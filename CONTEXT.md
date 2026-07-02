@@ -48,10 +48,13 @@ _Avoid_: item, listing, SKU (that is a Variant attribute)
 A specific, purchasable configuration of a Product — one concrete combination of options, with its own SKU, price, and inventory. Every Product has at least one Variant; a Product with no options has a single implicit Variant.
 _Avoid_: option, variant option (that describes an axis/value, not the purchasable unit), product version
 
+**Collection**:
+A named grouping of Products within a Store, used to organize the storefront (e.g. "Summer", "On Sale"). A Collection is one of two types: a Manual Collection, whose members are added and removed explicitly by the Merchant; or an Automated Collection, whose members are derived from rules (e.g. a tag or a price range) and update automatically as the catalog changes.
+_Avoid_: category (overloaded), group, folder
+
 **Order**:
 A Customer's intent to buy one or more Variants from a Store, carrying its totals and a delivery address. An Order's lifecycle runs along two independent axes — its payment status and its fulfillment status. An Order is open while either axis is non-terminal, and closed once both are terminal.
 _Avoid_: purchase, transaction (that is a payment event, not the Order), basket
-
 **Order Line**:
 A single line within an Order, referencing one Variant at a quantity and a unit price. An Order has one or more Order Lines.
 _Avoid_: line item, item (too generic)
@@ -85,6 +88,7 @@ _Avoid_: locale, money format
 - Each Store is independently isolated and independently billed.
 - Each request resolves to at most one Current Store. A storefront request derives it from the host; a dashboard request derives it from the Merchant's selection, authorized by a Membership.
 - A Store has many Products. A Product has one or more Variants. A Variant is the single purchasable unit: anything that can be priced, stocked, added to a cart, or ordered is a Variant.
+- A Store has many Collections. Each Collection groups Products and is either Manual (explicit members) or Automated (members derived from rules).
 - A Customer places Orders in one Store. An Order has one or more Order Lines; each Order Line references one Variant at a quantity and unit price. An Order's overall state is derived from its payment status and fulfillment status, which progress independently.
 - A Customer has one Cart per Store. A Cart holds no inventory and reserves nothing. Checkout converts a Cart into an Order; Variant inventory is decremented atomically inside the payment transaction.
 - Each Store denominates in exactly one Currency. All Money in that Store (prices, totals, fees) is held and computed as integer minor units of that Currency; floating-point is used only to parse input or format display, never in arithmetic.
@@ -98,3 +102,4 @@ _Avoid_: locale, money format
 - _Resolved_ — Cart-to-Order boundary and inventory timing: a Cart is ephemeral and reserves no inventory; checkout creates an Order in payment: pending; Variant inventory is decremented atomically inside the payment transaction (row-locked), preventing oversell. Recorded in ADR-0002.
 - _Resolved_ — Money representation: all Money is stored and computed as signed integer minor units of the Store's Currency; floating-point is used only to parse input or format display. Each Store has exactly one Currency. Recorded in ADR-0004.
 - _Resolved_ — Roles and permissions: three ranked tiers — Owner, Admin, Staff — where each tier inherits the capabilities of the one below. Authorization is a rank comparison. A Store has exactly one Owner, who cannot be removed and cannot leave without an atomic ownership transfer.
+- _Resolved_ — Collection model: a Collection groups Products and is one of two types — Manual (explicit membership) or Automated (membership derived from rules such as tag or price range).
