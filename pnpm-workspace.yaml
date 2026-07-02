@@ -2,11 +2,8 @@ packages:
   - "apps/*"
   - "packages/*"
 
-allowBuilds:
-  esbuild: set this to true or false
-  sharp: set this to true or false
-
-# pnpm 11 settings live here (moved from package.json)
+# pnpm 11 settings live here (moved from package.json's `pnpm` field).
+# Allow these native deps to run their install-time build scripts.
 onlyBuiltDependencies:
   - esbuild
   - sharp
