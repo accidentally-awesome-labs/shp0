@@ -1,0 +1,15 @@
+{
+  "name": "shp0",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter @shp0/web dev",
+    "build": "pnpm --filter @shp0/web build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  },
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=20"
+  }
+}
+

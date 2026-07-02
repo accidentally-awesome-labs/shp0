@@ -1,0 +1,10 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+allowBuilds:
+  esbuild: set this to true or false
+
+# pnpm 11 moved settings here from package.json
+onlyBuiltDependencies:
+  - esbuild
