@@ -63,6 +63,22 @@ _Avoid_: line item, item (too generic)
 A Customer's ephemeral, pre-purchase selection of Variants and quantities for one Store. A Cart holds no money and reserves no inventory; it is lightweight storage only. A Cart is converted into an Order when checkout begins.
 _Avoid_: basket, shopping bag, pending order (an Order is a separate thing)
 
+**Discount**:
+A reduction applied to an Order, defined by a Trigger, a Reward, and Conditions. Multiple Discounts may stack on one Order, under a fixed precedence with a never-negative floor.
+_Avoid_: coupon (that is a code-based Trigger, not the whole Discount), deal, offer, promotion (informal; a Discount with an automatic Trigger is still just a Discount)
+
+**Trigger**:
+The event that makes a Discount apply — either a code the shopper enters at checkout, or an automatic condition (e.g. a minimum spend, a quantity of a Product, or always-on).
+_Avoid_: discount type
+
+**Reward**:
+The reduction a Discount grants. One of: an amount off (fixed or percent) applied to the Order, specific Order Lines, or shipping; a free item, which adds an Order Line at unit price 0 and decrements that Variant's inventory like any other line; or free shipping, which zeroes the shipping cost.
+_Avoid_: discount value
+
+**Conditions**:
+The constraints on a Discount's applicability — validity window, usage limit, minimum spend, eligible Products or Collections.
+_Avoid_: rules (too generic)
+
 **Payment status**:
 Where an Order stands on the money axis — its own state machine (e.g. pending, paid, partially paid, refunded, partially refunded). Independent of fulfillment status.
 _Avoid_: order status (that is the derived overall state)
@@ -92,6 +108,7 @@ _Avoid_: locale, money format
 - A Customer places Orders in one Store. An Order has one or more Order Lines; each Order Line references one Variant at a quantity and unit price. An Order's overall state is derived from its payment status and fulfillment status, which progress independently.
 - A Customer has one Cart per Store. A Cart holds no inventory and reserves nothing. Checkout converts a Cart into an Order; Variant inventory is decremented atomically inside the payment transaction.
 - Each Store denominates in exactly one Currency. All Money in that Store (prices, totals, fees) is held and computed as integer minor units of that Currency; floating-point is used only to parse input or format display, never in arithmetic.
+- A Store defines Discounts. Each Discount is a Trigger plus a Reward plus Conditions. Multiple Discounts may stack on one Order under a fixed precedence (line-level before order-level before shipping; percent before fixed; never below zero), and the merchant sees a previewed outcome rather than choosing the combination order. A free-item Reward adds an Order Line at unit price 0 and decrements that Variant's inventory like any other line.
 
 ## Flagged ambiguities
 
@@ -103,3 +120,4 @@ _Avoid_: locale, money format
 - _Resolved_ — Money representation: all Money is stored and computed as signed integer minor units of the Store's Currency; floating-point is used only to parse input or format display. Each Store has exactly one Currency. Recorded in ADR-0004.
 - _Resolved_ — Roles and permissions: three ranked tiers — Owner, Admin, Staff — where each tier inherits the capabilities of the one below. Authorization is a rank comparison. A Store has exactly one Owner, who cannot be removed and cannot leave without an atomic ownership transfer.
 - _Resolved_ — Collection model: a Collection groups Products and is one of two types — Manual (explicit membership) or Automated (membership derived from rules such as tag or price range).
+- _Resolved_ — Discounts and promotions: a Discount is a unified, declarative Trigger + Reward + Conditions entity (so a code-based and an automatic/BOGO discount are the same concept, not two). Discounts stack from day one under a fixed precedence (line → order → shipping; percent before fixed; never-negative floor) shown via a merchant preview, not configurable ordering. Reward types include amount off (order/line/shipping), free item (an Order Line at unit price 0 that decrements inventory), and free shipping. Percentage reductions round half-up on minor units. Usage limits are enforced under a row-lock at redemption.
