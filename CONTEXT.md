@@ -87,6 +87,22 @@ _Avoid_: discount value
 The constraints on a Discount's applicability — validity window, usage limit, minimum spend, eligible Products or Collections.
 _Avoid_: rules (too generic)
 
+**Tier**:
+A named plan level a Store subscribes to, defining a monthly price, a commission rate, and a set of included Usage limits (e.g. Free, Pro, Scale).
+_Avoid_: plan (use Tier for the level; Subscription for the Store's choice of it), package, level
+
+**Subscription**:
+A Store's active choice of Tier — the recurring monthly relationship that sets its price, commission rate, and included Usage limits.
+_Avoid_: plan, membership (collides with Merchant Membership)
+
+**Commission**:
+The percentage of each paid Order that the platform takes as its fee. The Commission rate is set by the Store's Tier and decreases at higher Tiers. It is collected at payment time as the platform fee on the Store's Stripe Connect payment.
+_Avoid_: transaction fee, platform cut, take rate
+
+**Usage**:
+A Store's measured consumption against its Tier's included limits — counts of Products, Orders over a period, bandwidth, and staff seats. Exceeding a limit incurs an overage rather than blocking the Store, except on the Free Tier, where the limit is a hard cap.
+_Avoid_: quota, consumption, meter
+
 **Payment status**:
 Where an Order stands on the money axis — its own state machine (e.g. pending, paid, partially paid, refunded, partially refunded). Independent of fulfillment status.
 _Avoid_: order status (that is the derived overall state)
@@ -118,6 +134,7 @@ _Avoid_: locale, money format
 - A Customer has one Cart per Store. A Cart holds no inventory and reserves nothing. Checkout converts a Cart into an Order; Variant inventory is decremented atomically inside the payment transaction.
 - Each Store denominates in exactly one Currency. All Money in that Store (prices, totals, fees) is held and computed as integer minor units of that Currency; floating-point is used only to parse input or format display, never in arithmetic.
 - A Store defines Discounts. Each Discount is a Trigger plus a Reward plus Conditions. Multiple Discounts may stack on one Order under a fixed precedence (line-level before order-level before shipping; percent before fixed; never below zero), and the merchant sees a previewed outcome rather than choosing the combination order. A free-item Reward adds an Order Line at unit price 0 and decrements that Variant's inventory like any other line.
+- A Store holds one Subscription to a Tier at a time. The Tier sets a monthly price, a Commission rate (which decreases at higher Tiers), and included Usage limits. The platform takes the Commission at payment time as the fee on the Store's Stripe Connect payment. Exceeding a Usage limit incurs an overage rather than blocking the Store, except on the Free Tier, where the limit is a hard cap.
 
 ## Flagged ambiguities
 
@@ -131,3 +148,4 @@ _Avoid_: locale, money format
 - _Resolved_ — Collection model: a Collection groups Products and is one of two types — Manual (explicit membership) or Automated (membership derived from rules such as tag or price range).
 - _Resolved_ — Discounts and promotions: a Discount is a unified, declarative Trigger + Reward + Conditions entity (so a code-based and an automatic/BOGO discount are the same concept, not two). Discounts stack from day one under a fixed precedence (line → order → shipping; percent before fixed; never-negative floor) shown via a merchant preview, not configurable ordering. Reward types include amount off (order/line/shipping), free item (an Order Line at unit price 0 that decrements inventory), and free shipping. Percentage reductions round half-up on minor units. Usage limits are enforced under a row-lock at redemption.
 - _Resolved_ — Custom Domain verification: a Custom Domain is served only after DNS-proven ownership (CNAME for subdomains, TXT/ALIAS for apex), and is re-verified periodically; a domain that fails re-verification stops being served. Vercel is orchestrated for serving and TLS. Recorded in ADR-0005.
+- _Resolved_ — Platform billing: a Store holds one Subscription to a Tier at a time. Tiers define a monthly price, a Commission rate that decreases at higher Tiers, and included Usage limits (products, orders, bandwidth, staff seats). Commission is collected at payment time as the Stripe Connect application fee. Usage overages are charged (not blocking) except on the Free Tier, which hard-caps.
