@@ -4,7 +4,9 @@ packages:
 
 allowBuilds:
   esbuild: set this to true or false
+  sharp: set this to true or false
 
-# pnpm 11 moved settings here from package.json
+# pnpm 11 settings live here (moved from package.json)
 onlyBuiltDependencies:
   - esbuild
+  - sharp
