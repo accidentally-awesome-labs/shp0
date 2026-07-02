@@ -17,8 +17,20 @@ The association between a person and a single Store, granting them a Role within
 _Avoid_: store access, permission, team member
 
 **Role**:
-The level of authority a Merchant holds within a particular Store's Membership.
+The level of authority a Merchant holds within a particular Store's Membership. Roles are ranked: Owner above Admin above Staff. A Role grants the capabilities of its own tier and every tier below it.
 _Avoid_: permission level, user type
+
+**Owner**:
+The highest Role within a Store's Membership — exactly one per Store. Holds every capability, including the ones no other Role has: transfer ownership, manage platform billing, and manage Memberships. A Store always has exactly one Owner; the Owner cannot be removed, and cannot leave without first transferring ownership.
+_Avoid_: primary admin, super admin
+
+**Admin**:
+The middle Role. Manages the Store's catalog, Orders, Customers, and Store settings (including payouts), but cannot transfer or delete the Store, change platform billing, or manage Memberships.
+_Avoid_: manager, full access
+
+**Staff**:
+The lowest Role. May view the catalog, Orders, and Customers, and fulfill Orders; cannot change settings, money, or Memberships.
+_Avoid_: employee, limited user, agent
 
 **Customer**:
 A person who buys from one Store. A Customer's account, cart, orders, and addresses belong to that single Store and exist only within it.
@@ -56,10 +68,18 @@ _Avoid_: order status (that is the derived overall state)
 Where an Order stands on the delivery axis — its own state machine (e.g. unfulfilled, partially fulfilled, fulfilled). Independent of payment status.
 _Avoid_: order status (that is the derived overall state)
 
+**Money**:
+An amount in a Store's currency. Internally it is represented as a signed integer count of that currency's smallest unit (its minor units), never as a floating-point number. A pure helper converts to and from minor units only at the edges (input parsing and display); all arithmetic is integer math.
+_Avoid_: amount (too generic), price (a price is Money in a specific role), total (a role of Money within an Order)
+
+**Currency**:
+The unit of money a Store denominates in — an ISO 4217 code (e.g. USD) together with the number of decimal places that code defines. Each Store has exactly one Currency; all Money in that Store is expressed in that Currency's minor units.
+_Avoid_: locale, money format
+
 ## Relationships
 
 - A Merchant holds one or more Memberships.
-- Each Membership belongs to exactly one Store and carries exactly one Role.
+- Each Membership belongs to exactly one Store and carries exactly one Role. A Store always has exactly one Owner, who cannot be removed and cannot leave without first transferring ownership; ownership transfer is atomic.
 - A Store has many Customers; each Customer belongs to exactly one Store.
 - A Customer and a Merchant are distinct identities. The same human may be a Merchant on one Store and a Customer on another, with no relationship between those two identities.
 - Each Store is independently isolated and independently billed.
@@ -67,6 +87,7 @@ _Avoid_: order status (that is the derived overall state)
 - A Store has many Products. A Product has one or more Variants. A Variant is the single purchasable unit: anything that can be priced, stocked, added to a cart, or ordered is a Variant.
 - A Customer places Orders in one Store. An Order has one or more Order Lines; each Order Line references one Variant at a quantity and unit price. An Order's overall state is derived from its payment status and fulfillment status, which progress independently.
 - A Customer has one Cart per Store. A Cart holds no inventory and reserves nothing. Checkout converts a Cart into an Order; Variant inventory is decremented atomically inside the payment transaction.
+- Each Store denominates in exactly one Currency. All Money in that Store (prices, totals, fees) is held and computed as integer minor units of that Currency; floating-point is used only to parse input or format display, never in arithmetic.
 
 ## Flagged ambiguities
 
@@ -75,3 +96,5 @@ _Avoid_: order status (that is the derived overall state)
 - _Resolved_ — catalog shape: a Variant is mandatory; every Product has at least one Variant. A Variant is the single purchasable unit (price, inventory, cart line, order line all key off a Variant). A Product with no options has a single implicit Variant.
 - _Resolved_ — Order lifecycle: an Order has two independent status dimensions, payment status and fulfillment status, each its own state machine. The overall order state (open vs closed) is derived. This replaces a single linear status and makes partial payment, partial fulfillment, and partial refund representable.
 - _Resolved_ — Cart-to-Order boundary and inventory timing: a Cart is ephemeral and reserves no inventory; checkout creates an Order in payment: pending; Variant inventory is decremented atomically inside the payment transaction (row-locked), preventing oversell. Recorded in ADR-0002.
+- _Resolved_ — Money representation: all Money is stored and computed as signed integer minor units of the Store's Currency; floating-point is used only to parse input or format display. Each Store has exactly one Currency. Recorded in ADR-0004.
+- _Resolved_ — Roles and permissions: three ranked tiers — Owner, Admin, Staff — where each tier inherits the capabilities of the one below. Authorization is a rank comparison. A Store has exactly one Owner, who cannot be removed and cannot leave without an atomic ownership transfer.
