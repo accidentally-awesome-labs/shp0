@@ -40,6 +40,14 @@ _Avoid_: shopper (informal only; use Customer in formal language), buyer, user (
 The single Store that a request is scoped to. It is resolved differently by surface: on the storefront it is derived from the request host; on the dashboard it is the Store the Merchant has selected, and only if they hold a Membership there.
 _Avoid_: active store, current tenant, workspace
 
+**Subdomain**:
+A Store's default address on the platform, of the form `<name>.shp0.dev`. It is assigned at Store creation and served immediately with no setup.
+_Avoid_: default url, storefront url
+
+**Custom Domain**:
+A domain the Merchant owns and points at their Store instead of (or in addition to) the Subdomain. A Custom Domain is only served after the Merchant proves control of it via DNS, and it is re-verified periodically; a Custom Domain that fails re-verification stops being served.
+_Avoid_: custom url, vanity domain, branded domain
+
 **Product**:
 A sellable entity a Merchant creates in a Store — its title, description, images, and the option axes a shopper can choose from (e.g. Size, Color).
 _Avoid_: item, listing, SKU (that is a Variant attribute)
@@ -103,6 +111,7 @@ _Avoid_: locale, money format
 - A Customer and a Merchant are distinct identities. The same human may be a Merchant on one Store and a Customer on another, with no relationship between those two identities.
 - Each Store is independently isolated and independently billed.
 - Each request resolves to at most one Current Store. A storefront request derives it from the host; a dashboard request derives it from the Merchant's selection, authorized by a Membership.
+- A Store is addressable by its Subdomain by default, and may have zero or more Custom Domains. A Custom Domain is served only after DNS-proven ownership and is re-verified periodically; a failing Custom Domain stops being served, and the host-to-store cache is invalidated whenever a domain is added, removed, or fails verification.
 - A Store has many Products. A Product has one or more Variants. A Variant is the single purchasable unit: anything that can be priced, stocked, added to a cart, or ordered is a Variant.
 - A Store has many Collections. Each Collection groups Products and is either Manual (explicit members) or Automated (members derived from rules).
 - A Customer places Orders in one Store. An Order has one or more Order Lines; each Order Line references one Variant at a quantity and unit price. An Order's overall state is derived from its payment status and fulfillment status, which progress independently.
@@ -121,3 +130,4 @@ _Avoid_: locale, money format
 - _Resolved_ — Roles and permissions: three ranked tiers — Owner, Admin, Staff — where each tier inherits the capabilities of the one below. Authorization is a rank comparison. A Store has exactly one Owner, who cannot be removed and cannot leave without an atomic ownership transfer.
 - _Resolved_ — Collection model: a Collection groups Products and is one of two types — Manual (explicit membership) or Automated (membership derived from rules such as tag or price range).
 - _Resolved_ — Discounts and promotions: a Discount is a unified, declarative Trigger + Reward + Conditions entity (so a code-based and an automatic/BOGO discount are the same concept, not two). Discounts stack from day one under a fixed precedence (line → order → shipping; percent before fixed; never-negative floor) shown via a merchant preview, not configurable ordering. Reward types include amount off (order/line/shipping), free item (an Order Line at unit price 0 that decrements inventory), and free shipping. Percentage reductions round half-up on minor units. Usage limits are enforced under a row-lock at redemption.
+- _Resolved_ — Custom Domain verification: a Custom Domain is served only after DNS-proven ownership (CNAME for subdomains, TXT/ALIAS for apex), and is re-verified periodically; a domain that fails re-verification stops being served. Vercel is orchestrated for serving and TLS. Recorded in ADR-0005.
