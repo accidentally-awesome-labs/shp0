@@ -10,6 +10,7 @@ export const stores = pgTable("stores", {
   id: uuid("id").primaryKey().defaultRandom(),
   storeId: uuid("store_id").notNull(),
   name: text("name").notNull(),
+  subdomain: text("subdomain").notNull().unique(),
   createdAt: timestamp("created_at", { withTimezone: true })
     .defaultNow()
     .notNull(),
@@ -17,6 +18,30 @@ export const stores = pgTable("stores", {
 
 export type Store = typeof stores.$inferSelect;
 export type NewStore = typeof stores.$inferInsert;
+
+/**
+ * A Membership links a global Merchant (user) to a Store with a Role.
+ * This is a PLATFORM table (no store_id GUC, no RLS) — it bridges the global
+ * identity domain (Merchants) to the tenant domain (Stores). Queried via
+ * platformClient for both "which Stores does this user belong to?" (switcher)
+ * and "who are the members of this Store?" (team management).
+ */
+export const memberships = pgTable("memberships", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: text("user_id")
+    .notNull()
+    .references(() => user.id, { onDelete: "cascade" }),
+  storeId: uuid("store_id")
+    .notNull()
+    .references(() => stores.id, { onDelete: "cascade" }),
+  role: text("role").notNull(), // 'owner' | 'admin' | 'staff'
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .defaultNow()
+    .notNull(),
+});
+
+export type Membership = typeof memberships.$inferSelect;
+export type NewMembership = typeof memberships.$inferInsert;
 
 // ─────────────────────────────────────────────────────────────────────────
 // better-auth core tables (PLATFORM tables — no store_id, no RLS).

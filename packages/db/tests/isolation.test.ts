@@ -25,9 +25,9 @@ describe("RLS multi-tenant isolation (ADR-0001)", () => {
     storeA = await platformClient(async (tx) => {
       await tx.execute(sql`TRUNCATE stores RESTART IDENTITY CASCADE`);
       const aId = randomUUID();
-      await tx.insert(stores).values({ id: aId, storeId: aId, name: "Acme" });
+      await tx.insert(stores).values({ id: aId, storeId: aId, name: "Acme", subdomain: "acme-iso" });
       const bId = randomUUID();
-      await tx.insert(stores).values({ id: bId, storeId: bId, name: "Beta" });
+      await tx.insert(stores).values({ id: bId, storeId: bId, name: "Beta", subdomain: "beta-iso" });
       storeB = bId;
       return aId;
     });

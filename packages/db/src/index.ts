@@ -1,10 +1,12 @@
+import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
+import { eq } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import * as schema from "./schema";
 
 export * as schema from "./schema";
-export type { Store, NewStore } from "./schema";
+export type { Store, NewStore, Membership, NewMembership } from "./schema";
 
 /**
  * Two roles, two connection pools (per ADR-0001):
@@ -98,8 +100,18 @@ export async function applySchema(): Promise<void> {
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
         store_id uuid NOT NULL,
         name text NOT NULL,
+        subdomain text NOT NULL UNIQUE,
         created_at timestamptz NOT NULL DEFAULT now()
       );
+    `);
+    // Add subdomain column to existing databases (idempotent migration).
+    // Can't reference `id` in DEFAULT, so add nullable, backfill, then set NOT NULL.
+    await client.query(`
+      ALTER TABLE stores ADD COLUMN IF NOT EXISTS subdomain text;
+      UPDATE stores SET subdomain = 'pending-' || id::text WHERE subdomain IS NULL;
+      ALTER TABLE stores ALTER COLUMN subdomain SET NOT NULL;
+      ALTER TABLE stores DROP CONSTRAINT IF EXISTS stores_subdomain_key;
+      ALTER TABLE stores ADD CONSTRAINT stores_subdomain_key UNIQUE (subdomain);
     `);
 
     // Row-Level Security, keyed on the per-request GUC (ADR-0001).
@@ -113,6 +125,42 @@ export async function applySchema(): Promise<void> {
     `);
 
     await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON stores TO "default";`);
+
+    // ── memberships (PLATFORM table — bridges global users to Stores) ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS memberships (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id text NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+        store_id uuid NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+        role text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    // Single-Owner invariant part 1: at most one owner per Store.
+    await client.query(`
+      DROP INDEX IF EXISTS memberships_one_owner_per_store;
+      CREATE UNIQUE INDEX memberships_one_owner_per_store
+        ON memberships(store_id) WHERE role = 'owner';
+    `);
+    // Single-Owner invariant part 2: the owner cannot be removed (deleted).
+    // Transfer = UPDATE the row's user_id, not delete.
+    await client.query(`
+      CREATE OR REPLACE FUNCTION memberships_prevent_owner_delete()
+      RETURNS trigger LANGUAGE plpgsql AS $func$
+      BEGIN
+        IF OLD.role = 'owner' THEN
+          RAISE EXCEPTION 'Cannot delete an owner Membership. Transfer ownership first.';
+        END IF;
+        RETURN OLD;
+      END;
+      $func$;
+    `);
+    await client.query(`
+      DROP TRIGGER IF EXISTS memberships_no_delete_owner ON memberships;
+      CREATE TRIGGER memberships_no_delete_owner
+        BEFORE DELETE ON memberships
+        FOR EACH ROW EXECUTE FUNCTION memberships_prevent_owner_delete();
+    `);
 
     // ── better-auth core tables (PLATFORM tables — no store_id, no RLS) ──
     await client.query(`
@@ -179,3 +227,95 @@ export async function closePools(): Promise<void> {
   tenantPool = null;
   platformPool = null;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Store provisioning + Membership domain functions (Issue #4).
+// All run via platformClient — Store creation and Membership are platform ops.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Provision a new Store and make the given user its Owner, atomically.
+ *
+ * Store creation is a platform operation: the platform mints the Store's id,
+ * sets store_id = id, and creates the creator's Membership with role = 'owner'.
+ * Both inserts run in a single transaction via platformClient — if either
+ * fails, neither happens.
+ */
+export async function provisionStore(opts: {
+  name: string;
+  subdomain: string;
+  ownerId: string;
+}): Promise<{ store: typeof schema.stores.$inferSelect }> {
+  return platformClient(async (tx) => {
+    const id = randomUUID();
+    const [store] = await tx
+      .insert(schema.stores)
+      .values({
+        id,
+        storeId: id,
+        name: opts.name,
+        subdomain: opts.subdomain,
+      })
+      .returning();
+
+    await tx.insert(schema.memberships).values({
+      userId: opts.ownerId,
+      storeId: id,
+      role: "owner",
+    });
+
+    return { store: store! };
+  });
+}
+
+/**
+ * List all Stores a Merchant (user) belongs to via Memberships.
+ * Returns each Store with the Merchant's Role in it — the data behind the
+ * store switcher.
+ */
+export async function listMemberships(
+  userId: string,
+): Promise<
+  Array<{
+    storeId: string;
+    storeName: string;
+    subdomain: string;
+    role: string;
+  }>
+> {
+  return platformClient(async (tx) => {
+    const rows = await tx
+      .select({
+        storeId: schema.memberships.storeId,
+        storeName: schema.stores.name,
+        subdomain: schema.stores.subdomain,
+        role: schema.memberships.role,
+      })
+      .from(schema.memberships)
+      .innerJoin(
+        schema.stores,
+        eq(schema.memberships.storeId, schema.stores.id),
+      )
+      .where(eq(schema.memberships.userId, userId));
+
+    return rows;
+  });
+}
+
+/**
+ * Check whether a subdomain is available (not taken by another Store).
+ * Used for real-time validation during Store creation.
+ */
+export async function checkSubdomainAvailable(
+  subdomain: string,
+): Promise<boolean> {
+  return platformClient(async (tx) => {
+    const rows = await tx
+      .select({ id: schema.stores.id })
+      .from(schema.stores)
+      .where(eq(schema.stores.subdomain, subdomain))
+      .limit(1);
+    return rows.length === 0;
+  });
+}
+

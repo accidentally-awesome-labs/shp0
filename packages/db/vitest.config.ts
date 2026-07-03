@@ -5,6 +5,8 @@ export default defineConfig({
     environment: "node",
     // pg + node APIs play best in the forks pool
     pool: "forks",
+    // All test files share one test DB — run them sequentially to avoid races.
+    fileParallelism: false,
     testTimeout: 15000,
   },
 });
