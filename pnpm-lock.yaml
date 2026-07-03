@@ -10,6 +10,15 @@ importers:
 
   apps/web:
     dependencies:
+      '@shp0/auth':
+        specifier: workspace:*
+        version: link:../../packages/auth
+      '@shp0/db':
+        specifier: workspace:*
+        version: link:../../packages/db
+      better-auth:
+        specifier: ^1.2.0
+        version: 1.6.23(drizzle-orm@0.36.4(@types/pg@8.20.0)(@types/react@19.2.17)(kysely@0.29.2)(pg@8.22.0)(react@19.2.7))(next@15.5.19(babel-plugin-react-compiler@1.0.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7))(pg@8.22.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)(vitest@2.1.9(@types/node@22.20.0))
       next:
         specifier: ^15.1.0
         version: 15.5.19(babel-plugin-react-compiler@1.0.0)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)

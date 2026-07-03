@@ -20,13 +20,14 @@ describe("Merchant identity (Issue #3)", () => {
   beforeAll(async () => {
     await applySchema();
 
-    // Auth tables are platform tables (no store_id, no RLS) — connect as cloud_admin.
-    pool = new Pool({
-      connectionString:
-        process.env.PLATFORM_DATABASE_URL ??
-        "postgresql:///shp0_test?user=cloud_admin",
-    });
-    auth = createAuth(pool);
+    const databaseUrl =
+      process.env.PLATFORM_DATABASE_URL ??
+      "postgresql:///shp0_test?user=cloud_admin";
+
+    auth = createAuth({ databaseUrl });
+
+    // Pool for DB assertions + cleanup.
+    pool = new Pool({ connectionString: databaseUrl });
 
     // Clean auth tables so tests are hermetic across runs.
     const db = drizzle(pool);
