@@ -34,8 +34,20 @@ export default async function StoreDashboardPage({
           <span className="capitalize">{current?.role}</span>
         </p>
 
-        <div className="mt-8 rounded-lg border border-dashed p-6 text-center text-sm text-gray-500">
-          Product management, orders, and settings come in upcoming issues.
+        <div className="mt-8 space-y-4">
+          <a
+            href={`/dashboard/${storeId}/products`}
+            className="block rounded-lg border p-4 hover:border-black hover:shadow-sm transition"
+          >
+            <div className="font-semibold">Products</div>
+            <div className="mt-1 text-sm text-gray-500">
+              Manage your catalog — products, variants, pricing.
+            </div>
+          </a>
+
+          <div className="rounded-lg border border-dashed p-6 text-center text-sm text-gray-500">
+            Orders, collections, settings, and more come in upcoming issues.
+          </div>
         </div>
       </div>
     </main>
