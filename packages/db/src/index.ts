@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
-import { eq, sql } from "drizzle-orm";
+import { eq, sql, and } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import * as schema from "./schema";
@@ -588,6 +588,127 @@ export async function deleteProduct(
       .where(eq(schema.products.id, productId));
   });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Storefront data accessors (Issue #7).
+// Like the dashboard CRUD but only return PUBLISHED products. These are the
+// functions the storefront pages call — ISR-cached in the web layer.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * List published products for the storefront. Drafts are excluded — they are
+ * dashboard-only. RLS ensures only the Current Store's products are visible.
+ */
+export async function listPublishedProducts(
+  storeId: string,
+): Promise<
+  Array<{
+    id: string;
+    title: string;
+    slug: string;
+    minPriceCents: number;
+  }>
+> {
+  return tenantClient(storeId, async (tx) => {
+    const productList = await tx
+      .select({
+        id: schema.products.id,
+        title: schema.products.title,
+        slug: schema.products.slug,
+        status: schema.products.status,
+      })
+      .from(schema.products)
+      .where(eq(schema.products.status, "published"));
+
+    const results = [];
+    for (const p of productList) {
+      const variantList = await tx
+        .select({ priceCents: schema.variants.priceCents })
+        .from(schema.variants)
+        .where(eq(schema.variants.productId, p.id));
+      const minPriceCents = variantList.length > 0
+        ? Math.min(...variantList.map((v) => v.priceCents))
+        : 0;
+      results.push({ ...p, minPriceCents });
+    }
+    return results;
+  });
+}
+
+/**
+ * Get a single published product by slug, with all its variants.
+ * Returns null if the product doesn't exist, is a draft, or belongs to another
+ * Store (RLS returns zero rows).
+ */
+export async function getProductBySlug(
+  storeId: string,
+  slug: string,
+): Promise<{
+  id: string;
+  title: string;
+  slug: string;
+  description: string;
+  variants: Array<{
+    id: string;
+    sku: string;
+    title: string;
+    priceCents: number;
+    compareAtPriceCents: number | null;
+    inventory: number;
+  }>;
+} | null> {
+  return tenantClient(storeId, async (tx) => {
+    const productList = await tx
+      .select({
+        id: schema.products.id,
+        title: schema.products.title,
+        slug: schema.products.slug,
+        description: schema.products.description,
+      })
+      .from(schema.products)
+      .where(
+        and(
+          eq(schema.products.slug, slug),
+          eq(schema.products.status, "published"),
+        ),
+      )
+      .limit(1);
+
+    if (productList.length === 0) return null;
+
+    const p = productList[0]!;
+    const variantList = await tx
+      .select({
+        id: schema.variants.id,
+        sku: schema.variants.sku,
+        title: schema.variants.title,
+        priceCents: schema.variants.priceCents,
+        compareAtPriceCents: schema.variants.compareAtPriceCents,
+        inventory: schema.variants.inventory,
+      })
+      .from(schema.variants)
+      .where(eq(schema.variants.productId, p.id));
+
+    return { ...p, variants: variantList };
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Cache-tag functions (Issue #7).
+// These generate the revalidateTag keys for ISR — targeted cache invalidation
+// so a product edit only busts that product's pages, not the entire cache.
+// ─────────────────────────────────────────────────────────────────────────
+
+/** Cache tag for a single product's pages (detail page). */
+export function productTag(storeId: string, productId: string): string {
+  return `store:${storeId}:product:${productId}`;
+}
+
+/** Cache tag for a Store's product listing page. */
+export function storeProductsTag(storeId: string): string {
+  return `store:${storeId}:products`;
+}
+
 
 
 
