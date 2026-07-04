@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, uuid, boolean } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, uuid, boolean, integer, bigint } from "drizzle-orm/pg-core";
 
 /**
  * The `stores` table — one row per Store (tenant). This is the bootstrap tenant
@@ -18,6 +18,48 @@ export const stores = pgTable("stores", {
 
 export type Store = typeof stores.$inferSelect;
 export type NewStore = typeof stores.$inferInsert;
+
+/**
+ * A Product — the sellable entity a Merchant creates. Carries title, description,
+ * images, and the option axes. Scoped to a Store (store_id, RLS-protected).
+ */
+export const products = pgTable("products", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  storeId: uuid("store_id").notNull(),
+  title: text("title").notNull(),
+  slug: text("slug").notNull(),
+  description: text("description").default("").notNull(),
+  status: text("status").notNull().default("draft"), // 'draft' | 'published'
+  tags: text("tags").array().default([]).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type Product = typeof products.$inferSelect;
+export type NewProduct = typeof products.$inferInsert;
+
+/**
+ * A Variant — the single purchasable unit. Every Product has at least one
+ * Variant. Scoped to a Store (store_id, RLS-protected). Price/inventory live here.
+ */
+export const variants = pgTable("variants", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  storeId: uuid("store_id").notNull(),
+  productId: uuid("product_id")
+    .notNull()
+    .references(() => products.id, { onDelete: "cascade" }),
+  sku: text("sku").notNull(),
+  title: text("title").notNull(),
+  priceCents: bigint("price_cents", { mode: "number" }).notNull(),
+  compareAtPriceCents: bigint("compare_at_price_cents", { mode: "number" }),
+  inventory: integer("inventory").notNull().default(0),
+  position: integer("position").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type Variant = typeof variants.$inferSelect;
+export type NewVariant = typeof variants.$inferInsert;
 
 /**
  * A Membership links a global Merchant (user) to a Store with a Role.

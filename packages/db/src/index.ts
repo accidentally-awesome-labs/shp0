@@ -6,7 +6,7 @@ import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import * as schema from "./schema";
 
 export * as schema from "./schema";
-export type { Store, NewStore, Membership, NewMembership } from "./schema";
+export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant } from "./schema";
 
 /**
  * Two roles, two connection pools (per ADR-0001):
@@ -214,6 +214,71 @@ export async function applySchema(): Promise<void> {
       );
     `);
     // Auth tables are platform tables — cloud_admin owns them, no RLS, no grant to "default".
+
+    // ── products + variants (TENANT tables — store_id GUC, RLS-protected) ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS products (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        title text NOT NULL,
+        slug text NOT NULL,
+        description text NOT NULL DEFAULT '',
+        status text NOT NULL DEFAULT 'draft',
+        tags text[] NOT NULL DEFAULT '{}',
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS variants (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        product_id uuid NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        sku text NOT NULL,
+        title text NOT NULL,
+        price_cents bigint NOT NULL,
+        compare_at_price_cents bigint,
+        inventory integer NOT NULL DEFAULT 0,
+        position integer NOT NULL DEFAULT 0,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    // Generic trigger: stamp store_id from the per-request GUC on INSERT.
+    // The app never passes store_id — the DB always sets it (ADR-0001).
+    await client.query(`
+      CREATE OR REPLACE FUNCTION stamp_store_id()
+      RETURNS trigger LANGUAGE plpgsql AS $func$
+      BEGIN
+        NEW.store_id := current_setting('app.store_id', true)::uuid;
+        RETURN NEW;
+      END;
+      $func$;
+    `);
+    await client.query(`DROP TRIGGER IF EXISTS products_set_store_id ON products; CREATE TRIGGER products_set_store_id BEFORE INSERT ON products FOR EACH ROW EXECUTE FUNCTION stamp_store_id();`);
+    await client.query(`DROP TRIGGER IF EXISTS variants_set_store_id ON variants; CREATE TRIGGER variants_set_store_id BEFORE INSERT ON variants FOR EACH ROW EXECUTE FUNCTION stamp_store_id();`);
+
+    // RLS: products + variants are tenant-isolated (same pattern as stores).
+    await client.query(`ALTER TABLE products ENABLE ROW LEVEL SECURITY;`);
+    await client.query(`ALTER TABLE variants ENABLE ROW LEVEL SECURITY;`);
+    await client.query(`
+      DROP POLICY IF EXISTS products_tenant ON products;
+      CREATE POLICY products_tenant ON products
+        FOR ALL TO "default"
+        USING (current_setting('app.store_id', true) = store_id::text)
+        WITH CHECK (current_setting('app.store_id', true) = store_id::text);
+    `);
+    await client.query(`
+      DROP POLICY IF EXISTS variants_tenant ON variants;
+      CREATE POLICY variants_tenant ON variants
+        FOR ALL TO "default"
+        USING (current_setting('app.store_id', true) = store_id::text)
+        WITH CHECK (current_setting('app.store_id', true) = store_id::text);
+    `);
+    // Scoped-unique slug per Store.
+    await client.query(`DROP INDEX IF EXISTS products_store_slug_unique; CREATE UNIQUE INDEX products_store_slug_unique ON products(store_id, slug);`);
+    // Grant to tenant role.
+    await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON products, variants TO "default";`);
   } finally {
     client.release();
     await pool.end();
@@ -389,5 +454,139 @@ export async function resolveStoreBySubdomain(
     return rows.length > 0 ? rows[0]!.id : null;
   });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Product + Variant CRUD (Issue #6).
+// All run via tenantClient(storeId) — scoped by RLS, store_id stamped by trigger.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Create a Product with its Variants. Every Product must have at least one
+ * Variant (the single purchasable unit). Both inserts run inside a single
+ * tenantClient transaction — store_id is stamped from the GUC by the trigger.
+ */
+export async function createProduct(
+  storeId: string,
+  input: {
+    title: string;
+    slug: string;
+    description?: string;
+    status?: string;
+    tags?: string[];
+    variants: Array<{
+      sku: string;
+      title: string;
+      priceCents: number;
+      compareAtPriceCents?: number;
+      inventory?: number;
+      position?: number;
+    }>;
+  },
+): Promise<{ id: string; variants: Array<{ id: string }> }> {
+  if (input.variants.length === 0) {
+    throw new Error("A Product must have at least one Variant");
+  }
+
+  return tenantClient(storeId, async (tx) => {
+    const [product] = await tx
+      .insert(schema.products)
+      .values({
+        storeId,
+        title: input.title,
+        slug: input.slug,
+        description: input.description ?? "",
+        status: input.status ?? "draft",
+        tags: input.tags ?? [],
+      })
+      .returning();
+
+    const createdVariants: Array<{ id: string }> = [];
+    for (const v of input.variants) {
+      const [variant] = await tx
+        .insert(schema.variants)
+        .values({
+          storeId,
+          productId: product!.id,
+          sku: v.sku,
+          title: v.title,
+          priceCents: v.priceCents,
+          compareAtPriceCents: v.compareAtPriceCents,
+          inventory: v.inventory ?? 0,
+          position: v.position ?? 0,
+        })
+        .returning();
+      createdVariants.push({ id: variant!.id });
+    }
+
+    return { id: product!.id, variants: createdVariants };
+  });
+}
+
+/**
+ * List all Products (with their Variants) for the Current Store.
+ * Reads via tenantClient — RLS ensures only this Store's products are visible.
+ */
+export async function listProducts(
+  storeId: string,
+): Promise<
+  Array<{
+    id: string;
+    title: string;
+    slug: string;
+    status: string;
+    variants: Array<{
+      id: string;
+      sku: string;
+      title: string;
+      priceCents: number;
+      inventory: number;
+    }>;
+  }>
+> {
+  return tenantClient(storeId, async (tx) => {
+    const productList = await tx
+      .select({
+        id: schema.products.id,
+        title: schema.products.title,
+        slug: schema.products.slug,
+        status: schema.products.status,
+      })
+      .from(schema.products)
+      .orderBy(eq(schema.products.createdAt, schema.products.createdAt));
+
+    const results = [];
+    for (const p of productList) {
+      const variantList = await tx
+        .select({
+          id: schema.variants.id,
+          sku: schema.variants.sku,
+          title: schema.variants.title,
+          priceCents: schema.variants.priceCents,
+          inventory: schema.variants.inventory,
+        })
+        .from(schema.variants)
+        .where(eq(schema.variants.productId, p.id));
+
+      results.push({ ...p, variants: variantList });
+    }
+    return results;
+  });
+}
+
+/**
+ * Delete a Product (cascades to its Variants). RLS ensures only the Current
+ * Store's products are deletable.
+ */
+export async function deleteProduct(
+  storeId: string,
+  productId: string,
+): Promise<void> {
+  await tenantClient(storeId, async (tx) => {
+    await tx
+      .delete(schema.products)
+      .where(eq(schema.products.id, productId));
+  });
+}
+
 
 
