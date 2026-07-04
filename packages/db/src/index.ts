@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import * as schema from "./schema";
@@ -318,4 +318,76 @@ export async function checkSubdomainAvailable(
     return rows.length === 0;
   });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Current Store resolution (Issue #5).
+// The authorization layer ABOVE RLS: RLS isolates between Stores given a
+// storeId; these functions decide which storeId a request may even be in.
+// ─────────────────────────────────────────────────────────────────────────
+
+/** Subdomains reserved for the platform itself, never a Store. */
+const RESERVED_SUBDOMAINS = new Set(["app", "www", "dashboard", "api", "mail"]);
+
+/**
+ * Parse a request host and extract the Store subdomain, if any.
+ *
+ * Pure function — no DB call. Returns the subdomain string for a Store host
+ * like "acme.shp0.dev", or null for the platform domain, localhost/dev, and
+ * reserved subdomains (app, www, dashboard, api, mail).
+ */
+export function parseSubdomain(
+  host: string,
+  platformDomain: string = "shp0.dev",
+): string | null {
+  // Strip port if present (e.g. "localhost:3000").
+  const hostname = host.split(":")[0]!;
+
+  // Must end with the platform domain.
+  if (!hostname.endsWith(`.${platformDomain}`)) return null;
+
+  const subdomain = hostname.slice(0, hostname.length - platformDomain.length - 1);
+
+  // No subdomain = the platform domain itself.
+  if (!subdomain) return null;
+
+  // Reserved subdomains are platform, not a Store.
+  if (RESERVED_SUBDOMAINS.has(subdomain)) return null;
+
+  return subdomain;
+}
+
+/**
+ * Check whether a Merchant (user) holds an active Membership for the given Store.
+ * This is the dashboard authorization gate: a Merchant's Store selection is
+ * only honored if they actually belong to that Store.
+ */
+export async function authorizeStoreMembership(
+  userId: string,
+  storeId: string,
+): Promise<boolean> {
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT 1 FROM memberships WHERE user_id = ${userId} AND store_id = ${storeId} LIMIT 1`,
+    );
+    return rows.rows.length > 0;
+  });
+}
+
+/**
+ * Resolve a Store by its subdomain. Returns the storeId if the subdomain
+ * exists, or null if it doesn't. Used for storefront host-based resolution.
+ */
+export async function resolveStoreBySubdomain(
+  subdomain: string,
+): Promise<string | null> {
+  return platformClient(async (tx) => {
+    const rows = await tx
+      .select({ id: schema.stores.id })
+      .from(schema.stores)
+      .where(eq(schema.stores.subdomain, subdomain))
+      .limit(1);
+    return rows.length > 0 ? rows[0]!.id : null;
+  });
+}
+
 
