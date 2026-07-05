@@ -7,7 +7,10 @@ import * as schema from "./schema";
 
 export * as schema from "./schema";
 export { parseMoney, formatMoney, applyPercent } from "./money";
-export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant } from "./schema";
+export { addLine, updateLine, removeLine, computeSubtotal, mergeCarts } from "./cart";
+export type { Cart, CartLine } from "./cart";
+export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem } from "./schema";
+import type { Cart, CartLine } from "./cart";
 
 /**
  * Two roles, two connection pools (per ADR-0001):
@@ -280,6 +283,50 @@ export async function applySchema(): Promise<void> {
     await client.query(`DROP INDEX IF EXISTS products_store_slug_unique; CREATE UNIQUE INDEX products_store_slug_unique ON products(store_id, slug);`);
     // Grant to tenant role.
     await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON products, variants TO "default";`);
+
+    // ── carts + cart_items (TENANT tables — ephemeral, RLS-protected) ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS carts (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        customer_id text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS cart_items (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        cart_id uuid NOT NULL REFERENCES carts(id) ON DELETE CASCADE,
+        variant_id uuid NOT NULL,
+        quantity integer NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    // store_id stamped from GUC by the existing stamp_store_id() trigger.
+    await client.query(`DROP TRIGGER IF EXISTS carts_set_store_id ON carts; CREATE TRIGGER carts_set_store_id BEFORE INSERT ON carts FOR EACH ROW EXECUTE FUNCTION stamp_store_id();`);
+    await client.query(`DROP TRIGGER IF EXISTS cart_items_set_store_id ON cart_items; CREATE TRIGGER cart_items_set_store_id BEFORE INSERT ON cart_items FOR EACH ROW EXECUTE FUNCTION stamp_store_id();`);
+    // RLS: carts + cart_items are tenant-isolated.
+    await client.query(`ALTER TABLE carts ENABLE ROW LEVEL SECURITY;`);
+    await client.query(`ALTER TABLE cart_items ENABLE ROW LEVEL SECURITY;`);
+    await client.query(`
+      DROP POLICY IF EXISTS carts_tenant ON carts;
+      CREATE POLICY carts_tenant ON carts
+        FOR ALL TO "default"
+        USING (current_setting('app.store_id', true) = store_id::text)
+        WITH CHECK (current_setting('app.store_id', true) = store_id::text);
+    `);
+    await client.query(`
+      DROP POLICY IF EXISTS cart_items_tenant ON cart_items;
+      CREATE POLICY cart_items_tenant ON cart_items
+        FOR ALL TO "default"
+        USING (current_setting('app.store_id', true) = store_id::text)
+        WITH CHECK (current_setting('app.store_id', true) = store_id::text);
+    `);
+    // One cart per customer per store.
+    await client.query(`DROP INDEX IF EXISTS carts_store_customer_unique; CREATE UNIQUE INDEX carts_store_customer_unique ON carts(store_id, customer_id);`);
+    await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON carts, cart_items TO "default";`);
   } finally {
     client.release();
     await pool.end();
@@ -709,6 +756,113 @@ export function productTag(storeId: string, productId: string): string {
 export function storeProductsTag(storeId: string): string {
   return `store:${storeId}:products`;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// DB-backed cart CRUD (Issue #8).
+// For authenticated Customers — one cart per customer per store, RLS-scoped.
+// All via tenantClient. The pure line math (cart.ts) is the domain logic;
+// these functions persist/restore it.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Get or create a Customer's cart for the given Store. Returns the cart id.
+ * One cart per customer per store (enforced by a unique index).
+ */
+export async function getOrCreateDbCart(
+  storeId: string,
+  customerId: string,
+): Promise<string> {
+  return tenantClient(storeId, async (tx) => {
+    // Try to find existing.
+    const existing = await tx.execute(
+      sql`SELECT id FROM carts WHERE customer_id = ${customerId} LIMIT 1`,
+    );
+    if (existing.rows.length > 0) {
+      return existing.rows[0]!.id as string;
+    }
+    // Create new.
+    const [cart] = await tx
+      .insert(schema.carts)
+      .values({ storeId, customerId })
+      .returning();
+    return cart!.id;
+  });
+}
+
+/**
+ * Load a Customer's cart as a domain Cart object (storeId + lines).
+ * Returns an empty cart if the customer has no cart yet.
+ */
+export async function getDbCart(
+  storeId: string,
+  customerId: string,
+): Promise<Cart> {
+  return tenantClient(storeId, async (tx) => {
+    const cartRows = await tx.execute(
+      sql`SELECT id FROM carts WHERE customer_id = ${customerId} LIMIT 1`,
+    );
+    if (cartRows.rows.length === 0) {
+      return { storeId, lines: [] };
+    }
+    const cartId = cartRows.rows[0]!.id as string;
+
+    const itemRows = await tx.execute(
+      sql`SELECT variant_id, quantity FROM cart_items WHERE cart_id = ${cartId}`,
+    );
+    return {
+      storeId,
+      lines: (itemRows.rows as Array<{ variant_id: string; quantity: number }>).map(
+        (r) => ({ variantId: r.variant_id, quantity: r.quantity }),
+      ),
+    };
+  });
+}
+
+/**
+ * Save a cart's lines to the database, replacing any existing items.
+ * Used after pure line-math operations are applied to a Cart domain object.
+ */
+export async function saveDbCartLines(
+  storeId: string,
+  customerId: string,
+  lines: CartLine[],
+): Promise<void> {
+  await tenantClient(storeId, async (tx) => {
+    const cartId = await getOrCreateDbCart(storeId, customerId);
+
+    // Delete existing items.
+    await tx
+      .delete(schema.cartItems)
+      .where(eq(schema.cartItems.cartId, cartId));
+
+    // Insert new items.
+    if (lines.length > 0) {
+      await tx.insert(schema.cartItems).values(
+        lines.map((line) => ({
+          storeId,
+          cartId,
+          variantId: line.variantId,
+          quantity: line.quantity,
+        })),
+      );
+    }
+  });
+}
+
+/**
+ * Delete a Customer's cart (and all its items, via cascade).
+ */
+export async function deleteDbCart(
+  storeId: string,
+  customerId: string,
+): Promise<void> {
+  await tenantClient(storeId, async (tx) => {
+    await tx
+      .delete(schema.carts)
+      .where(eq(schema.carts.customerId, customerId));
+  });
+}
+
 
 
 
