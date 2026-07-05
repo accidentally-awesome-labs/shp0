@@ -13,7 +13,9 @@ export { transitionPayment, transitionFulfillment, isOrderOpen } from "./order";
 export type { PaymentStatus, FulfillmentStatus } from "./order";
 export { computeApplicationFee, buildCheckoutSessionParams } from "./payments";
 export type { CheckoutSessionParams } from "./payments";
-export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine } from "./schema";
+export { matchesRule } from "./collections";
+export type { CollectionRule, ProductForRule } from "./collections";
+export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine, Collection, NewCollection } from "./schema";
 import type { Cart, CartLine } from "./cart";
 
 /**
@@ -377,6 +379,49 @@ export async function applySchema(): Promise<void> {
         WITH CHECK (current_setting('app.store_id', true) = store_id::text);
     `);
     await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON orders, order_lines TO "default";`);
+
+    // ── collections + collection_products (tenant tables, RLS-protected) ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS collections (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        name text NOT NULL,
+        slug text NOT NULL,
+        type text NOT NULL,
+        rule jsonb,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS collection_products (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        collection_id uuid NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+        product_id uuid NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        position integer NOT NULL DEFAULT 0,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    await client.query(`DROP TRIGGER IF EXISTS collections_set_store_id ON collections; CREATE TRIGGER collections_set_store_id BEFORE INSERT ON collections FOR EACH ROW EXECUTE FUNCTION stamp_store_id();`);
+    await client.query(`DROP TRIGGER IF EXISTS collection_products_set_store_id ON collection_products; CREATE TRIGGER collection_products_set_store_id BEFORE INSERT ON collection_products FOR EACH ROW EXECUTE FUNCTION stamp_store_id();`);
+    await client.query(`ALTER TABLE collections ENABLE ROW LEVEL SECURITY;`);
+    await client.query(`ALTER TABLE collection_products ENABLE ROW LEVEL SECURITY;`);
+    await client.query(`
+      DROP POLICY IF EXISTS collections_tenant ON collections;
+      CREATE POLICY collections_tenant ON collections
+        FOR ALL TO "default"
+        USING (current_setting('app.store_id', true) = store_id::text)
+        WITH CHECK (current_setting('app.store_id', true) = store_id::text);
+    `);
+    await client.query(`
+      DROP POLICY IF EXISTS collection_products_tenant ON collection_products;
+      CREATE POLICY collection_products_tenant ON collection_products
+        FOR ALL TO "default"
+        USING (current_setting('app.store_id', true) = store_id::text)
+        WITH CHECK (current_setting('app.store_id', true) = store_id::text);
+    `);
+    await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON collections, collection_products TO "default";`);
 
     // ── commission_bps on stores (idempotent migration) ──
     await client.query(`ALTER TABLE stores ADD COLUMN IF NOT EXISTS commission_bps integer NOT NULL DEFAULT 250;`);
@@ -1326,6 +1371,144 @@ export async function getOrderForCheckout(
     };
   });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Collections — Manual + Automated (Issue #11).
+//
+// Manual collections use an explicit join table.
+// Automated collections evaluate their rule at query time (always current).
+// Both are tenant-scoped (RLS-protected).
+// ─────────────────────────────────────────────────────────────────────────
+
+import type { CollectionRule } from "./collections";
+
+/**
+ * Create a collection (manual or automated).
+ * For automated, pass a rule jsonb. For manual, omit rule.
+ */
+export async function createCollection(
+  storeId: string,
+  opts: {
+    name: string;
+    slug: string;
+    type: "manual" | "automated";
+    rule?: CollectionRule;
+  },
+): Promise<{ id: string; type: string }> {
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(
+      sql`INSERT INTO collections (name, slug, type, rule) VALUES (${opts.name}, ${opts.slug}, ${opts.type}, ${opts.rule ? JSON.stringify(opts.rule) : null}) RETURNING id, type`,
+    );
+    const r = rows.rows[0] as { id: string; type: string };
+    return { id: r.id, type: r.type };
+  });
+}
+
+/**
+ * List all collections in a Store.
+ */
+export async function listCollections(
+  storeId: string,
+): Promise<Array<{ id: string; name: string; slug: string; type: string }>> {
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT id, name, slug, type FROM collections ORDER BY created_at DESC`,
+    );
+    return rows.rows as Array<{ id: string; name: string; slug: string; type: string }>;
+  });
+}
+
+/**
+ * Add products to a manual collection (insert join rows).
+ */
+export async function addCollectionMembers(
+  storeId: string,
+  collectionId: string,
+  productIds: string[],
+): Promise<void> {
+  if (productIds.length === 0) return;
+  return tenantClient(storeId, async (tx) => {
+    for (const productId of productIds) {
+      await tx.execute(
+        sql`INSERT INTO collection_products (collection_id, product_id) VALUES (${collectionId}, ${productId}) ON CONFLICT DO NOTHING`,
+      );
+    }
+  });
+}
+
+/**
+ * Remove a product from a manual collection.
+ */
+export async function removeCollectionMember(
+  storeId: string,
+  collectionId: string,
+  productId: string,
+): Promise<void> {
+  return tenantClient(storeId, async (tx) => {
+    await tx.execute(
+      sql`DELETE FROM collection_products WHERE collection_id = ${collectionId} AND product_id = ${productId}`,
+    );
+  });
+}
+
+/**
+ * List the members of a collection (manual or automated).
+ *
+ * For manual: join collection_products → products.
+ * For automated: evaluate the rule at query time (always current).
+ */
+export async function listCollectionMembers(
+  storeId: string,
+  collectionId: string,
+): Promise<Array<{ id: string; title: string; slug: string }>> {
+  return tenantClient(storeId, async (tx) => {
+    // Look up the collection type + rule.
+    const colRows = await tx.execute(
+      sql`SELECT type, rule FROM collections WHERE id = ${collectionId} LIMIT 1`,
+    );
+    if (colRows.rows.length === 0) return [];
+    const col = colRows.rows[0] as { type: string; rule: unknown };
+
+    if (col.type === "manual") {
+      // Join table.
+      const rows = await tx.execute(
+        sql`
+          SELECT p.id, p.title, p.slug FROM products p
+          JOIN collection_products cp ON cp.product_id = p.id
+          WHERE cp.collection_id = ${collectionId}
+          ORDER BY cp.position, p.title
+        `,
+      );
+      return rows.rows as Array<{ id: string; title: string; slug: string }>;
+    }
+
+    // Automated — evaluate the rule.
+    const rule = col.rule as CollectionRule | null;
+    if (!rule) return [];
+
+    if (rule.type === "tag") {
+      const rows = await tx.execute(
+        sql`SELECT id, title, slug FROM products WHERE ${rule.tag} = ANY(tags) ORDER BY title`,
+      );
+      return rows.rows as Array<{ id: string; title: string; slug: string }>;
+    }
+
+    // price_range
+    const minCents = rule.minCents ?? 0;
+    const maxCents = rule.maxCents ?? Number.MAX_SAFE_INTEGER;
+    const rows = await tx.execute(
+      sql`
+        SELECT p.id, p.title, p.slug FROM products p
+        WHERE (
+          SELECT MIN(v.price_cents) FROM variants v WHERE v.product_id = p.id
+        ) BETWEEN ${minCents} AND ${maxCents}
+        ORDER BY p.title
+      `,
+    );
+    return rows.rows as Array<{ id: string; title: string; slug: string }>;
+  });
+}
+
 
 
 

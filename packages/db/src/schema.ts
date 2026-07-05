@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, uuid, boolean, integer, bigint } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, uuid, boolean, integer, bigint, jsonb } from "drizzle-orm/pg-core";
 
 /**
  * The `stores` table — one row per Store (tenant). This is the bootstrap tenant
@@ -135,6 +135,48 @@ export const orderLines = pgTable("order_lines", {
 
 export type OrderLine = typeof orderLines.$inferSelect;
 export type NewOrderLine = typeof orderLines.$inferInsert;
+
+/**
+ * A Collection — a named grouping of Products. Two types:
+ * - 'manual': explicit members via collection_products join table.
+ * - 'automated': members derived from a rule (jsonb), evaluated at query time.
+ * Scoped to a Store (store_id, RLS-protected).
+ */
+export const collections = pgTable("collections", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  storeId: uuid("store_id").notNull(),
+  name: text("name").notNull(),
+  slug: text("slug").notNull(),
+  type: text("type").notNull(), // 'manual' | 'automated'
+  // JSON rule for automated collections. Null for manual.
+  // Shape: { type: "tag", tag: string } | { type: "price_range", minCents?, maxCents? }
+  rule: jsonb("rule"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type Collection = typeof collections.$inferSelect;
+export type NewCollection = typeof collections.$inferInsert;
+
+/**
+ * Manual collection members — the join table a Merchant edits.
+ * Only used by manual collections. Scoped to a Store (store_id, RLS-protected).
+ */
+export const collectionProducts = pgTable("collection_products", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  storeId: uuid("store_id").notNull(),
+  collectionId: uuid("collection_id")
+    .notNull()
+    .references(() => collections.id, { onDelete: "cascade" }),
+  productId: uuid("product_id")
+    .notNull()
+    .references(() => products.id, { onDelete: "cascade" }),
+  position: integer("position").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type CollectionProduct = typeof collectionProducts.$inferSelect;
+export type NewCollectionProduct = typeof collectionProducts.$inferInsert;
 
 /**
  * A Stripe Connect payment account linked to a Store. PLATFORM table (no RLS) —
