@@ -9,7 +9,9 @@ export * as schema from "./schema";
 export { parseMoney, formatMoney, applyPercent } from "./money";
 export { addLine, updateLine, removeLine, computeSubtotal, mergeCarts } from "./cart";
 export type { Cart, CartLine } from "./cart";
-export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem } from "./schema";
+export { transitionPayment, transitionFulfillment, isOrderOpen } from "./order";
+export type { PaymentStatus, FulfillmentStatus } from "./order";
+export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine } from "./schema";
 import type { Cart, CartLine } from "./cart";
 
 /**
@@ -327,6 +329,52 @@ export async function applySchema(): Promise<void> {
     // One cart per customer per store.
     await client.query(`DROP INDEX IF EXISTS carts_store_customer_unique; CREATE UNIQUE INDEX carts_store_customer_unique ON carts(store_id, customer_id);`);
     await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON carts, cart_items TO "default";`);
+
+    // ── orders + order_lines (TENANT tables — RLS-protected) ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS orders (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        customer_id text NOT NULL,
+        payment_status text NOT NULL DEFAULT 'pending',
+        fulfillment_status text NOT NULL DEFAULT 'unfulfilled',
+        total_cents bigint NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS order_lines (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        order_id uuid NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+        variant_id uuid NOT NULL,
+        quantity integer NOT NULL,
+        unit_price_cents bigint NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    // store_id stamped from GUC by the existing stamp_store_id() trigger.
+    await client.query(`DROP TRIGGER IF EXISTS orders_set_store_id ON orders; CREATE TRIGGER orders_set_store_id BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION stamp_store_id();`);
+    await client.query(`DROP TRIGGER IF EXISTS order_lines_set_store_id ON order_lines; CREATE TRIGGER order_lines_set_store_id BEFORE INSERT ON order_lines FOR EACH ROW EXECUTE FUNCTION stamp_store_id();`);
+    // RLS: orders + order_lines are tenant-isolated.
+    await client.query(`ALTER TABLE orders ENABLE ROW LEVEL SECURITY;`);
+    await client.query(`ALTER TABLE order_lines ENABLE ROW LEVEL SECURITY;`);
+    await client.query(`
+      DROP POLICY IF EXISTS orders_tenant ON orders;
+      CREATE POLICY orders_tenant ON orders
+        FOR ALL TO "default"
+        USING (current_setting('app.store_id', true) = store_id::text)
+        WITH CHECK (current_setting('app.store_id', true) = store_id::text);
+    `);
+    await client.query(`
+      DROP POLICY IF EXISTS order_lines_tenant ON order_lines;
+      CREATE POLICY order_lines_tenant ON order_lines
+        FOR ALL TO "default"
+        USING (current_setting('app.store_id', true) = store_id::text)
+        WITH CHECK (current_setting('app.store_id', true) = store_id::text);
+    `);
+    await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON orders, order_lines TO "default";`);
   } finally {
     client.release();
     await pool.end();
@@ -862,6 +910,100 @@ export async function deleteDbCart(
       .where(eq(schema.carts.customerId, customerId));
   });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Checkout + Order lifecycle (Issue #9).
+// checkout() converts a Cart into an Order (pending/unfulfilled), snapshots
+// unit prices into Order Lines, and consumes the Cart.
+// Inventory is NOT decremented here — that's the payment slice (ADR-0002).
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Convert a Customer's Cart into an Order.
+ *
+ * 1. Loads the cart + live variant prices.
+ * 2. Creates an Order in payment=pending, fulfillment=unfulfilled.
+ * 3. Creates Order Lines with snapshotted unit prices (frozen at checkout).
+ * 4. Consumes the Cart (deletes it).
+ *
+ * Inventory is NOT decremented here — that happens in the payment transaction.
+ */
+export async function checkout(
+  storeId: string,
+  customerId: string,
+): Promise<{ orderId: string; totalCents: number }> {
+  return tenantClient(storeId, async (tx) => {
+    // 1. Load cart + prices.
+    const cartRows = await tx.execute(
+      sql`SELECT id FROM carts WHERE customer_id = ${customerId} LIMIT 1`,
+    );
+    if (cartRows.rows.length === 0) {
+      throw new Error("Cannot checkout: cart is empty or does not exist");
+    }
+    const cartId = cartRows.rows[0]!.id as string;
+
+    const itemRows = await tx.execute(
+      sql`SELECT variant_id, quantity FROM cart_items WHERE cart_id = ${cartId}`,
+    );
+    const lines = itemRows.rows as Array<{ variant_id: string; quantity: number }>;
+    if (lines.length === 0) {
+      throw new Error("Cannot checkout: cart has no items");
+    }
+
+    // Snapshot live prices for each variant.
+    let totalCents = 0;
+    const pricedLines: Array<{
+      variantId: string;
+      quantity: number;
+      unitPriceCents: number;
+    }> = [];
+
+    for (const line of lines) {
+      const priceRows = await tx.execute(
+        sql`SELECT price_cents FROM variants WHERE id = ${line.variant_id} LIMIT 1`,
+      );
+      if (priceRows.rows.length === 0) {
+        throw new Error(`Variant ${line.variant_id} not found`);
+      }
+      const unitPriceCents = priceRows.rows[0]!.price_cents as number;
+      totalCents += unitPriceCents * line.quantity;
+      pricedLines.push({
+        variantId: line.variant_id,
+        quantity: line.quantity,
+        unitPriceCents,
+      });
+    }
+
+    // 2. Create the Order (pending/unfulfilled).
+    const [order] = await tx
+      .insert(schema.orders)
+      .values({
+        storeId,
+        customerId,
+        paymentStatus: "pending",
+        fulfillmentStatus: "unfulfilled",
+        totalCents,
+      })
+      .returning();
+
+    // 3. Create Order Lines with snapshotted prices.
+    for (const line of pricedLines) {
+      await tx.insert(schema.orderLines).values({
+        storeId,
+        orderId: order!.id,
+        variantId: line.variantId,
+        quantity: line.quantity,
+        unitPriceCents: line.unitPriceCents,
+      });
+    }
+
+    // 4. Consume the cart (delete it — cascade removes cart_items).
+    await tx.delete(schema.carts).where(eq(schema.carts.id, cartId));
+
+    return { orderId: order!.id, totalCents };
+  });
+}
+
 
 
 

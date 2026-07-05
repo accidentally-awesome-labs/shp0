@@ -96,6 +96,45 @@ export type CartItem = typeof cartItems.$inferSelect;
 export type NewCartItem = typeof cartItems.$inferInsert;
 
 /**
+ * An Order — created by checkout() from a Cart. Carries the two-dimensional
+ * lifecycle (payment + fulfillment status). Tenant-scoped (RLS-protected).
+ * Per ADR-0002: created in payment=pending, fulfillment=unfulfilled.
+ */
+export const orders = pgTable("orders", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  storeId: uuid("store_id").notNull(),
+  customerId: text("customer_id").notNull(),
+  paymentStatus: text("payment_status").notNull().default("pending"),
+  fulfillmentStatus: text("fulfillment_status").notNull().default("unfulfilled"),
+  totalCents: bigint("total_cents", { mode: "number" }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type Order = typeof orders.$inferSelect;
+export type NewOrder = typeof orders.$inferInsert;
+
+/**
+ * An Order Line — one line in an Order. References a Variant at a quantity and
+ * a snapshot of the unit price at checkout time (prices are frozen, not live).
+ * Tenant-scoped (RLS-protected).
+ */
+export const orderLines = pgTable("order_lines", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  storeId: uuid("store_id").notNull(),
+  orderId: uuid("order_id")
+    .notNull()
+    .references(() => orders.id, { onDelete: "cascade" }),
+  variantId: uuid("variant_id").notNull(),
+  quantity: integer("quantity").notNull(),
+  unitPriceCents: bigint("unit_price_cents", { mode: "number" }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type OrderLine = typeof orderLines.$inferSelect;
+export type NewOrderLine = typeof orderLines.$inferInsert;
+
+/**
  * A Membership links a global Merchant (user) to a Store with a Role.
  * This is a PLATFORM table (no store_id GUC, no RLS) — it bridges the global
  * identity domain (Merchants) to the tenant domain (Stores). Queried via
