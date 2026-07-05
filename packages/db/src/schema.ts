@@ -179,6 +179,71 @@ export type CollectionProduct = typeof collectionProducts.$inferSelect;
 export type NewCollectionProduct = typeof collectionProducts.$inferInsert;
 
 /**
+ * A Customer — the per-Store storefront identity (Issue #13).
+ * SEPARATE from Merchant identity (which is global/cross-Store).
+ * A Customer belongs to exactly ONE Store. The same email on Store A and
+ * Store B are completely separate identities (no relationship).
+ * Scoped to a Store (store_id, RLS-protected).
+ */
+export const customers = pgTable("customers", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  storeId: uuid("store_id").notNull(),
+  email: text("email").notNull(),
+  name: text("name").notNull(),
+  // scrypt hash — never the plaintext password.
+  passwordHash: text("password_hash").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type Customer = typeof customers.$inferSelect;
+export type NewCustomer = typeof customers.$inferInsert;
+
+/**
+ * A Customer session — a signed-in Customer's session token.
+ * Tenant-scoped (store_id, RLS-protected). A session belongs to one Customer
+ * in one Store.
+ */
+export const customerSessions = pgTable("customer_sessions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  storeId: uuid("store_id").notNull(),
+  customerId: uuid("customer_id")
+    .notNull()
+    .references(() => customers.id, { onDelete: "cascade" }),
+  token: text("token").notNull().unique(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type CustomerSession = typeof customerSessions.$inferSelect;
+
+/**
+ * A Customer address — shipping/billing address book entry.
+ * Tenant-scoped (store_id, RLS-protected).
+ */
+export const addresses = pgTable("addresses", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  storeId: uuid("store_id").notNull(),
+  customerId: uuid("customer_id")
+    .notNull()
+    .references(() => customers.id, { onDelete: "cascade" }),
+  fullName: text("full_name").notNull(),
+  line1: text("line1").notNull(),
+  line2: text("line2"),
+  city: text("city").notNull(),
+  region: text("region").notNull(),
+  postalCode: text("postal_code").notNull(),
+  country: text("country").notNull(),
+  phone: text("phone"),
+  isDefault: boolean("is_default").notNull().default(false),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type Address = typeof addresses.$inferSelect;
+export type NewAddress = typeof addresses.$inferInsert;
+
+/**
  * A Discount — a unified Trigger + Reward + Conditions entity (Issue #12).
  * Code-based and automatic/BOGO are the same concept.
  * Scoped to a Store (store_id, RLS-protected).

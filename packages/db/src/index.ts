@@ -17,6 +17,8 @@ export { matchesRule } from "./collections";
 export type { CollectionRule, ProductForRule } from "./collections";
 export { applyDiscounts } from "./discounts";
 export type { DiscountCart, DiscountReward, DiscountResult } from "./discounts";
+export { hashPassword, verifyPassword } from "./customer-auth";
+export type { Customer, NewCustomer } from "./schema";
 export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine, Collection, NewCollection } from "./schema";
 import type { Cart, CartLine } from "./cart";
 
@@ -469,6 +471,62 @@ export async function applySchema(): Promise<void> {
         WITH CHECK (current_setting('app.store_id', true) = store_id::text);
     `);
     await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON discounts, discount_redemptions TO "default";`);
+
+    // ── customers + customer_sessions + addresses (tenant tables, RLS-protected) ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS customers (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        email text NOT NULL,
+        name text NOT NULL,
+        password_hash text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        UNIQUE (store_id, email)
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS customer_sessions (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        customer_id uuid NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+        token text NOT NULL UNIQUE,
+        expires_at timestamptz NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS addresses (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        customer_id uuid NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+        full_name text NOT NULL,
+        line1 text NOT NULL,
+        line2 text,
+        city text NOT NULL,
+        region text NOT NULL,
+        postal_code text NOT NULL,
+        country text NOT NULL,
+        phone text,
+        is_default boolean NOT NULL DEFAULT false,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    await client.query(`DROP TRIGGER IF EXISTS customers_set_store_id ON customers; CREATE TRIGGER customers_set_store_id BEFORE INSERT ON customers FOR EACH ROW EXECUTE FUNCTION stamp_store_id();`);
+    await client.query(`DROP TRIGGER IF EXISTS customer_sessions_set_store_id ON customer_sessions; CREATE TRIGGER customer_sessions_set_store_id BEFORE INSERT ON customer_sessions FOR EACH ROW EXECUTE FUNCTION stamp_store_id();`);
+    await client.query(`DROP TRIGGER IF EXISTS addresses_set_store_id ON addresses; CREATE TRIGGER addresses_set_store_id BEFORE INSERT ON addresses FOR EACH ROW EXECUTE FUNCTION stamp_store_id();`);
+    for (const tbl of ["customers", "customer_sessions", "addresses"]) {
+      await client.query(`ALTER TABLE ${tbl} ENABLE ROW LEVEL SECURITY;`);
+      await client.query(`
+        DROP POLICY IF EXISTS ${tbl}_tenant ON ${tbl};
+        CREATE POLICY ${tbl}_tenant ON ${tbl}
+          FOR ALL TO "default"
+          USING (current_setting('app.store_id', true) = store_id::text)
+          WITH CHECK (current_setting('app.store_id', true) = store_id::text);
+      `);
+    }
+    await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON customers, customer_sessions, addresses TO "default";`);
 
     // ── commission_bps on stores (idempotent migration) ──
     await client.query(`ALTER TABLE stores ADD COLUMN IF NOT EXISTS commission_bps integer NOT NULL DEFAULT 250;`);
@@ -1744,6 +1802,135 @@ export async function redeemDiscount(
 }
 
 
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// Customer identity — per-Store, RLS-protected (Issue #13).
+//
+// Customers are SEPARATE from Merchants (global/better-auth). A Customer
+// belongs to exactly one Store. All queries run through tenantClient (RLS).
+// ─────────────────────────────────────────────────────────────────────────
+
+import { hashPassword, verifyPassword } from "./customer-auth";
+
+/** Session expiry: 30 days. */
+const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Sign up a new Customer in a Store.
+ * Throws if a customer with this email already exists in this Store.
+ */
+export async function signUpCustomer(
+  storeId: string,
+  opts: { email: string; password: string; name: string },
+): Promise<{ customerId: string }> {
+  const passwordHash = hashPassword(opts.password);
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(
+      sql`INSERT INTO customers (email, name, password_hash) VALUES (${opts.email}, ${opts.name}, ${passwordHash}) RETURNING id`,
+    );
+    return { customerId: (rows.rows[0] as { id: string }).id };
+  });
+}
+
+/**
+ * Sign in a Customer — returns a session token, or null if credentials are wrong.
+ */
+export async function signInCustomer(
+  storeId: string,
+  opts: { email: string; password: string },
+): Promise<{ token: string; customerId: string } | null> {
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT id, password_hash FROM customers WHERE email = ${opts.email} LIMIT 1`,
+    );
+    if (rows.rows.length === 0) return null;
+    const customer = rows.rows[0] as { id: string; password_hash: string };
+    if (!verifyPassword(opts.password, customer.password_hash)) return null;
+    const token = randomUUID();
+    const expiresAt = new Date(Date.now() + SESSION_DURATION_MS);
+    await tx.execute(
+      sql`INSERT INTO customer_sessions (customer_id, token, expires_at) VALUES (${customer.id}, ${token}, ${expiresAt})`,
+    );
+    return { token, customerId: customer.id };
+  });
+}
+
+/**
+ * Resolve a session token to the Customer (for request-time auth).
+ */
+export async function getCustomerBySession(
+  storeId: string,
+  token: string,
+): Promise<{ id: string; email: string; name: string } | null> {
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT c.id, c.email, c.name FROM customers c JOIN customer_sessions s ON s.customer_id = c.id WHERE s.token = ${token} AND s.expires_at > now() LIMIT 1`,
+    );
+    if (rows.rows.length === 0) return null;
+    return rows.rows[0] as { id: string; email: string; name: string };
+  });
+}
+
+/**
+ * List all Customers in a Store (for the dashboard).
+ */
+export async function listCustomers(
+  storeId: string,
+): Promise<Array<{ id: string; email: string; name: string }>> {
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(sql`SELECT id, email, name FROM customers ORDER BY created_at DESC`);
+    return rows.rows as Array<{ id: string; email: string; name: string }>;
+  });
+}
+
+/**
+ * List a Customer's orders (order history).
+ */
+export async function listCustomerOrders(
+  storeId: string,
+  customerId: string,
+): Promise<Array<{ id: string; paymentStatus: string; fulfillmentStatus: string; totalCents: number }>> {
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT id, payment_status, fulfillment_status, total_cents FROM orders WHERE customer_id = ${customerId} ORDER BY created_at DESC`,
+    );
+    return (rows.rows as Array<{ id: string; payment_status: string; fulfillment_status: string; total_cents: number }>)
+      .map((r) => ({ id: r.id, paymentStatus: r.payment_status, fulfillmentStatus: r.fulfillment_status, totalCents: r.total_cents }));
+  });
+}
+
+/**
+ * Add an address to a Customer's address book.
+ */
+export async function addCustomerAddress(
+  storeId: string,
+  customerId: string,
+  opts: { fullName: string; line1: string; line2?: string; city: string; region: string; postalCode: string; country: string; phone?: string },
+): Promise<{ id: string }> {
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(
+      sql`INSERT INTO addresses (customer_id, full_name, line1, line2, city, region, postal_code, country, phone) VALUES (${customerId}, ${opts.fullName}, ${opts.line1}, ${opts.line2 ?? null}, ${opts.city}, ${opts.region}, ${opts.postalCode}, ${opts.country}, ${opts.phone ?? null}) RETURNING id`,
+    );
+    return { id: (rows.rows[0] as { id: string }).id };
+  });
+}
+
+/**
+ * List a Customer's addresses.
+ */
+export async function listCustomerAddresses(
+  storeId: string,
+  customerId: string,
+): Promise<Array<{ id: string; fullName: string; line1: string; line2: string | null; city: string; region: string; postalCode: string; country: string }>> {
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT id, full_name, line1, line2, city, region, postal_code, country FROM addresses WHERE customer_id = ${customerId} ORDER BY created_at DESC`,
+    );
+    return (rows.rows as Array<{ id: string; full_name: string; line1: string; line2: string | null; city: string; region: string; postal_code: string; country: string }>)
+      .map((r) => ({ id: r.id, fullName: r.full_name, line1: r.line1, line2: r.line2, city: r.city, region: r.region, postalCode: r.postal_code, country: r.country }));
+  });
+}
 
 
 
