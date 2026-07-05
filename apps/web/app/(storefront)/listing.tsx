@@ -38,7 +38,12 @@ export default async function StorefrontListing() {
 
   return (
     <div className="mx-auto max-w-5xl px-4 py-8">
-      <h1 className="text-2xl font-bold">All Products</h1>
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold">All Products</h1>
+        <Link href="/cart" className="text-sm text-gray-600 hover:text-black">
+          View cart →
+        </Link>
+      </div>
 
       {products.length === 0 ? (
         <p className="mt-8 text-gray-500">No products available yet.</p>
