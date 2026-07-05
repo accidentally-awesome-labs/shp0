@@ -4,6 +4,7 @@ import {
   parseSubdomain,
   authorizeStoreMembership,
   resolveStoreBySubdomain,
+  resolveStoreByCustomDomain,
 } from "@shp0/db";
 import { auth } from "@/lib/auth";
 
@@ -36,17 +37,23 @@ export async function resolveDashboardStore(storeId: string): Promise<{
 /**
  * Resolve the Current Store for a storefront request, from the request host.
  *
- * Extracts the subdomain from the host (e.g. "acme.shp0.dev" → "acme"),
- * then looks up the Store by subdomain. Returns null if the host doesn't
- * map to a Store (platform domain, localhost, unknown subdomain).
+ * Resolution order (ADR-0005):
+ * 1. Custom Domain — if the host matches a VERIFIED custom domain, use it.
+ * 2. Subdomain — extract subdomain from host (e.g. "acme.shp0.dev" → "acme").
  *
- * In local dev, there's no real subdomain — this returns null, and the
- * storefront shows a dev fallback.
+ * Returns null if the host doesn't map to a Store.
+ * Only VERIFIED custom domains resolve (security — pending/failed do not serve).
  */
 export async function resolveStorefrontStore(): Promise<string | null> {
   const h = await headers();
   const host = h.get("host") ?? "localhost:3000";
+  const hostname = host.split(":")[0]!; // strip port
 
+  // 1. Check custom domains first (verified only).
+  const customStoreId = await resolveStoreByCustomDomain(hostname);
+  if (customStoreId) return customStoreId;
+
+  // 2. Fall back to subdomain resolution.
   const subdomain = parseSubdomain(host);
   if (!subdomain) return null;
 
