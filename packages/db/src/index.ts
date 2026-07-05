@@ -11,6 +11,8 @@ export { addLine, updateLine, removeLine, computeSubtotal, mergeCarts } from "./
 export type { Cart, CartLine } from "./cart";
 export { transitionPayment, transitionFulfillment, isOrderOpen } from "./order";
 export type { PaymentStatus, FulfillmentStatus } from "./order";
+export { computeApplicationFee, buildCheckoutSessionParams } from "./payments";
+export type { CheckoutSessionParams } from "./payments";
 export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine } from "./schema";
 import type { Cart, CartLine } from "./cart";
 
@@ -375,6 +377,30 @@ export async function applySchema(): Promise<void> {
         WITH CHECK (current_setting('app.store_id', true) = store_id::text);
     `);
     await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON orders, order_lines TO "default";`);
+
+    // ── commission_bps on stores (idempotent migration) ──
+    await client.query(`ALTER TABLE stores ADD COLUMN IF NOT EXISTS commission_bps integer NOT NULL DEFAULT 250;`);
+
+    // ── stripe_payment_accounts (PLATFORM table — no RLS) ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS stripe_payment_accounts (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL UNIQUE REFERENCES stores(id) ON DELETE CASCADE,
+        connect_account_id text NOT NULL,
+        details_submitted boolean NOT NULL DEFAULT false,
+        charges_enabled boolean NOT NULL DEFAULT false,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+
+    // ── processed_events (PLATFORM table — idempotency, no RLS) ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS processed_events (
+        id text PRIMARY KEY,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
   } finally {
     client.release();
     await pool.end();
@@ -1054,6 +1080,161 @@ export async function getOrder(
       fulfillmentStatus: o.fulfillment_status,
       totalCents: o.total_cents,
       lines,
+    };
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Payment transaction + idempotency (Issue #10, ADR-0002).
+//
+// markOrderPaid() is the concurrency fence: it transitions payment: pending→paid,
+// reads the affected Variants FOR UPDATE (row-lock), checks + decrements inventory,
+// all atomically inside ONE transaction. No oversell is possible.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Transition an Order to paid and decrement inventory atomically.
+ *
+ * THE CONCURRENCY FENCE (ADR-0002):
+ * 1. Read the Order's lines.
+ * 2. SELECT ... FOR UPDATE on each Variant (row-lock — serializes concurrent payments).
+ * 3. Check inventory >= quantity for every line.
+ *    - If ANY line is insufficient → throw (payment voided). NO decrement happens.
+ * 4. Decrement all variants.
+ * 5. Transition payment: pending → paid.
+ *
+ * All in ONE transaction — if step 3 fails, nothing is committed (no partial decrement).
+ *
+ * Returns true if the transition succeeded, false if the order was already paid
+ * (idempotent — safe to call from a replayed webhook).
+ */
+export async function markOrderPaid(
+  storeId: string,
+  orderId: string,
+): Promise<{ ok: true } | { ok: false; reason: "already_paid" | "insufficient_inventory" }> {
+  return tenantClient(storeId, async (tx) => {
+    // Check current payment status (idempotency).
+    const orderRows = await tx.execute(
+      sql`SELECT payment_status FROM orders WHERE id = ${orderId} FOR UPDATE`,
+    );
+    if (orderRows.rows.length === 0) {
+      throw new Error(`Order ${orderId} not found`);
+    }
+    const currentStatus = orderRows.rows[0]!.payment_status as string;
+    if (currentStatus === "paid") {
+      return { ok: false, reason: "already_paid" };
+    }
+    if (currentStatus !== "pending") {
+      throw new Error(`Order ${orderId} is in unexpected state: ${currentStatus}`);
+    }
+
+    // Load order lines.
+    const lineRows = await tx.execute(
+      sql`SELECT variant_id, quantity FROM order_lines WHERE order_id = ${orderId}`,
+    );
+    const lines = lineRows.rows as Array<{ variant_id: string; quantity: number }>;
+
+    // Lock + check each variant. FOR UPDATE serializes concurrent payments.
+    for (const line of lines) {
+      const variantRows = await tx.execute(
+        sql`SELECT inventory FROM variants WHERE id = ${line.variant_id} FOR UPDATE`,
+      );
+      if (variantRows.rows.length === 0) {
+        throw new Error(`Variant ${line.variant_id} not found`);
+      }
+      const inventory = variantRows.rows[0]!.inventory as number;
+      if (inventory < line.quantity) {
+        // Insufficient inventory — void this payment attempt.
+        // NO decrement happens (we haven't written any). The transaction rolls back.
+        return { ok: false, reason: "insufficient_inventory" };
+      }
+    }
+
+    // All checks passed — decrement every variant.
+    for (const line of lines) {
+      await tx.execute(
+        sql`UPDATE variants SET inventory = inventory - ${line.quantity} WHERE id = ${line.variant_id}`,
+      );
+    }
+
+    // Transition payment: pending → paid.
+    await tx.execute(
+      sql`UPDATE orders SET payment_status = 'paid', updated_at = now() WHERE id = ${orderId}`,
+    );
+
+    return { ok: true as const };
+  });
+}
+
+/**
+ * Check whether a webhook event has already been processed (idempotency).
+ * Returns true if the event id is in the processed_events table.
+ */
+export async function isEventProcessed(eventId: string): Promise<boolean> {
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT id FROM processed_events WHERE id = ${eventId} LIMIT 1`,
+    );
+    return rows.rows.length > 0;
+  });
+}
+
+/**
+ * Mark a webhook event as processed. Insert is best-effort — if the event is
+ * already processed, the PK conflict makes this a no-op.
+ */
+export async function markEventProcessed(eventId: string): Promise<void> {
+  await platformClient(async (tx) => {
+    await tx.execute(
+      sql`INSERT INTO processed_events (id) VALUES (${eventId}) ON CONFLICT DO NOTHING`,
+    );
+  });
+}
+
+/**
+ * Upsert a Store's Stripe Connect account. Called after onboarding completes.
+ */
+export async function upsertPaymentAccount(opts: {
+  storeId: string;
+  connectAccountId: string;
+  detailsSubmitted?: boolean;
+  chargesEnabled?: boolean;
+}): Promise<void> {
+  await platformClient(async (tx) => {
+    await tx.execute(
+      sql`
+        INSERT INTO stripe_payment_accounts (store_id, connect_account_id, details_submitted, charges_enabled)
+        VALUES (${opts.storeId}, ${opts.connectAccountId}, ${opts.detailsSubmitted ?? false}, ${opts.chargesEnabled ?? false})
+        ON CONFLICT (store_id) DO UPDATE SET
+          connect_account_id = EXCLUDED.connect_account_id,
+          details_submitted = EXCLUDED.details_submitted,
+          charges_enabled = EXCLUDED.charges_enabled,
+          updated_at = now()
+      `,
+    );
+  });
+}
+
+/**
+ * Get a Store's Stripe Connect account, or null if not yet onboarded.
+ */
+export async function getPaymentAccount(
+  storeId: string,
+): Promise<{ connectAccountId: string; detailsSubmitted: boolean; chargesEnabled: boolean } | null> {
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT connect_account_id, details_submitted, charges_enabled FROM stripe_payment_accounts WHERE store_id = ${storeId} LIMIT 1`,
+    );
+    if (rows.rows.length === 0) return null;
+    const r = rows.rows[0] as {
+      connect_account_id: string;
+      details_submitted: boolean;
+      charges_enabled: boolean;
+    };
+    return {
+      connectAccountId: r.connect_account_id,
+      detailsSubmitted: r.details_submitted,
+      chargesEnabled: r.charges_enabled,
     };
   });
 }

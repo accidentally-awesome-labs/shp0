@@ -11,6 +11,8 @@ export const stores = pgTable("stores", {
   storeId: uuid("store_id").notNull(),
   name: text("name").notNull(),
   subdomain: text("subdomain").notNull().unique(),
+  // Commission in basis points (250 = 2.5%). Platform-wide default, overridable per store.
+  commissionBps: integer("commission_bps").notNull().default(250),
   createdAt: timestamp("created_at", { withTimezone: true })
     .defaultNow()
     .notNull(),
@@ -133,6 +135,36 @@ export const orderLines = pgTable("order_lines", {
 
 export type OrderLine = typeof orderLines.$inferSelect;
 export type NewOrderLine = typeof orderLines.$inferInsert;
+
+/**
+ * A Stripe Connect payment account linked to a Store. PLATFORM table (no RLS) —
+ * bridges the Store (tenant) to Stripe's Connect account (external). Queried
+ * via platformClient. One per Store.
+ */
+export const stripePaymentAccounts = pgTable("stripe_payment_accounts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  storeId: uuid("store_id").notNull().unique(),
+  connectAccountId: text("connect_account_id").notNull(),
+  detailsSubmitted: boolean("details_submitted").notNull().default(false),
+  chargesEnabled: boolean("charges_enabled").notNull().default(false),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type StripePaymentAccount = typeof stripePaymentAccounts.$inferSelect;
+export type NewStripePaymentAccount = typeof stripePaymentAccounts.$inferInsert;
+
+/**
+ * Processed webhook events — idempotency. Keyed by Stripe event id.
+ * PLATFORM table (no RLS) — the webhook handler runs cross-Store (it doesn't
+ * know the Store until it looks up the Connect account from the event).
+ */
+export const processedEvents = pgTable("processed_events", {
+  id: text("id").primaryKey(), // Stripe event id (e.g. "evt_123")
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type ProcessedEvent = typeof processedEvents.$inferSelect;
 
 /**
  * A Membership links a global Merchant (user) to a Store with a Role.
