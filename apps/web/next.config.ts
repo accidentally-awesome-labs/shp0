@@ -11,6 +11,8 @@ const nextConfig: NextConfig = {
   // React Compiler — installed as babel-plugin-react-compiler, auto-wired by Next.
   experimental: {
     reactCompiler: true,
+    // Partial Prerendering — static shell with dynamic holes (the speed flex).
+    ppr: true,
   },
 };
 

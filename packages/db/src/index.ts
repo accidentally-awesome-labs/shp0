@@ -606,6 +606,7 @@ export async function listPublishedProducts(
     id: string;
     title: string;
     slug: string;
+    status: string;
     minPriceCents: number;
   }>
 > {
