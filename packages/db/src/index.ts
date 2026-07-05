@@ -17,6 +17,8 @@ export { matchesRule } from "./collections";
 export type { CollectionRule, ProductForRule } from "./collections";
 export { applyDiscounts } from "./discounts";
 export type { DiscountCart, DiscountReward, DiscountResult } from "./discounts";
+export { checkUsagePolicy, TIERS } from "./billing";
+export type { Tier, TierLimits, Usage, UsageAction, UsagePolicy } from "./billing";
 export { hashPassword, verifyPassword } from "./customer-auth";
 export type { Customer, NewCustomer } from "./schema";
 export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine, Collection, NewCollection } from "./schema";
@@ -527,6 +529,19 @@ export async function applySchema(): Promise<void> {
       `);
     }
     await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON customers, customer_sessions, addresses TO "default";`);
+
+    // ── subscriptions (PLATFORM table — one Store → one Tier, no RLS) ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL UNIQUE,
+        tier_id text NOT NULL,
+        stripe_subscription_id text,
+        status text NOT NULL DEFAULT 'active',
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
 
     // ── commission_bps on stores (idempotent migration) ──
     await client.query(`ALTER TABLE stores ADD COLUMN IF NOT EXISTS commission_bps integer NOT NULL DEFAULT 250;`);
@@ -1929,6 +1944,91 @@ export async function listCustomerAddresses(
     );
     return (rows.rows as Array<{ id: string; full_name: string; line1: string; line2: string | null; city: string; region: string; postal_code: string; country: string }>)
       .map((r) => ({ id: r.id, fullName: r.full_name, line1: r.line1, line2: r.line2, city: r.city, region: r.region, postalCode: r.postal_code, country: r.country }));
+  });
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// Platform billing — Tiers / Subscriptions / Commission (Issue #15).
+//
+// A Store holds one Subscription to a Tier at a time. The Tier determines
+// the commission rate (collected as the Connect application_fee) and usage
+// limits (Free = hard cap, Pro/Scale = overage).
+// ─────────────────────────────────────────────────────────────────────────
+
+import { TIERS } from "./billing";
+import type { Tier } from "./billing";
+
+/**
+ * Get a Store's current tier (defaults to 'free' if no subscription).
+ * Platform-scoped — subscriptions are cross-Store.
+ */
+export async function getStoreTier(storeId: string): Promise<Tier> {
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT tier_id FROM subscriptions WHERE store_id = ${storeId} AND status = 'active' LIMIT 1`,
+    );
+    if (rows.rows.length === 0) return TIERS.free;
+    const tierId = rows.rows[0]!.tier_id as "free" | "pro" | "scale";
+    return TIERS[tierId];
+  });
+}
+
+/**
+ * Get a Store's commission rate from its current Tier.
+ * This replaces the static stores.commission_bps — the rate is tier-driven.
+ */
+export async function getTierCommissionBps(storeId: string): Promise<number> {
+  const tier = await getStoreTier(storeId);
+  return tier.commissionBps;
+}
+
+/**
+ * Subscribe a Store to a Tier (or change tiers — upgrade/downgrade).
+ * One active subscription per Store (UNIQUE on store_id).
+ */
+export async function setStoreTier(
+  storeId: string,
+  tierId: "free" | "pro" | "scale",
+): Promise<void> {
+  return platformClient(async (tx) => {
+    await tx.execute(
+      sql`
+        INSERT INTO subscriptions (store_id, tier_id)
+        VALUES (${storeId}, ${tierId})
+        ON CONFLICT (store_id) DO UPDATE SET
+          tier_id = EXCLUDED.tier_id,
+          status = 'active',
+          updated_at = now()
+      `,
+    );
+  });
+}
+
+/**
+ * Meter current usage for a Store (for the usage policy evaluator).
+ * Counts products, orders this month, and staff seats.
+ */
+export async function getStoreUsage(storeId: string): Promise<{
+  productCount: number;
+  orderCountThisMonth: number;
+  staffSeats: number;
+}> {
+  return platformClient(async (tx) => {
+    const productRows = await tx.execute(
+      sql`SELECT COUNT(*) as count FROM products WHERE store_id = ${storeId}`,
+    );
+    const orderRows = await tx.execute(
+      sql`SELECT COUNT(*) as count FROM orders WHERE store_id = ${storeId} AND date_trunc('month', created_at) = date_trunc('month', now())`,
+    );
+    const staffRows = await tx.execute(
+      sql`SELECT COUNT(*) as count FROM memberships WHERE store_id = ${storeId}`,
+    );
+    return {
+      productCount: parseInt(productRows.rows[0]!.count as string),
+      orderCountThisMonth: parseInt(orderRows.rows[0]!.count as string),
+      staffSeats: parseInt(staffRows.rows[0]!.count as string),
+    };
   });
 }
 

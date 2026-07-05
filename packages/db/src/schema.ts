@@ -179,6 +179,24 @@ export type CollectionProduct = typeof collectionProducts.$inferSelect;
 export type NewCollectionProduct = typeof collectionProducts.$inferInsert;
 
 /**
+ * A Subscription — links a Store to a billing Tier (Issue #15).
+ * PLATFORM table (no RLS) — one Store → one Tier at a time.
+ * Queried via platformClient. The tier determines the commission rate.
+ */
+export const subscriptions = pgTable("subscriptions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  storeId: uuid("store_id").notNull().unique(), // one active subscription per store
+  tierId: text("tier_id").notNull(), // 'free' | 'pro' | 'scale'
+  stripeSubscriptionId: text("stripe_subscription_id"),
+  status: text("status").notNull().default("active"), // 'active' | 'canceled' | 'past_due'
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type Subscription = typeof subscriptions.$inferSelect;
+export type NewSubscription = typeof subscriptions.$inferInsert;
+
+/**
  * A Customer — the per-Store storefront identity (Issue #13).
  * SEPARATE from Merchant identity (which is global/cross-Store).
  * A Customer belongs to exactly ONE Store. The same email on Store A and
