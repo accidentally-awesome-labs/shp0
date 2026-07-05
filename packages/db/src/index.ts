@@ -15,6 +15,8 @@ export { computeApplicationFee, buildCheckoutSessionParams } from "./payments";
 export type { CheckoutSessionParams } from "./payments";
 export { matchesRule } from "./collections";
 export type { CollectionRule, ProductForRule } from "./collections";
+export { applyDiscounts } from "./discounts";
+export type { DiscountCart, DiscountReward, DiscountResult } from "./discounts";
 export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine, Collection, NewCollection } from "./schema";
 import type { Cart, CartLine } from "./cart";
 
@@ -422,6 +424,51 @@ export async function applySchema(): Promise<void> {
         WITH CHECK (current_setting('app.store_id', true) = store_id::text);
     `);
     await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON collections, collection_products TO "default";`);
+
+    // ── discounts + discount_redemptions (tenant tables, RLS-protected) ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS discounts (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        name text NOT NULL,
+        trigger jsonb NOT NULL,
+        reward jsonb NOT NULL,
+        conditions jsonb,
+        usage_count integer NOT NULL DEFAULT 0,
+        active boolean NOT NULL DEFAULT true,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS discount_redemptions (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        discount_id uuid NOT NULL REFERENCES discounts(id) ON DELETE CASCADE,
+        order_id uuid NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        UNIQUE (discount_id, order_id)
+      );
+    `);
+    await client.query(`DROP TRIGGER IF EXISTS discounts_set_store_id ON discounts; CREATE TRIGGER discounts_set_store_id BEFORE INSERT ON discounts FOR EACH ROW EXECUTE FUNCTION stamp_store_id();`);
+    await client.query(`DROP TRIGGER IF EXISTS discount_redemptions_set_store_id ON discount_redemptions; CREATE TRIGGER discount_redemptions_set_store_id BEFORE INSERT ON discount_redemptions FOR EACH ROW EXECUTE FUNCTION stamp_store_id();`);
+    await client.query(`ALTER TABLE discounts ENABLE ROW LEVEL SECURITY;`);
+    await client.query(`ALTER TABLE discount_redemptions ENABLE ROW LEVEL SECURITY;`);
+    await client.query(`
+      DROP POLICY IF EXISTS discounts_tenant ON discounts;
+      CREATE POLICY discounts_tenant ON discounts
+        FOR ALL TO "default"
+        USING (current_setting('app.store_id', true) = store_id::text)
+        WITH CHECK (current_setting('app.store_id', true) = store_id::text);
+    `);
+    await client.query(`
+      DROP POLICY IF EXISTS discount_redemptions_tenant ON discount_redemptions;
+      CREATE POLICY discount_redemptions_tenant ON discount_redemptions
+        FOR ALL TO "default"
+        USING (current_setting('app.store_id', true) = store_id::text)
+        WITH CHECK (current_setting('app.store_id', true) = store_id::text);
+    `);
+    await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON discounts, discount_redemptions TO "default";`);
 
     // ── commission_bps on stores (idempotent migration) ──
     await client.query(`ALTER TABLE stores ADD COLUMN IF NOT EXISTS commission_bps integer NOT NULL DEFAULT 250;`);
@@ -1577,6 +1624,125 @@ export async function getStorefrontCollectionBySlug(
       .map((r) => ({ id: r.id, title: r.title, slug: r.slug, priceCents: r.price_cents }));
   });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Discounts — Trigger + Reward + Conditions (Issue #12).
+//
+// The stacking engine (applyDiscounts) is the deep module — a pure function.
+// The DB layer handles: persistence, code lookup, row-locked redemption,
+// and idempotency (one redemption per discount+order).
+// ─────────────────────────────────────────────────────────────────────────
+
+import type { DiscountReward } from "./discounts";
+
+/**
+ * Create a discount (code-based or automatic).
+ */
+export async function createDiscount(
+  storeId: string,
+  opts: {
+    name: string;
+    trigger: object;
+    reward: DiscountReward;
+    conditions?: object;
+  },
+): Promise<{ id: string }> {
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(
+      sql`INSERT INTO discounts (name, trigger, reward, conditions) VALUES (${opts.name}, ${JSON.stringify(opts.trigger)}, ${JSON.stringify(opts.reward)}, ${opts.conditions ? JSON.stringify(opts.conditions) : null}) RETURNING id`,
+    );
+    return { id: (rows.rows[0] as { id: string }).id };
+  });
+}
+
+/**
+ * List all discounts in a Store.
+ */
+export async function listDiscounts(
+  storeId: string,
+): Promise<Array<{ id: string; name: string; active: boolean; usageCount: number }>> {
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT id, name, active, usage_count FROM discounts ORDER BY created_at DESC`,
+    );
+    const discounts = (rows.rows as Array<{ id: string; name: string; active: boolean; usage_count: number }>)
+      .map((r) => ({ id: r.id, name: r.name, active: r.active, usageCount: r.usage_count }));
+    return discounts;
+  });
+}
+
+/**
+ * Look up a discount by its code (for checkout).
+ */
+export async function getDiscountByCode(
+  storeId: string,
+  code: string,
+): Promise<{ id: string; reward: DiscountReward; conditions: object | null } | null> {
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT id, reward, conditions FROM discounts WHERE trigger->>'code' = ${code} AND active = true LIMIT 1`,
+    );
+    if (rows.rows.length === 0) return null;
+    const r = rows.rows[0] as { id: string; reward: DiscountReward; conditions: object | null };
+    return { id: r.id, reward: r.reward, conditions: r.conditions };
+  });
+}
+
+/**
+ * Redeem a discount for an order — ROW-LOCKED for usage-limit safety.
+ *
+ * 1. SELECT ... FOR UPDATE on the discount (serializes concurrent redemptions).
+ * 2. Check if already redeemed for this order (idempotency — UNIQUE constraint).
+ * 3. Check usage limit (if set in conditions).
+ * 4. Increment usage_count + insert redemption.
+ *
+ * Returns:
+ * - { ok: true } on first redemption.
+ * - { ok: false, reason: "already_redeemed" } if this discount+order already exists.
+ * - { ok: false, reason: "usage_limit_reached" } if the limit is exceeded.
+ */
+export async function redeemDiscount(
+  storeId: string,
+  discountId: string,
+  orderId: string,
+): Promise<{ ok: true } | { ok: false; reason: "already_redeemed" | "usage_limit_reached" }> {
+  return tenantClient(storeId, async (tx) => {
+    // 1. Row-lock the discount.
+    const rows = await tx.execute(
+      sql`SELECT usage_count, conditions FROM discounts WHERE id = ${discountId} FOR UPDATE`,
+    );
+    if (rows.rows.length === 0) {
+      throw new Error(`Discount ${discountId} not found`);
+    }
+    const discount = rows.rows[0] as { usage_count: number; conditions: { usageLimit?: number } | null };
+
+    // 2. Idempotency — already redeemed for this order?
+    const existing = await tx.execute(
+      sql`SELECT id FROM discount_redemptions WHERE discount_id = ${discountId} AND order_id = ${orderId} LIMIT 1`,
+    );
+    if (existing.rows.length > 0) {
+      return { ok: false, reason: "already_redeemed" };
+    }
+
+    // 3. Usage limit check.
+    if (discount.conditions?.usageLimit !== undefined) {
+      if (discount.usage_count >= discount.conditions.usageLimit) {
+        return { ok: false, reason: "usage_limit_reached" };
+      }
+    }
+
+    // 4. Increment usage + record redemption.
+    await tx.execute(
+      sql`UPDATE discounts SET usage_count = usage_count + 1, updated_at = now() WHERE id = ${discountId}`,
+    );
+    await tx.execute(
+      sql`INSERT INTO discount_redemptions (discount_id, order_id) VALUES (${discountId}, ${orderId})`,
+    );
+
+    return { ok: true as const };
+  });
+}
+
 
 
 

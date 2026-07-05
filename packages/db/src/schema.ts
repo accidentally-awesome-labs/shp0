@@ -179,6 +179,51 @@ export type CollectionProduct = typeof collectionProducts.$inferSelect;
 export type NewCollectionProduct = typeof collectionProducts.$inferInsert;
 
 /**
+ * A Discount — a unified Trigger + Reward + Conditions entity (Issue #12).
+ * Code-based and automatic/BOGO are the same concept.
+ * Scoped to a Store (store_id, RLS-protected).
+ *
+ * trigger: how activated — { type: "code", code: string } | { type: "automatic" }
+ * reward: what it does — jsonb matching DiscountReward from discounts.ts
+ * conditions: validity window, usage limit, min spend, eligible products
+ */
+export const discounts = pgTable("discounts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  storeId: uuid("store_id").notNull(),
+  name: text("name").notNull(),
+  // Trigger jsonb: { type: "code", code: "SAVE10" } | { type: "automatic" }
+  trigger: jsonb("trigger").notNull(),
+  // Reward jsonb: DiscountReward (order_percent, order_fixed, line_*, free_item, free_shipping)
+  reward: jsonb("reward").notNull(),
+  // Conditions jsonb: { validFrom?, validUntil?, usageLimit?, minSpendCents?, eligibleProductIds? }
+  conditions: jsonb("conditions"),
+  usageCount: integer("usage_count").notNull().default(0),
+  active: boolean("active").notNull().default(true),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type Discount = typeof discounts.$inferSelect;
+export type NewDiscount = typeof discounts.$inferInsert;
+
+/**
+ * Discount redemptions — one row per (discount, order) pair.
+ * Enforces idempotency: a discount can't be redeemed twice for the same order.
+ * Scoped to a Store (store_id, RLS-protected).
+ */
+export const discountRedemptions = pgTable("discount_redemptions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  storeId: uuid("store_id").notNull(),
+  discountId: uuid("discount_id")
+    .notNull()
+    .references(() => discounts.id, { onDelete: "cascade" }),
+  orderId: uuid("order_id").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type DiscountRedemption = typeof discountRedemptions.$inferSelect;
+
+/**
  * A Stripe Connect payment account linked to a Store. PLATFORM table (no RLS) —
  * bridges the Store (tenant) to Stripe's Connect account (external). Queried
  * via platformClient. One per Store.
