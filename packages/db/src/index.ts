@@ -19,6 +19,8 @@ export { applyDiscounts } from "./discounts";
 export type { DiscountCart, DiscountReward, DiscountResult } from "./discounts";
 export { checkUsagePolicy, TIERS } from "./billing";
 export type { Tier, TierLimits, Usage, UsageAction, UsagePolicy } from "./billing";
+export { transitionStoreStatus } from "./store-status";
+export type { StoreStatus, StoreEvent, StoreStatusResult } from "./store-status";
 export { hashPassword, verifyPassword } from "./customer-auth";
 export type { Customer, NewCustomer } from "./schema";
 export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine, Collection, NewCollection } from "./schema";
@@ -545,6 +547,8 @@ export async function applySchema(): Promise<void> {
 
     // ── commission_bps on stores (idempotent migration) ──
     await client.query(`ALTER TABLE stores ADD COLUMN IF NOT EXISTS commission_bps integer NOT NULL DEFAULT 250;`);
+    // ── status on stores (platform admin: active | suspended | terminated) ──
+    await client.query(`ALTER TABLE stores ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'active';`);
 
     // ── stripe_payment_accounts (PLATFORM table — no RLS) ──
     await client.query(`
@@ -2029,6 +2033,136 @@ export async function getStoreUsage(storeId: string): Promise<{
       orderCountThisMonth: parseInt(orderRows.rows[0]!.count as string),
       staffSeats: parseInt(staffRows.rows[0]!.count as string),
     };
+  });
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// Platform admin — operator surface (Issue #16).
+//
+// THE legitimate use of platformClient: cross-Store reads and operator actions.
+// Tenant clients are never used here. Guarded to platform operators only.
+// ─────────────────────────────────────────────────────────────────────────
+
+import { transitionStoreStatus } from "./store-status";
+import type { StoreStatus, StoreEvent } from "./store-status";
+
+/**
+ * List ALL Stores with their Owners — cross-Store operator view.
+ * Platform-scoped via platformClient.
+ */
+export async function listAllStoresForOperator(): Promise<
+  Array<{
+    id: string;
+    name: string;
+    subdomain: string;
+    status: string;
+    ownerName: string | null;
+    ownerEmail: string | null;
+    orderCount: number;
+    createdAt: Date;
+  }>
+> {
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      sql`
+        SELECT
+          s.id, s.name, s.subdomain, s.status, s.created_at,
+          u.name as owner_name, u.email as owner_email,
+          (SELECT COUNT(*) FROM orders o WHERE o.store_id = s.id) as order_count
+        FROM stores s
+        LEFT JOIN memberships m ON m.store_id = s.id AND m.role = 'owner'
+        LEFT JOIN "user" u ON u.id = m.user_id
+        ORDER BY s.created_at DESC
+      `,
+    );
+    const result = (rows.rows as Array<{
+      id: string; name: string; subdomain: string; status: string; created_at: Date;
+      owner_name: string | null; owner_email: string | null; order_count: string;
+    }>).map((r) => ({
+      id: r.id,
+      name: r.name,
+      subdomain: r.subdomain,
+      status: r.status,
+      ownerName: r.owner_name,
+      ownerEmail: r.owner_email,
+      orderCount: parseInt(r.order_count),
+      createdAt: r.created_at,
+    }));
+    return result;
+  });
+}
+
+/**
+ * Platform analytics: active store count + GMV (Gross Merchandise Value).
+ * GMV = sum of all paid orders' totals across all stores.
+ * Platform-scoped via platformClient.
+ */
+export async function getPlatformAnalytics(): Promise<{
+  totalStores: number;
+  activeStores: number;
+  suspendedStores: number;
+  terminatedStores: number;
+  gmvCents: number;
+  totalOrders: number;
+}> {
+  return platformClient(async (tx) => {
+    const storeRows = await tx.execute(
+      sql`SELECT status, COUNT(*) as count FROM stores GROUP BY status`,
+    );
+    const statusCounts: Record<string, number> = {};
+    let totalStores = 0;
+    for (const row of storeRows.rows as Array<{ status: string; count: string }>) {
+      statusCounts[row.status] = parseInt(row.count);
+      totalStores += parseInt(row.count);
+    }
+
+    const gmvRows = await tx.execute(
+      sql`SELECT COALESCE(SUM(total_cents), 0) as gmv, COUNT(*) as order_count FROM orders WHERE payment_status = 'paid'`,
+    );
+    const gmvData = gmvRows.rows[0] as { gmv: string; order_count: string };
+
+    return {
+      totalStores,
+      activeStores: statusCounts["active"] ?? 0,
+      suspendedStores: statusCounts["suspended"] ?? 0,
+      terminatedStores: statusCounts["terminated"] ?? 0,
+      gmvCents: parseInt(gmvData.gmv),
+      totalOrders: parseInt(gmvData.order_count),
+    };
+  });
+}
+
+/**
+ * Suspend, reinstate, or terminate a Store (operator action).
+ * Uses the pure state machine to validate the transition, then updates the DB.
+ */
+export async function applyStoreStatusAction(
+  storeId: string,
+  event: StoreEvent,
+): Promise<{ ok: true } | { ok: false; reason: "invalid_transition" }> {
+  return platformClient(async (tx) => {
+    // Read current status.
+    const rows = await tx.execute(
+      sql`SELECT status FROM stores WHERE id = ${storeId} LIMIT 1`,
+    );
+    if (rows.rows.length === 0) {
+      throw new Error(`Store ${storeId} not found`);
+    }
+    const currentStatus = rows.rows[0]!.status as StoreStatus;
+
+    // Validate the transition via the pure state machine.
+    const result = transitionStoreStatus(currentStatus, event);
+    if (!result.ok) {
+      return result;
+    }
+
+    // Apply the transition.
+    await tx.execute(
+      sql`UPDATE stores SET status = ${result.status} WHERE id = ${storeId}`,
+    );
+
+    return { ok: true as const };
   });
 }
 

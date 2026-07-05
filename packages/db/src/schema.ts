@@ -13,6 +13,8 @@ export const stores = pgTable("stores", {
   subdomain: text("subdomain").notNull().unique(),
   // Commission in basis points (250 = 2.5%). Platform-wide default, overridable per store.
   commissionBps: integer("commission_bps").notNull().default(250),
+  // Platform admin status: active | suspended | terminated (Issue #16).
+  status: text("status").notNull().default("active"),
   createdAt: timestamp("created_at", { withTimezone: true })
     .defaultNow()
     .notNull(),
