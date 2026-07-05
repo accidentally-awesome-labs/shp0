@@ -1,7 +1,7 @@
 "use server";
 
 import { headers } from "next/headers";
-import { revalidatePath } from "next/cache";
+import { revalidatePath, revalidateTag } from "next/cache";
 
 import { auth } from "@/lib/auth";
 import { resolveDashboardStore } from "@/lib/current-store";
@@ -10,6 +10,8 @@ import {
   listProducts as dbListProducts,
   deleteProduct as dbDeleteProduct,
   parseMoney,
+  productTag,
+  storeProductsTag,
 } from "@shp0/db";
 
 export async function createProductAction(storeId: string, formData: FormData) {
@@ -39,6 +41,9 @@ export async function createProductAction(storeId: string, formData: FormData) {
     ],
   });
 
+  // Targeted cache invalidation: bust this product's tag + the listing tag.
+  revalidateTag(productTag(storeId, result.id), "default");
+  revalidateTag(storeProductsTag(storeId), "default");
   revalidatePath(`/dashboard/${storeId}/products`);
   return result;
 }
@@ -48,6 +53,9 @@ export async function deleteProductAction(storeId: string, productId: string) {
   if (!resolved) throw new Error("Not authorized for this store");
 
   await dbDeleteProduct(storeId, productId);
+  // Targeted cache invalidation.
+  revalidateTag(productTag(storeId, productId), "default");
+  revalidateTag(storeProductsTag(storeId), "default");
   revalidatePath(`/dashboard/${storeId}/products`);
 }
 
@@ -63,3 +71,4 @@ function slugify(text: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-|-$/g, "");
 }
+
