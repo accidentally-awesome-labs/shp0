@@ -58,6 +58,13 @@ async function CartView() {
           <div className="rounded-lg bg-gray-50 p-4 text-sm text-gray-500">
             Cart subtotal is computed at checkout from live Variant prices (ADR-0002).
           </div>
+
+          <a
+            href="/checkout"
+            className="block w-full rounded bg-black px-4 py-3 text-center text-white hover:bg-gray-800"
+          >
+            Proceed to checkout
+          </a>
         </div>
       )}
     </div>

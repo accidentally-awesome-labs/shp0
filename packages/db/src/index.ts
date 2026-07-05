@@ -1004,6 +1004,60 @@ export async function checkout(
   });
 }
 
+/**
+ * Load an Order by id (with its lines), scoped to the Current Store via RLS.
+ * Returns null if the Order doesn't exist or belongs to another Store.
+ */
+export async function getOrder(
+  storeId: string,
+  orderId: string,
+): Promise<{
+  id: string;
+  paymentStatus: string;
+  fulfillmentStatus: string;
+  totalCents: number;
+  lines: Array<{
+    variantId: string;
+    quantity: number;
+    unitPriceCents: number;
+  }>;
+} | null> {
+  return tenantClient(storeId, async (tx) => {
+    const orderRows = await tx.execute(
+      sql`SELECT id, payment_status, fulfillment_status, total_cents FROM orders WHERE id = ${orderId} LIMIT 1`,
+    );
+    if (orderRows.rows.length === 0) return null;
+
+    const o = orderRows.rows[0] as {
+      id: string;
+      payment_status: string;
+      fulfillment_status: string;
+      total_cents: number;
+    };
+
+    const lineRows = await tx.execute(
+      sql`SELECT variant_id, quantity, unit_price_cents FROM order_lines WHERE order_id = ${orderId}`,
+    );
+    const lines = (lineRows.rows as Array<{
+      variant_id: string;
+      quantity: number;
+      unit_price_cents: number;
+    }>).map((r) => ({
+      variantId: r.variant_id,
+      quantity: r.quantity,
+      unitPriceCents: r.unit_price_cents,
+    }));
+
+    return {
+      id: o.id,
+      paymentStatus: o.payment_status,
+      fulfillmentStatus: o.fulfillment_status,
+      totalCents: o.total_cents,
+      lines,
+    };
+  });
+}
+
 
 
 
