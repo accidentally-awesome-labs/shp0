@@ -21,6 +21,12 @@ export { checkUsagePolicy, TIERS } from "./billing";
 export type { Tier, TierLimits, Usage, UsageAction, UsagePolicy } from "./billing";
 export { transitionStoreStatus } from "./store-status";
 export type { StoreStatus, StoreEvent, StoreStatusResult } from "./store-status";
+export { transitionDomainVerification } from "./domain-verification";
+export type {
+  DomainVerificationStatus,
+  DomainVerificationEvent,
+  DomainVerificationResult,
+} from "./domain-verification";
 export { hashPassword, verifyPassword } from "./customer-auth";
 export type { Customer, NewCustomer } from "./schema";
 export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine, Collection, NewCollection } from "./schema";
@@ -540,6 +546,21 @@ export async function applySchema(): Promise<void> {
         tier_id text NOT NULL,
         stripe_subscription_id text,
         status text NOT NULL DEFAULT 'active',
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+
+    // ── custom_domains (PLATFORM table — host→Store mapping, no RLS) ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS custom_domains (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        hostname text NOT NULL UNIQUE,
+        verification_status text NOT NULL DEFAULT 'pending',
+        is_apex boolean NOT NULL DEFAULT false,
+        txt_verification_value text,
+        last_verified_at timestamptz,
         created_at timestamptz NOT NULL DEFAULT now(),
         updated_at timestamptz NOT NULL DEFAULT now()
       );
@@ -2163,6 +2184,102 @@ export async function applyStoreStatusAction(
     );
 
     return { ok: true as const };
+  });
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// Custom Domains — host→Store mapping + verification lifecycle (Issue #14).
+//
+// PLATFORM table (no RLS) — the host-to-Store resolution runs before we know
+// the Store. Only VERIFIED domains resolve to a Store (security).
+// ─────────────────────────────────────────────────────────────────────────
+
+import { transitionDomainVerification } from "./domain-verification";
+import type { DomainVerificationStatus, DomainVerificationEvent } from "./domain-verification";
+
+/**
+ * Add a Custom Domain to a Store (starts as 'pending').
+ * Detects apex vs subdomain automatically.
+ */
+export async function addCustomDomain(
+  storeId: string,
+  hostname: string,
+): Promise<{ id: string; txtVerificationValue: string }> {
+  // Detect apex: a hostname with no dots (after the TLD) is apex.
+  // Simple heuristic: if it has exactly 1 dot (e.g. "acme.com") it's apex.
+  // If it has 2+ dots (e.g. "shop.acme.com") it's a subdomain.
+  const dotCount = (hostname.match(/\./g) || []).length;
+  const isApex = dotCount === 1;
+  const txtValue = `shp0-verify=${randomUUID()}`;
+
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      sql`INSERT INTO custom_domains (store_id, hostname, is_apex, txt_verification_value) VALUES (${storeId}, ${hostname}, ${isApex}, ${txtValue}) RETURNING id`,
+    );
+    return { id: (rows.rows[0] as { id: string }).id, txtVerificationValue: txtValue };
+  });
+}
+
+/**
+ * Resolve a host to a Store — ONLY if the domain is VERIFIED.
+ * Returns null for pending/failed/unknown hosts (no Current Store = security).
+ *
+ * This is the host-to-Store resolution seam (complements resolveStoreBySubdomain).
+ */
+export async function resolveStoreByCustomDomain(
+  hostname: string,
+): Promise<string | null> {
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT store_id FROM custom_domains WHERE hostname = ${hostname} AND verification_status = 'verified' LIMIT 1`,
+    );
+    if (rows.rows.length === 0) return null;
+    return rows.rows[0]!.store_id as string;
+  });
+}
+
+/**
+ * Apply a verification result to a custom domain (via the pure state machine).
+ * This is called by the DNS verification job (HITL) or manual verification.
+ */
+export async function applyDomainVerification(
+  domainId: string,
+  event: DomainVerificationEvent,
+): Promise<{ ok: true; status: DomainVerificationStatus } | { ok: false; reason: "invalid_transition" }> {
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT verification_status FROM custom_domains WHERE id = ${domainId} LIMIT 1`,
+    );
+    if (rows.rows.length === 0) {
+      throw new Error(`Custom domain ${domainId} not found`);
+    }
+    const current = rows.rows[0]!.verification_status as DomainVerificationStatus;
+
+    const result = transitionDomainVerification(current, event);
+    if (!result.ok) return result;
+
+    const lastVerified = result.status === "verified" ? sql`now()` : sql`last_verified_at`;
+    await tx.execute(
+      sql`UPDATE custom_domains SET verification_status = ${result.status}, last_verified_at = ${lastVerified}, updated_at = now() WHERE id = ${domainId}`,
+    );
+
+    return { ok: true, status: result.status };
+  });
+}
+
+/**
+ * List all custom domains for a Store (dashboard view).
+ */
+export async function listCustomDomains(
+  storeId: string,
+): Promise<Array<{ id: string; hostname: string; verificationStatus: string; isApex: boolean }>> {
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT id, hostname, verification_status, is_apex FROM custom_domains WHERE store_id = ${storeId} ORDER BY created_at DESC`,
+    );
+    return (rows.rows as Array<{ id: string; hostname: string; verification_status: string; is_apex: boolean }>)
+      .map((r) => ({ id: r.id, hostname: r.hostname, verificationStatus: r.verification_status, isApex: r.is_apex }));
   });
 }
 

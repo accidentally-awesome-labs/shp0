@@ -199,6 +199,30 @@ export type Subscription = typeof subscriptions.$inferSelect;
 export type NewSubscription = typeof subscriptions.$inferInsert;
 
 /**
+ * A Custom Domain — a Merchant-owned domain mapped to a Store (Issue #14, ADR-0005).
+ * PLATFORM table (no RLS) — the host-to-Store resolution runs before we know
+ * the Store (it's how we FIND the Store). Queried via platformClient.
+ *
+ * verification_status: pending | verified | failed.
+ * Only VERIFIED domains are served (resolve to a Store).
+ * A failing re-verification transitions verified → failed (STOP SERVING).
+ */
+export const customDomains = pgTable("custom_domains", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  storeId: uuid("store_id").notNull(),
+  hostname: text("hostname").notNull().unique(), // e.g. "shop.acme.com"
+  verificationStatus: text("verification_status").notNull().default("pending"), // pending | verified | failed
+  isApex: boolean("is_apex").notNull().default(false), // apex uses TXT, subdomain uses CNAME
+  txtVerificationValue: text("txt_verification_value"), // the TXT record value the merchant must set
+  lastVerifiedAt: timestamp("last_verified_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+export type CustomDomain = typeof customDomains.$inferSelect;
+export type NewCustomDomain = typeof customDomains.$inferInsert;
+
+/**
  * A Customer — the per-Store storefront identity (Issue #13).
  * SEPARATE from Merchant identity (which is global/cross-Store).
  * A Customer belongs to exactly ONE Store. The same email on Store A and
