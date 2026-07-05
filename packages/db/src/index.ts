@@ -1239,6 +1239,94 @@ export async function getPaymentAccount(
   });
 }
 
+/**
+ * Get a Store's commission in basis points.
+ */
+export async function getStoreCommissionBps(storeId: string): Promise<number> {
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT commission_bps FROM stores WHERE id = ${storeId} LIMIT 1`,
+    );
+    if (rows.rows.length === 0) throw new Error("Store not found");
+    return rows.rows[0]!.commission_bps as number;
+  });
+}
+
+/**
+ * Resolve a Store id from a Stripe Connect account id.
+ * Used by the webhook handler to find which Store a payment belongs to.
+ */
+export async function getStoreIdByConnectAccount(
+  connectAccountId: string,
+): Promise<string | null> {
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT store_id FROM stripe_payment_accounts WHERE connect_account_id = ${connectAccountId} LIMIT 1`,
+    );
+    if (rows.rows.length === 0) return null;
+    return rows.rows[0]!.store_id as string;
+  });
+}
+
+/**
+ * Load an Order with its lines in the shape needed by buildCheckoutSessionParams.
+ * Includes product titles for the Stripe line item names.
+ */
+export async function getOrderForCheckout(
+  storeId: string,
+  orderId: string,
+): Promise<{
+  id: string;
+  paymentStatus: string;
+  totalCents: number;
+  lines: Array<{
+    variantId: string;
+    productTitle: string;
+    quantity: number;
+    unitPriceCents: number;
+  }>;
+} | null> {
+  return tenantClient(storeId, async (tx) => {
+    const orderRows = await tx.execute(
+      sql`SELECT id, payment_status, total_cents FROM orders WHERE id = ${orderId} LIMIT 1`,
+    );
+    if (orderRows.rows.length === 0) return null;
+    const o = orderRows.rows[0] as {
+      id: string;
+      payment_status: string;
+      total_cents: number;
+    };
+
+    const lineRows = await tx.execute(
+      sql`
+        SELECT ol.variant_id, ol.quantity, ol.unit_price_cents, p.title as product_title
+        FROM order_lines ol
+        JOIN variants v ON v.id = ol.variant_id
+        JOIN products p ON p.id = v.product_id
+        WHERE ol.order_id = ${orderId}
+      `,
+    );
+    const lines = (lineRows.rows as Array<{
+      variant_id: string;
+      quantity: number;
+      unit_price_cents: number;
+      product_title: string;
+    }>).map((r) => ({
+      variantId: r.variant_id,
+      productTitle: r.product_title,
+      quantity: r.quantity,
+      unitPriceCents: r.unit_price_cents,
+    }));
+
+    return {
+      id: o.id,
+      paymentStatus: o.payment_status,
+      totalCents: o.total_cents,
+      lines,
+    };
+  });
+}
+
 
 
 
