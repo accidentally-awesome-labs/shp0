@@ -1509,6 +1509,75 @@ export async function listCollectionMembers(
   });
 }
 
+/**
+ * Storefront: list a collection's members by slug (published products only).
+ * Used by the storefront collection page. Returns products with their min price.
+ */
+export async function getStorefrontCollectionBySlug(
+  storeId: string,
+  slug: string,
+): Promise<Array<{ id: string; title: string; slug: string; priceCents: number }>> {
+  return tenantClient(storeId, async (tx) => {
+    // Find the collection by slug.
+    const colRows = await tx.execute(
+      sql`SELECT id, type, rule FROM collections WHERE slug = ${slug} LIMIT 1`,
+    );
+    if (colRows.rows.length === 0) return [];
+    const col = colRows.rows[0] as { id: string; type: string; rule: unknown };
+
+    if (col.type === "manual") {
+      const rows = await tx.execute(
+        sql`
+          SELECT p.id, p.title, p.slug,
+            (SELECT MIN(v.price_cents) FROM variants v WHERE v.product_id = p.id) as price_cents
+          FROM products p
+          JOIN collection_products cp ON cp.product_id = p.id
+          WHERE cp.collection_id = ${col.id} AND p.status = 'published'
+          ORDER BY cp.position, p.title
+        `,
+      );
+      return (rows.rows as Array<{ id: string; title: string; slug: string; price_cents: number }>)
+        .map((r) => ({ id: r.id, title: r.title, slug: r.slug, priceCents: r.price_cents }));
+    }
+
+    // Automated — evaluate rule, published only.
+    const rule = col.rule as CollectionRule | null;
+    if (!rule) return [];
+
+    if (rule.type === "tag") {
+      const rows = await tx.execute(
+        sql`
+          SELECT p.id, p.title, p.slug,
+            (SELECT MIN(v.price_cents) FROM variants v WHERE v.product_id = p.id) as price_cents
+          FROM products p
+          WHERE ${rule.tag} = ANY(p.tags) AND p.status = 'published'
+          ORDER BY p.title
+        `,
+      );
+      return (rows.rows as Array<{ id: string; title: string; slug: string; price_cents: number }>)
+        .map((r) => ({ id: r.id, title: r.title, slug: r.slug, priceCents: r.price_cents }));
+    }
+
+    // price_range
+    const minCents = rule.minCents ?? 0;
+    const maxCents = rule.maxCents ?? Number.MAX_SAFE_INTEGER;
+    const rows = await tx.execute(
+      sql`
+        SELECT p.id, p.title, p.slug,
+          (SELECT MIN(v.price_cents) FROM variants v WHERE v.product_id = p.id) as price_cents
+        FROM products p
+        WHERE p.status = 'published'
+          AND (
+            SELECT MIN(v.price_cents) FROM variants v WHERE v.product_id = p.id
+          ) BETWEEN ${minCents} AND ${maxCents}
+        ORDER BY p.title
+      `,
+    );
+    return (rows.rows as Array<{ id: string; title: string; slug: string; price_cents: number }>)
+      .map((r) => ({ id: r.id, title: r.title, slug: r.slug, priceCents: r.price_cents }));
+  });
+}
+
 
 
 
