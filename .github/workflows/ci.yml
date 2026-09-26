@@ -45,11 +45,16 @@ jobs:
       - name: CI script self-tests
         run: node --test 'scripts/ci/*.test.mjs'
 
-      # Pure Operator allowlist policy (Issue #52): no database. The rest of
-      # packages/auth/tests needs Postgres and is not in CI yet.
+      # Pure Operator allowlist policy (Issue #52). Needs no database, unlike
+      # the rest of packages/auth/tests, so it runs with the fast checks.
       - name: Auth unit tests
         working-directory: packages/auth
         run: pnpm exec vitest run tests/operator.test.ts
+
+      # Every platform admin server action calls requireOperator() first, and
+      # no other apps/web file reaches the Operator-only db helpers (Issue #52).
+      - name: Operator guard
+        run: node scripts/ci/operator-guard.mjs
 
       - name: Typecheck
         run: pnpm -r typecheck
