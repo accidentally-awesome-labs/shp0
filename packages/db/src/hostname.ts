@@ -84,13 +84,19 @@ export type CustomDomainRejection =
   | "label"
   | "localhost"
   | "single_label"
-  | "platform_domain";
+  | "platform_domain"
+  // Not a validation result: addCustomDomain reports it when the hostname is
+  // already stored (by any Store, in any spelling that normalizes to it).
+  | "already_added";
 
 export type CustomDomainValidation =
   | { ok: true; hostname: string }
   | { ok: false; reason: CustomDomainRejection; message: string };
 
-/** Thrown by addCustomDomain when the hostname is not an acceptable Custom Domain. */
+/**
+ * Thrown by addCustomDomain when the hostname cannot be added: it is not an
+ * acceptable Custom Domain, or it has already been added.
+ */
 export class InvalidCustomDomainError extends Error {
   readonly reason: CustomDomainRejection;
 
@@ -103,7 +109,11 @@ export class InvalidCustomDomainError extends Error {
 
 const EXAMPLE = "shop.example.com";
 
-function reject(reason: CustomDomainRejection, platformDomain: string): CustomDomainValidation {
+/** The Merchant-facing message for a rejected Custom Domain hostname. */
+export function customDomainRejectionMessage(
+  reason: CustomDomainRejection,
+  platformDomain: string = PLATFORM_DOMAIN,
+): string {
   const messages: Record<CustomDomainRejection, string> = {
     empty: `Enter a domain name, such as ${EXAMPLE}.`,
     whitespace: "A domain name cannot contain spaces.",
@@ -121,8 +131,14 @@ function reject(reason: CustomDomainRejection, platformDomain: string): CustomDo
     localhost: "localhost cannot be used as a Custom Domain.",
     single_label: `Enter a full domain name, such as ${EXAMPLE}.`,
     platform_domain: `${platformDomain} and its subdomains cannot be added as Custom Domains. Your Store is already served on its Subdomain.`,
+    // Same wording whichever Store holds the hostname: it says nothing about who.
+    already_added: "This domain has already been added to a Store.",
   };
-  return { ok: false, reason, message: messages[reason] };
+  return messages[reason];
+}
+
+function reject(reason: CustomDomainRejection, platformDomain: string): CustomDomainValidation {
+  return { ok: false, reason, message: customDomainRejectionMessage(reason, platformDomain) };
 }
 
 /**

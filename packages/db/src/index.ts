@@ -27,6 +27,7 @@ export {
   normalizeRequestHost,
   isPlatformHost,
   validateCustomDomain,
+  customDomainRejectionMessage,
   routeStorefrontHost,
   InvalidCustomDomainError,
 } from "./hostname";
@@ -2182,7 +2183,12 @@ export async function applyStoreStatusAction(
 
 import { transitionDomainVerification } from "./domain-verification";
 import type { DomainVerificationStatus, DomainVerificationEvent } from "./domain-verification";
-import { InvalidCustomDomainError, routeStorefrontHost, validateCustomDomain } from "./hostname";
+import {
+  InvalidCustomDomainError,
+  customDomainRejectionMessage,
+  routeStorefrontHost,
+  validateCustomDomain,
+} from "./hostname";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -2191,7 +2197,9 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
  *
  * The hostname is validated and normalized first (see validateCustomDomain):
  * the platform domain and its subdomains, URLs, IP literals, wildcards and
- * other malformed names throw InvalidCustomDomainError and store nothing.
+ * other malformed names throw InvalidCustomDomainError and store nothing. So
+ * does a hostname that is already stored, for this Store or another one
+ * (reason "already_added").
  * Detects apex vs subdomain automatically.
  */
 export async function addCustomDomain(
@@ -2209,12 +2217,19 @@ export async function addCustomDomain(
   const isApex = dotCount === 1;
   const txtValue = `shp0-verify=${randomUUID()}`;
 
-  return platformClient(async (tx) => {
+  const id = await platformClient(async (tx) => {
+    // hostname is UNIQUE across all Stores. A hostname that is already stored
+    // inserts nothing, and is reported as a typed error instead of a raw
+    // unique violation.
     const rows = await tx.execute(
-      sql`INSERT INTO custom_domains (store_id, hostname, is_apex, txt_verification_value) VALUES (${storeId}, ${normalized}, ${isApex}, ${txtValue}) RETURNING id`,
+      sql`INSERT INTO custom_domains (store_id, hostname, is_apex, txt_verification_value) VALUES (${storeId}, ${normalized}, ${isApex}, ${txtValue}) ON CONFLICT (hostname) DO NOTHING RETURNING id`,
     );
-    return { id: (rows.rows[0] as { id: string }).id, txtVerificationValue: txtValue };
+    return (rows.rows[0] as { id: string } | undefined)?.id;
   });
+  if (!id) {
+    throw new InvalidCustomDomainError("already_added", customDomainRejectionMessage("already_added"));
+  }
+  return { id, txtVerificationValue: txtValue };
 }
 
 async function findVerifiedCustomDomainStore(hostname: string): Promise<string | null> {

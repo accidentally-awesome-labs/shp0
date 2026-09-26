@@ -176,6 +176,25 @@ describe("Custom Domain takeover containment (Issue #58)", () => {
       expect(byHost.get("shop.norm-test.com")!.isApex).toBe(false);
       expect(byHost.get("xn--mnchen-3ya.de")!.isApex).toBe(true);
     });
+
+    it("reports a hostname that is already added as a typed error, with the same answer whichever Store holds it", async () => {
+      await addCustomDomain(storeA, "dup.claim-test.com");
+
+      // Same Store, another spelling of the same hostname.
+      const sameStore = await addCustomDomain(storeA, "DUP.Claim-Test.com.").catch((error: unknown) => error);
+      // Another Store.
+      const otherStore = await addCustomDomain(storeB, "dup.claim-test.com").catch((error: unknown) => error);
+
+      for (const error of [sameStore, otherStore]) {
+        expect(error).toMatchObject({ name: "InvalidCustomDomainError", reason: "already_added" });
+      }
+      expect((otherStore as Error).message).toBe((sameStore as Error).message);
+
+      const rows = await platformClient((tx) =>
+        tx.execute(sql`SELECT store_id FROM custom_domains WHERE hostname = 'dup.claim-test.com'`),
+      );
+      expect(rows.rows).toEqual([{ store_id: storeA }]);
+    });
   });
 
   describe("resolving a request host", () => {
