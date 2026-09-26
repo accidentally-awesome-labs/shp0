@@ -1,0 +1,43 @@
+# Code owners. GitHub requests a review from these owners on any PR that
+# touches a matching path; with "Require review from Code Owners" enabled in
+# branch protection, their approval becomes mandatory.
+#
+# CODEOWNERS supports neither {a,b} nor [x] patterns: one path per line.
+# Later lines win. See docs/agents/definition-of-done.md.
+
+# ── Security-sensitive: tenancy/RLS, auth, payments, billing, platform admin ─
+# Add the contracted security/payments reviewer to these lines once hired.
+/packages/db/src/index.ts              @salarsayyad
+/packages/db/src/schema.ts             @salarsayyad
+/packages/db/src/payments.ts           @salarsayyad
+/packages/db/src/billing.ts            @salarsayyad
+/packages/db/src/customer-auth.ts      @salarsayyad
+/packages/db/drizzle.config.ts         @salarsayyad
+/packages/auth/                        @salarsayyad
+/apps/web/proxy.ts                     @salarsayyad
+/apps/web/lib/auth.ts                  @salarsayyad
+/apps/web/lib/current-store.ts         @salarsayyad
+/apps/web/lib/stripe.ts                @salarsayyad
+/apps/web/app/api/                     @salarsayyad
+/apps/web/app/admin/                   @salarsayyad
+/apps/web/app/actions/admin.ts         @salarsayyad
+/apps/web/app/actions/billing.ts       @salarsayyad
+/apps/web/app/actions/cart.ts          @salarsayyad
+/apps/web/app/actions/checkout.ts      @salarsayyad
+/apps/web/app/actions/customers.ts     @salarsayyad
+/apps/web/app/actions/domains.ts       @salarsayyad
+/apps/web/app/actions/stripe.ts        @salarsayyad
+/apps/web/app/dashboard/*/layout.tsx   @salarsayyad
+
+# ── Harness: CI, agent settings, dependencies, domain docs ──────────────────
+/.github/                              @salarsayyad
+/.claude/                              @salarsayyad
+/scripts/ci/                           @salarsayyad
+/CLAUDE.md                             @salarsayyad
+/CONTEXT.md                            @salarsayyad
+/docs/adr/                             @salarsayyad
+/docs/agents/                          @salarsayyad
+/.npmrc                                @salarsayyad
+/pnpm-lock.yaml                        @salarsayyad
+/pnpm-workspace.yaml                   @salarsayyad
+package.json                           @salarsayyad
