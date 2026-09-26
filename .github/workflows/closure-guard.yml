@@ -1,0 +1,42 @@
+name: Closure guard
+
+# Reopens issues closed as completed without a merged PR, and issues closed as
+# not planned without a wontfix/superseded label. See scripts/ci/closure-guard.mjs.
+
+on:
+  issues:
+    types: [closed]
+  # Sweep in case an `issues` event was missed (Actions outage, etc.).
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      lookback_hours:
+        description: "Sweep issues closed in the last N hours"
+        default: "7"
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: closure-guard-${{ github.event.issue.number || 'sweep' }}
+
+jobs:
+  guard:
+    name: closure-guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/ci
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check closures
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOOKBACK_HOURS: ${{ inputs.lookback_hours || '7' }}
+        run: node scripts/ci/closure-guard.mjs
