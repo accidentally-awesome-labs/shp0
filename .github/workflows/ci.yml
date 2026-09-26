@@ -48,9 +48,8 @@ jobs:
       - name: Typecheck
         run: pnpm -r typecheck
 
-      # Pure modules only. The Postgres integration suites are not in CI yet:
-      # applySchema() cannot bootstrap an empty database (it creates
-      # memberships before the "user" table it references).
+      # Pure modules only, no database. The Postgres suites (db and auth) run
+      # in the `integration` job below, starting from an empty database.
       - name: Unit tests
         working-directory: packages/db
         run: >-
@@ -71,3 +70,64 @@ jobs:
           # errors during prerender. Not used at runtime.
           BETTER_AUTH_SECRET: ci-build-placeholder-not-a-secret
         run: pnpm build
+
+  # The Postgres suites (RLS isolation, provisioning, integration, auth), run
+  # from an EMPTY database so applySchema() has to bootstrap it from nothing.
+  integration:
+    name: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        # Probe over TCP so the check only passes once the real server is up,
+        # not the socket-only server the image runs while initialising.
+        options: >-
+          --health-cmd "pg_isready -h localhost -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # The tests connect to postgresql:///shp0_test?user=...; with no host in
+      # the URL, node-postgres (and psql) fall back to PGHOST/PGPORT.
+      PGHOST: localhost
+      PGPORT: "5432"
+    steps:
+      - uses: actions/checkout@v5
+
+      # Version comes from "packageManager" in package.json.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      # Exactly what the suites expect: the platform role cloud_admin (owns the
+      # database, so it owns every table applySchema() creates and bypasses
+      # RLS), the tenant role "default" (subject to RLS), neither a superuser,
+      # and an empty shp0_test.
+      - name: Provision test database
+        run: |
+          psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres <<'SQL'
+          CREATE ROLE cloud_admin LOGIN NOSUPERUSER;
+          CREATE ROLE "default" LOGIN NOSUPERUSER;
+          CREATE DATABASE shp0_test OWNER cloud_admin;
+          SQL
+
+      # The db suite runs first (its files share the database and run one at a
+      # time); the auth suite runs after it, never concurrently.
+      - name: Integration tests (db)
+        working-directory: packages/db
+        run: pnpm exec vitest run
+
+      - name: Integration tests (auth)
+        working-directory: packages/auth
+        run: pnpm exec vitest run

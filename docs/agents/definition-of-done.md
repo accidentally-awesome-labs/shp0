@@ -13,16 +13,9 @@ or setting enforces it.
 | Check | Where | What it stops |
 | --- | --- | --- |
 | CI: frozen install leaves the tree clean, banned patterns, CI script self-tests, typecheck, unit tests, production build | `.github/workflows/ci.yml` | Broken installs, `db:push`, focused tests, `applySchema()` outside tests, type errors, broken builds |
+| CI `integration` job: the full `packages/db` suite, then the `packages/auth` suite, against a Postgres 16 service starting from an empty `shp0_test` (non-superuser `cloud_admin` and `default` roles) | `.github/workflows/ci.yml` | An `applySchema()` that cannot bootstrap an empty database or is not idempotent; regressions in RLS isolation, Store provisioning, payments, auth and the other Postgres-backed paths |
 | Closure guard | `.github/workflows/closure-guard.yml` | Issues closed as completed without a merged PR (reopened); not-planned closes without `wontfix` or `superseded` |
 | Code owners | `.github/CODEOWNERS` | Security-sensitive paths get a review request from their owner |
-
-The Postgres integration suites (`packages/db/tests/*-integration.test.ts`,
-`isolation`, `provisioning`, `products`, `storefront`, `resolution`,
-`packages/auth/tests`) are **not in CI yet**. On an empty database they fail at
-setup, because `applySchema()` creates `memberships` before the `"user"` table it
-references. In Claude Code on the web the SessionStart hook provisions Postgres
-for them; the bootstrap bug still has to be fixed before they can pass there or
-join CI.
 
 ## Expected of every change (not yet machine-checked)
 
@@ -44,5 +37,4 @@ join CI.
 
 Tracked as issues, not yet in place: branch protection on `main` (required
 checks, code-owner review, no direct pushes), a separate GitHub identity for
-agent PRs, integration tests from an empty database in CI, and one failing test
-per known defect.
+agent PRs, and one failing test per known defect.

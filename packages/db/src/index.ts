@@ -112,11 +112,17 @@ export async function platformClient<T>(
 /**
  * Apply the schema + RLS roles/policies. Idempotent. Run as `cloud_admin`.
  *
+ * Must bootstrap an empty database: every table is created after the tables its
+ * foreign keys reference. `connectionString` defaults to the platform URL; the
+ * bootstrap test passes one pinned to a throwaway schema.
+ *
  * For the tenant bootstrap `stores` table, a trigger stamps `store_id := id` on
  * insert (the platform creates Stores, so the per-request GUC is not set then).
  */
-export async function applySchema(): Promise<void> {
-  const pool = new Pool({ connectionString: PLATFORM_DATABASE_URL });
+export async function applySchema(
+  connectionString: string = PLATFORM_DATABASE_URL,
+): Promise<void> {
+  const pool = new Pool({ connectionString });
   const client = await pool.connect();
   try {
     await client.query(`
@@ -150,43 +156,8 @@ export async function applySchema(): Promise<void> {
 
     await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON stores TO "default";`);
 
-    // ── memberships (PLATFORM table — bridges global users to Stores) ──
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS memberships (
-        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id text NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
-        store_id uuid NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
-        role text NOT NULL,
-        created_at timestamptz NOT NULL DEFAULT now()
-      );
-    `);
-    // Single-Owner invariant part 1: at most one owner per Store.
-    await client.query(`
-      DROP INDEX IF EXISTS memberships_one_owner_per_store;
-      CREATE UNIQUE INDEX memberships_one_owner_per_store
-        ON memberships(store_id) WHERE role = 'owner';
-    `);
-    // Single-Owner invariant part 2: the owner cannot be removed (deleted).
-    // Transfer = UPDATE the row's user_id, not delete.
-    await client.query(`
-      CREATE OR REPLACE FUNCTION memberships_prevent_owner_delete()
-      RETURNS trigger LANGUAGE plpgsql AS $func$
-      BEGIN
-        IF OLD.role = 'owner' THEN
-          RAISE EXCEPTION 'Cannot delete an owner Membership. Transfer ownership first.';
-        END IF;
-        RETURN OLD;
-      END;
-      $func$;
-    `);
-    await client.query(`
-      DROP TRIGGER IF EXISTS memberships_no_delete_owner ON memberships;
-      CREATE TRIGGER memberships_no_delete_owner
-        BEFORE DELETE ON memberships
-        FOR EACH ROW EXECUTE FUNCTION memberships_prevent_owner_delete();
-    `);
-
     // ── better-auth core tables (PLATFORM tables — no store_id, no RLS) ──
+    // Created before memberships, whose user_id references "user"(id).
     await client.query(`
       CREATE TABLE IF NOT EXISTS "user" (
         id text PRIMARY KEY,
@@ -238,6 +209,42 @@ export async function applySchema(): Promise<void> {
       );
     `);
     // Auth tables are platform tables — cloud_admin owns them, no RLS, no grant to "default".
+
+    // ── memberships (PLATFORM table — bridges global users to Stores) ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS memberships (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id text NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
+        store_id uuid NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+        role text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+    `);
+    // Single-Owner invariant part 1: at most one owner per Store.
+    await client.query(`
+      DROP INDEX IF EXISTS memberships_one_owner_per_store;
+      CREATE UNIQUE INDEX memberships_one_owner_per_store
+        ON memberships(store_id) WHERE role = 'owner';
+    `);
+    // Single-Owner invariant part 2: the owner cannot be removed (deleted).
+    // Transfer = UPDATE the row's user_id, not delete.
+    await client.query(`
+      CREATE OR REPLACE FUNCTION memberships_prevent_owner_delete()
+      RETURNS trigger LANGUAGE plpgsql AS $func$
+      BEGIN
+        IF OLD.role = 'owner' THEN
+          RAISE EXCEPTION 'Cannot delete an owner Membership. Transfer ownership first.';
+        END IF;
+        RETURN OLD;
+      END;
+      $func$;
+    `);
+    await client.query(`
+      DROP TRIGGER IF EXISTS memberships_no_delete_owner ON memberships;
+      CREATE TRIGGER memberships_no_delete_owner
+        BEFORE DELETE ON memberships
+        FOR EACH ROW EXECUTE FUNCTION memberships_prevent_owner_delete();
+    `);
 
     // ── products + variants (TENANT tables — store_id GUC, RLS-protected) ──
     await client.query(`
