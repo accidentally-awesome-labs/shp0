@@ -35,6 +35,10 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+          # The guard has no dependencies. setup-node v5 otherwise reads
+          # "packageManager": "pnpm@..." from package.json and fails because
+          # pnpm isn't installed in this job.
+          package-manager-cache: false
       - name: Check closures
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
