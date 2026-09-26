@@ -17,6 +17,10 @@ or setting enforces it.
 | Closure guard | `.github/workflows/closure-guard.yml` | Issues closed as completed without a merged PR (reopened); not-planned closes without `wontfix` or `superseded` |
 | Code owners | `.github/CODEOWNERS` | Security-sensitive paths get a review request from their owner |
 
+To run the integration suites outside CI, provision what the `Provision test
+database` step in `ci.yml` does (the two roles and `shp0_test`); in Claude Code
+on the web, `.claude/hooks/session-start.sh` does this at session start.
+
 ## Expected of every change (not yet machine-checked)
 
 1. **Defect fixes start with a failing test.** The test fails on `main` for the

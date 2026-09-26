@@ -110,10 +110,12 @@ jobs:
       - name: Install (frozen lockfile)
         run: pnpm install --frozen-lockfile
 
-      # Exactly what the suites expect: the platform role cloud_admin (owns the
-      # database, so it owns every table applySchema() creates and bypasses
-      # RLS), the tenant role "default" (subject to RLS), neither a superuser,
-      # and an empty shp0_test.
+      # Exactly what the suites expect: the platform role cloud_admin, the
+      # tenant role "default" (subject to RLS), neither a superuser, and an
+      # empty shp0_test owned by cloud_admin. Owning the database lets
+      # cloud_admin create tables in `public` (PG15+); applySchema() runs as
+      # cloud_admin, so it owns every table and, as owner (no FORCE RLS),
+      # bypasses RLS.
       - name: Provision test database
         run: |
           psql -X -v ON_ERROR_STOP=1 -U postgres -d postgres <<'SQL'
