@@ -1,5 +1,7 @@
 export const instant = false;
 
+import { notFound, redirect } from "next/navigation";
+
 import {
   getAdminStores,
   getAdminAnalytics,
@@ -7,8 +9,24 @@ import {
   reinstateStoreAction,
   terminateStoreAction,
 } from "@/app/actions/admin";
+import { getOperatorAccess } from "@/lib/operator";
 
 export default async function AdminPage() {
+  // Gate before fetching anything (Issue #52). The check reads the session from
+  // the request headers, so this page renders per request and has no
+  // prerendered or cached content to share across users. `instant = false`
+  // above only opts out of instant-navigation validation; it is not what keeps
+  // the page dynamic. Do not add `"use cache"` to anything below this gate.
+  //
+  // This route resumes from an empty postponed shell, so the response has
+  // already committed to 200: redirect() becomes a client-side redirect and
+  // notFound() renders the not-found page (noindex), not an HTTP 404. Signed-out
+  // visitors without a session cookie get a real 307 from proxy.ts first.
+  const access = await getOperatorAccess();
+  if (access.status === "unauthenticated") redirect("/sign-in?redirect=/admin");
+  // Signed in but not an Operator: answer as if the admin did not exist.
+  if (access.status !== "operator") notFound();
+
   const [stores, analytics] = await Promise.all([getAdminStores(), getAdminAnalytics()]);
 
   return (

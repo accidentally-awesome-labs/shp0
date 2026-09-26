@@ -1,10 +1,11 @@
 import { NextResponse, type NextRequest } from "next/server";
 
 /**
- * Route guard — protects the dashboard from unauthenticated access.
+ * Route guard — protects the dashboard and the platform admin from
+ * unauthenticated access.
  *
  * Checks for the better-auth session cookie directly (edge-safe, no DB call).
- * If a Merchant hits /dashboard without one, redirect to /sign-in.
+ * If a Merchant hits /dashboard or /admin without one, redirect to /sign-in.
  * The actual session *validity* is checked server-side per-request via auth.api.
  *
  * NOTE: We check the cookie directly rather than importing better-auth/cookies,
@@ -26,5 +27,8 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/dashboard/:path*"],
+  // /admin: a signed-out visitor gets a real 307 to sign-in here. This is a
+  // convenience, not the guard: the admin page and every operator server action
+  // check the session and the Operator allowlist themselves (Issue #52).
+  matcher: ["/dashboard/:path*", "/admin/:path*"],
 };

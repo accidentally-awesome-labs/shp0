@@ -17,6 +17,7 @@
 /apps/web/proxy.ts                     @salarsayyad
 /apps/web/lib/auth.ts                  @salarsayyad
 /apps/web/lib/current-store.ts         @salarsayyad
+/apps/web/lib/operator.ts              @salarsayyad
 /apps/web/lib/stripe.ts                @salarsayyad
 /apps/web/app/api/                     @salarsayyad
 /apps/web/app/admin/                   @salarsayyad

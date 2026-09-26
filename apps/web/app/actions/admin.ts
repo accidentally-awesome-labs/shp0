@@ -1,8 +1,6 @@
 "use server";
 
-import { headers } from "next/headers";
-
-import { auth } from "@/lib/auth";
+import { requireOperator } from "@/lib/operator";
 import {
   listAllStoresForOperator,
   getPlatformAnalytics,
@@ -10,15 +8,12 @@ import {
 } from "@shp0/db";
 
 /**
- * Guard: only platform operators can access this surface.
- * In production this checks an operator role/flag. For now, any authenticated
- * user is allowed (the guard is the structure — wire to real authz later).
+ * Operator (platform admin) server actions — Issue #16, guarded per Issue #52.
+ *
+ * Each export here is callable directly over HTTP by its action id, not only
+ * through the admin page, so each one calls requireOperator() before it
+ * touches data. Only Operators (SHP0_OPERATOR_USER_IDS) get past it.
  */
-async function requireOperator(): Promise<void> {
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) throw new Error("Not authenticated");
-  // TODO: check operator role/flag here.
-}
 
 export async function getAdminStores() {
   await requireOperator();
