@@ -45,6 +45,12 @@ jobs:
       - name: CI script self-tests
         run: node --test 'scripts/ci/*.test.mjs'
 
+      # Pure Operator allowlist policy (Issue #52): no database. The rest of
+      # packages/auth/tests needs Postgres and is not in CI yet.
+      - name: Auth unit tests
+        working-directory: packages/auth
+        run: pnpm exec vitest run tests/operator.test.ts
+
       - name: Typecheck
         run: pnpm -r typecheck
 
