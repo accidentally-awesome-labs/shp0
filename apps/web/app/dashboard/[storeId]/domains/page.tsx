@@ -1,7 +1,11 @@
 export const instant = false;
 
 import Link from "next/link";
-import { addDomainAction, getDashboardDomains, verifyDomainAction, retryDomainAction } from "@/app/actions/domains";
+import { notFound } from "next/navigation";
+
+import { getDashboardDomains, retryDomainAction } from "@/app/actions/domains";
+import { resolveDashboardStore } from "@/lib/current-store";
+import { AddDomainForm } from "./add-domain-form";
 
 export default async function DomainsPage({
   params,
@@ -9,22 +13,18 @@ export default async function DomainsPage({
   params: Promise<{ storeId: string }>;
 }) {
   const { storeId } = await params;
+
+  // Authorization gate: 404 unless the Merchant holds a Membership here.
+  const resolved = await resolveDashboardStore(storeId);
+  if (!resolved) notFound();
+
   const domains = await getDashboardDomains(storeId);
 
   return (
     <div className="mx-auto max-w-2xl p-8">
       <h1 className="mb-8 text-2xl font-bold">Custom Domains</h1>
 
-      <form action={addDomainAction.bind(null, storeId)} className="mb-8 flex gap-2">
-        <input
-          name="hostname"
-          placeholder="shop.yourdomain.com"
-          className="flex-1 rounded border px-3 py-2"
-        />
-        <button type="submit" className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">
-          Add Domain
-        </button>
-      </form>
+      <AddDomainForm storeId={storeId} />
 
       {domains.length === 0 ? (
         <p className="text-gray-500">No custom domains yet. Your store is served on its subdomain by default.</p>
@@ -36,7 +36,7 @@ export default async function DomainsPage({
                 <div>
                   <p className="font-medium">{domain.hostname}</p>
                   <p className="text-sm text-gray-500">
-                    {domain.isApex ? "Apex (TXT record)" : "Subdomain (CNAME)"}
+                    {domain.isApex ? "Apex domain" : "Subdomain of your domain"}
                   </p>
                 </div>
                 <span className={`rounded px-2 py-0.5 text-xs font-medium ${
@@ -48,14 +48,19 @@ export default async function DomainsPage({
                 </span>
               </div>
               {domain.verificationStatus === "pending" && (
-                <form action={verifyDomainAction.bind(null, domain.id)} className="mt-2">
-                  <button type="submit" className="text-xs text-blue-600 hover:underline">
-                    Verify now
-                  </button>
-                </form>
+                <div className="mt-3 rounded bg-gray-50 p-3 text-sm">
+                  <p className="font-medium text-gray-700">TXT record to add at your DNS provider</p>
+                  <code className="mt-1 block break-all font-mono text-xs text-gray-800">
+                    {domain.txtVerificationValue}
+                  </code>
+                  <p className="mt-2 text-gray-500">
+                    Automatic verification is not available yet. This domain stays pending and
+                    does not serve your Store until it has been verified.
+                  </p>
+                </div>
               )}
               {domain.verificationStatus === "failed" && (
-                <form action={retryDomainAction.bind(null, domain.id)} className="mt-2">
+                <form action={retryDomainAction.bind(null, storeId, domain.id)} className="mt-2">
                   <button type="submit" className="text-xs text-blue-600 hover:underline">
                     Retry verification
                   </button>

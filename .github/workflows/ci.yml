@@ -64,6 +64,7 @@ jobs:
           tests/payments.test.ts
           tests/store-status.test.ts
           tests/domain-verification.test.ts
+          tests/hostname.test.ts
 
       - name: Build
         env:
