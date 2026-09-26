@@ -56,13 +56,13 @@ if [ "$current_block" != "$desired_block" ]; then
   cat "$tmp" > "$PG_HBA"
   rm -f "$tmp"
   if pg_lsclusters -h | awk -v v="$PG_VERSION" -v c="$PG_CLUSTER" '$1==v && $2==c {print $4}' | grep -q online; then
-    pg_ctlcluster "$PG_VERSION" "$PG_CLUSTER" reload
+    pg_ctlcluster "$PG_VERSION" "$PG_CLUSTER" reload >&2
   fi
 fi
 
 if ! pg_lsclusters -h | awk -v v="$PG_VERSION" -v c="$PG_CLUSTER" '$1==v && $2==c {print $4}' | grep -q online; then
   log "starting Postgres ${PG_VERSION}/${PG_CLUSTER}"
-  pg_ctlcluster "$PG_VERSION" "$PG_CLUSTER" start
+  pg_ctlcluster "$PG_VERSION" "$PG_CLUSTER" start >&2
 fi
 
 psql_admin() { runuser -u postgres -- psql -X -q -v ON_ERROR_STOP=1 "$@"; }
