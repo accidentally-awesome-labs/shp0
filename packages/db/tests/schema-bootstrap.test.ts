@@ -22,9 +22,19 @@ const BASE_URL =
 
 const SCHEMA = `bootstrap_${randomUUID().replace(/-/g, "")}`;
 
+/**
+ * `base` with `-c search_path=<schemaName>` added to its startup `options`.
+ * Appends rather than replaces, so options already in the URL (for example a
+ * hosted provider's `endpoint=...` routing option) are kept.
+ */
 function urlWithSearchPath(base: string, schemaName: string): string {
   const url = new URL(base);
-  url.searchParams.set("options", `-c search_path=${schemaName}`);
+  const searchPath = `-c search_path=${schemaName}`;
+  const existing = url.searchParams.get("options");
+  url.searchParams.set(
+    "options",
+    existing ? `${existing} ${searchPath}` : searchPath,
+  );
   return url.toString();
 }
 

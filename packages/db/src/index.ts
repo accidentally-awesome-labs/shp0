@@ -116,8 +116,9 @@ export async function platformClient<T>(
  * foreign keys reference. `connectionString` defaults to the platform URL; the
  * bootstrap test passes one pinned to a throwaway schema.
  *
- * For the tenant bootstrap `stores` table, a trigger stamps `store_id := id` on
- * insert (the platform creates Stores, so the per-request GUC is not set then).
+ * The tenant bootstrap `stores` table has no stamping trigger: the platform
+ * creates Stores (so the per-request GUC is not set then), and the inserting
+ * code sets `store_id = id` itself (see provisionStore()).
  */
 export async function applySchema(
   connectionString: string = PLATFORM_DATABASE_URL,
