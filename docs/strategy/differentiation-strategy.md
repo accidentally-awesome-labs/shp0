@@ -1,6 +1,6 @@
 # shp0 strategy 2026–2028: the hosted way out of WooCommerce that keeps what Shopify makes you give up
 
-*Strategy report, 2026-09-26. Ground truth is `main@21b98b1` (2026-07-05), the only branch. The verified code audit is [`docs/strategy/codebase-audit.md`](codebase-audit.md); its finding IDs (D, P, I, M, F, O, C, W) are used throughout. Vocabulary follows `CONTEXT.md`; proposed new terms are listed in §11.3.*
+*Strategy report, 2026-09-26. Ground truth is `main@21b98b1` (2026-07-05), the only branch. The verified code audit is [`docs/strategy/codebase-audit.md`](codebase-audit.md); its finding IDs (D, P, I, M, F, O, C, W) are used throughout. Vocabulary follows `CONTEXT.md`; proposed new terms are listed in §11.3. How to execute this plan (sequencing, agent operating model, founder track) is in [`execution-playbook.md`](execution-playbook.md), which departs from §8 where noted in its §8.*
 
 *ID legend: **N-xx** = proposed issue (Appendix B.4); **#nn** = GitHub issue; **A#** = competitive fact with source and date (Appendix A); **G1** = demand gate (§7.1); **K#** = kill criterion (§11.4); **R#** = risk (§11.1). Every external number carries a label and an A# row. `index.ts` means `packages/db/src/index.ts`.*
 
