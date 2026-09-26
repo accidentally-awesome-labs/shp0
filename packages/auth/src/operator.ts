@@ -1,5 +1,6 @@
 /**
- * Operator (platform admin) authorization policy — Issue #52, decision #73.
+ * Operator (platform admin) authorization policy — Issue #52, as proposed in
+ * decision #73.
  *
  * An Operator runs the platform itself: they can list every Store and suspend,
  * reinstate or terminate any of them. Being an Operator is not a Store Role and
@@ -45,4 +46,38 @@ export function isOperator(
 ): boolean {
   if (typeof userId !== "string" || userId.length === 0) return false;
   return operatorUserIds.has(userId);
+}
+
+/** Operator access for one request. */
+export type OperatorAccess =
+  | { status: "unauthenticated" }
+  | { status: "forbidden" }
+  | { status: "operator"; userId: string };
+
+/**
+ * Decide Operator access for one request. `sessionUserId` is the signed-in
+ * user's id, or null/undefined when the request has no valid session;
+ * `rawOperatorUserIds` is the raw SHP0_OPERATOR_USER_IDS value.
+ */
+export function decideOperatorAccess(
+  sessionUserId: string | null | undefined,
+  rawOperatorUserIds: string | null | undefined,
+): OperatorAccess {
+  if (sessionUserId === null || sessionUserId === undefined) {
+    return { status: "unauthenticated" };
+  }
+  if (!isOperator(sessionUserId, parseOperatorUserIds(rawOperatorUserIds))) {
+    return { status: "forbidden" };
+  }
+  return { status: "operator", userId: sessionUserId };
+}
+
+/**
+ * Throw unless `access` is an Operator's. The messages are deliberately
+ * generic: "Not authorized" says nothing about how Operators are configured.
+ */
+export function assertOperator(access: OperatorAccess): { userId: string } {
+  if (access.status === "unauthenticated") throw new Error("Not authenticated");
+  if (access.status !== "operator") throw new Error("Not authorized");
+  return { userId: access.userId };
 }

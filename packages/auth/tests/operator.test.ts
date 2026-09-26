@@ -4,14 +4,16 @@ import {
   OPERATOR_USER_IDS_ENV,
   parseOperatorUserIds,
   isOperator,
+  decideOperatorAccess,
+  assertOperator,
 } from "../src/operator";
 
 /**
  * Issue #52 — Operator (platform admin) authorization policy.
  *
  * Operators are an allowlist of better-auth user ids read from
- * SHP0_OPERATOR_USER_IDS (decision #73: ids, never emails). The policy fails
- * closed: with the variable unset or empty, nobody is an Operator.
+ * SHP0_OPERATOR_USER_IDS (ids, never emails, as proposed in decision #73). The
+ * policy fails closed: with the variable unset or empty, nobody is an Operator.
  *
  * Pure: no database, no network, no environment reads.
  */
@@ -87,6 +89,68 @@ describe("Operator allowlist policy (Issue #52)", () => {
     it("the whole raw value is not itself an id", () => {
       const operators = parseOperatorUserIds("op_1,op_2");
       expect(isOperator("op_1,op_2", operators)).toBe(false);
+    });
+  });
+
+  // What the web app's requireOperator() and the /admin gate decide for one
+  // request: the signed-in user's id (or none) against the raw variable.
+  describe("request access", () => {
+    it.each([
+      ["no session", null],
+      ["no session (undefined)", undefined],
+    ])("%s is unauthenticated, whatever the allowlist says", (_label, sessionUserId) => {
+      expect(decideOperatorAccess(sessionUserId, "op_1")).toEqual({ status: "unauthenticated" });
+      expect(decideOperatorAccess(sessionUserId, undefined)).toEqual({ status: "unauthenticated" });
+    });
+
+    it("a signed-in user who is not listed is forbidden", () => {
+      expect(decideOperatorAccess("merchant_1", "op_1, op_2")).toEqual({ status: "forbidden" });
+    });
+
+    it.each([
+      ["unset", undefined],
+      ["empty", ""],
+      ["separators only", " , ,"],
+      ["a wildcard", "*"],
+    ])("a signed-in user is forbidden when the variable is %s (fails closed)", (_label, raw) => {
+      expect(decideOperatorAccess("op_1", raw)).toEqual({ status: "forbidden" });
+    });
+
+    it("a listed user is an Operator", () => {
+      expect(decideOperatorAccess("op_2", " , op_1 ,op_2,")).toEqual({
+        status: "operator",
+        userId: "op_2",
+      });
+    });
+
+    it("an empty user id on a session is forbidden, not an Operator", () => {
+      expect(decideOperatorAccess("", "op_1")).toEqual({ status: "forbidden" });
+    });
+  });
+
+  describe("assertOperator", () => {
+    it("throws 'Not authenticated' without a session", () => {
+      expect(() => assertOperator({ status: "unauthenticated" })).toThrowError(
+        /^Not authenticated$/,
+      );
+    });
+
+    it("throws a generic 'Not authorized' for a signed-in non-Operator", () => {
+      expect(() => assertOperator({ status: "forbidden" })).toThrowError(/^Not authorized$/);
+    });
+
+    it("returns the Operator's user id", () => {
+      expect(assertOperator({ status: "operator", userId: "op_1" })).toEqual({ userId: "op_1" });
+    });
+
+    it("rejects a signed-in Merchant end to end, and lets a listed Operator through", () => {
+      expect(() => assertOperator(decideOperatorAccess("merchant_1", "op_1"))).toThrowError(
+        /^Not authorized$/,
+      );
+      expect(() => assertOperator(decideOperatorAccess(null, "op_1"))).toThrowError(
+        /^Not authenticated$/,
+      );
+      expect(assertOperator(decideOperatorAccess("op_1", "op_1"))).toEqual({ userId: "op_1" });
     });
   });
 });

@@ -1,11 +1,15 @@
 import { headers } from "next/headers";
+import { cache } from "react";
 
 import {
   OPERATOR_USER_IDS_ENV,
-  isOperator,
-  parseOperatorUserIds,
+  assertOperator,
+  decideOperatorAccess,
+  type OperatorAccess,
 } from "@shp0/auth/operator";
 import { auth } from "@/lib/auth";
+
+export type { OperatorAccess };
 
 /**
  * Operator (platform admin) access for the current request — Issue #52.
@@ -13,38 +17,29 @@ import { auth } from "@/lib/auth";
  * Operators are the Merchant user ids listed in SHP0_OPERATOR_USER_IDS
  * (comma-separated). Unset or empty means nobody is an Operator and the
  * platform admin is locked (fail closed). The policy itself lives in
- * @shp0/auth/operator; this module binds it to the request's session.
+ * @shp0/auth/operator (unit-tested); this module only binds it to the
+ * request's session.
  *
  * Every call reads the session from the request headers, so anything gated on
  * it renders per request and is never part of a prerendered or cached shell.
  * The allowlist is read at call time, never at build time, and never logged.
+ *
+ * React cache() dedupes the session lookup within one server render (the
+ * /admin gate plus the data functions it then calls). It never spans requests,
+ * and a server action invoked over HTTP gets its own fresh check.
  */
-export type OperatorAccess =
-  | { status: "unauthenticated" }
-  | { status: "forbidden" }
-  | { status: "operator"; userId: string };
-
-export async function getOperatorAccess(): Promise<OperatorAccess> {
+export const getOperatorAccess = cache(async (): Promise<OperatorAccess> => {
   const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) return { status: "unauthenticated" };
-
-  const operatorUserIds = parseOperatorUserIds(process.env[OPERATOR_USER_IDS_ENV]);
-  if (!isOperator(session.user.id, operatorUserIds)) return { status: "forbidden" };
-
-  return { status: "operator", userId: session.user.id };
-}
+  return decideOperatorAccess(session?.user.id, process.env[OPERATOR_USER_IDS_ENV]);
+});
 
 /**
- * Throw unless the caller is an Operator. Server actions are reachable over
- * HTTP by action id without rendering the admin page, so every operator
- * action and data function must call this itself before touching data.
- *
- * The "Not authorized" message is deliberately generic: it says nothing about
- * how Operators are configured.
+ * Throw unless the caller is an Operator: "Not authenticated" without a
+ * session, a generic "Not authorized" otherwise. Server actions are reachable
+ * over HTTP by action id without rendering the admin page, so every operator
+ * action and data function must call this itself before touching data
+ * (scripts/ci/operator-guard.mjs checks apps/web/app/actions/admin.ts).
  */
 export async function requireOperator(): Promise<{ userId: string }> {
-  const access = await getOperatorAccess();
-  if (access.status === "unauthenticated") throw new Error("Not authenticated");
-  if (access.status !== "operator") throw new Error("Not authorized");
-  return { userId: access.userId };
+  return assertOperator(await getOperatorAccess());
 }
