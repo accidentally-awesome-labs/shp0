@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      # Version comes from "packageManager" in package.json.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      # A frozen install must not rewrite tracked files (pnpm 11 rewrites
+      # pnpm-workspace.yaml when build approvals are missing).
+      - name: Install left the tree clean
+        run: git diff --exit-code
+
+      - name: Banned patterns
+        run: node scripts/ci/banned-patterns.mjs
+
+      - name: CI script self-tests
+        run: node --test 'scripts/ci/*.test.mjs'
+
+      - name: Typecheck
+        run: pnpm -r typecheck
+
+      # Pure modules only. The Postgres integration suites are not in CI yet:
+      # applySchema() cannot bootstrap an empty database (it creates
+      # memberships before the "user" table it references).
+      - name: Unit tests
+        working-directory: packages/db
+        run: >-
+          pnpm exec vitest run
+          tests/money.test.ts
+          tests/cart.test.ts
+          tests/order.test.ts
+          tests/discounts.test.ts
+          tests/billing.test.ts
+          tests/collections.test.ts
+          tests/payments.test.ts
+          tests/store-status.test.ts
+          tests/domain-verification.test.ts
+
+      - name: Build
+        env:
+          # Build-time placeholder so better-auth doesn't log default-secret
+          # errors during prerender. Not used at runtime.
+          BETTER_AUTH_SECRET: ci-build-placeholder-not-a-secret
+        run: pnpm build
