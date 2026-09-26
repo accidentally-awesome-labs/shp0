@@ -93,8 +93,9 @@ jobs:
           --health-retries 20
     env:
       # The tests connect to postgresql:///shp0_test?user=...; with no host in
-      # the URL, node-postgres (and psql) fall back to PGHOST/PGPORT.
-      PGHOST: localhost
+      # the URL, node-postgres (and psql) fall back to PGHOST/PGPORT. An IPv4
+      # literal, so neither tool depends on how the runner resolves localhost.
+      PGHOST: 127.0.0.1
       PGPORT: "5432"
     steps:
       - uses: actions/checkout@v5
