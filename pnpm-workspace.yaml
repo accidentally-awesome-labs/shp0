@@ -15,7 +15,9 @@ minimumReleaseAgeExclude:
   - next@16.3.0-canary.78
 
 # pnpm 11 settings live here (moved from package.json's `pnpm` field).
-# Allow these native deps to run their install-time build scripts.
-onlyBuiltDependencies:
-  - esbuild
-  - sharp
+# Allow these native deps to run their install-time build scripts. pnpm 11
+# replaced `onlyBuiltDependencies` with `allowBuilds`; with the old key a
+# frozen install exits 1 (ERR_PNPM_IGNORED_BUILDS) and rewrites this file.
+allowBuilds:
+  esbuild: true
+  sharp: true
