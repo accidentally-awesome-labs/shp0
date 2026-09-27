@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import { eq, sql, and } from "drizzle-orm";
@@ -92,17 +93,45 @@ function getPlatformPool(): Pool {
 type Tx = NodePgDatabase<typeof schema>;
 
 /**
+ * Which client callback, if any, the current async call chain is running in.
+ *
+ * Both pools keep pg's default size (10 connections) and are shared by every
+ * Store. A callback that opens another client holds one connection while it
+ * waits for a second: ten such calls at once take every connection and then
+ * wait forever for an eleventh, which wedges the pool for all Stores (a burst
+ * of add-to-cart requests did exactly this). So nesting is refused outright,
+ * on the first call and not only under load: work inside a callback uses the
+ * `tx` it was given, through helpers that take a Tx.
+ */
+const openClient = new AsyncLocalStorage<string>();
+
+function refuseNestedClient(name: string): void {
+  const outer = openClient.getStore();
+  if (outer !== undefined) {
+    throw new Error(
+      `${name}() was called inside another database client (a ${outer}() callback). ` +
+        "That holds two pool connections at once and deadlocks the shared pool under load: " +
+        "use the transaction the outer callback was given (pass its tx to a helper).",
+    );
+  }
+}
+
+/**
  * Run `fn` against the current Store's data, scoped by the database itself.
  *
  * `app.store_id` is set with `SET LOCAL` inside a transaction, so the GUC is
  * structurally inseparable from the query and resets at COMMIT. RLS policies
  * enforce `current_setting('app.store_id', true) = store_id`; with the GUC unset
  * the policy matches zero rows (fail-closed). This is the only tenant query path.
+ *
+ * `fn` must not open another client (tenantClient or platformClient, directly
+ * or through an exported function): that throws, see refuseNestedClient.
  */
 export async function tenantClient<T>(
   storeId: string,
   fn: (tx: Tx) => Promise<T>,
 ): Promise<T> {
+  refuseNestedClient("tenantClient");
   const client = await getTenantPool().connect();
   try {
     await client.query("BEGIN");
@@ -110,7 +139,7 @@ export async function tenantClient<T>(
     // unlike SET, accepts a bind parameter — so the store id is never string-built.
     await client.query("SELECT set_config('app.store_id', $1, true)", [storeId]);
     const tx = drizzle(client, { schema });
-    const result = await fn(tx);
+    const result = await openClient.run("tenantClient", () => fn(tx));
     await client.query("COMMIT");
     return result;
   } catch (error) {
@@ -125,14 +154,17 @@ export async function tenantClient<T>(
  * Run `fn` with cross-Store access, bypassing RLS (the `cloud_admin` role).
  * Reserved for platform operations — operator admin, analytics, Store creation.
  * Never used to serve a single Store.
+ *
+ * Like tenantClient, `fn` must not open another client.
  */
 export async function platformClient<T>(
   fn: (tx: Tx) => Promise<T>,
 ): Promise<T> {
+  refuseNestedClient("platformClient");
   const client = await getPlatformPool().connect();
   try {
     const tx = drizzle(client, { schema });
-    return await fn(tx);
+    return await openClient.run("platformClient", () => fn(tx));
   } finally {
     client.release();
   }
@@ -1068,6 +1100,61 @@ export function storeProductsTag(storeId: string): string {
 // these functions persist/restore it.
 // ─────────────────────────────────────────────────────────────────────────
 
+// The helpers below take the transaction their caller already holds (never a
+// Store id to open their own), so one cart operation is one pool connection.
+
+/**
+ * The id of the Customer's cart in the transaction's Store, row-locked until
+ * the transaction ends, or null if there is none. The lock serializes writes
+ * to one Cart (two tabs, a double click), so none is lost.
+ */
+async function lockCart(tx: Tx, customerId: string): Promise<string | null> {
+  const rows = await tx.execute(
+    sql`SELECT id FROM carts WHERE customer_id = ${customerId} LIMIT 1 FOR UPDATE`,
+  );
+  return rows.rows.length > 0 ? (rows.rows[0]!.id as string) : null;
+}
+
+/**
+ * lockCart, creating the Cart first if there is none. Two first writes for
+ * the same Customer race on the one-cart-per-customer unique index: the loser
+ * inserts nothing (ON CONFLICT DO NOTHING waits for the winner to commit) and
+ * then locks the winner's row.
+ */
+async function lockOrCreateCart(tx: Tx, storeId: string, customerId: string): Promise<string> {
+  const existing = await lockCart(tx, customerId);
+  if (existing !== null) return existing;
+  // store_id is stamped from the transaction's GUC by the trigger (ADR-0001).
+  const inserted = await tx.execute(
+    sql`INSERT INTO carts (store_id, customer_id) VALUES (${storeId}, ${customerId})
+        ON CONFLICT (store_id, customer_id) DO NOTHING RETURNING id`,
+  );
+  if (inserted.rows.length > 0) return inserted.rows[0]!.id as string;
+  const raced = await lockCart(tx, customerId);
+  if (raced === null) throw new Error("Could not create the cart");
+  return raced;
+}
+
+async function readCartLines(tx: Tx, cartId: string): Promise<CartLine[]> {
+  const rows = await tx.execute(
+    sql`SELECT variant_id, quantity FROM cart_items WHERE cart_id = ${cartId}`,
+  );
+  return (rows.rows as Array<{ variant_id: string; quantity: number }>).map((r) => ({
+    variantId: r.variant_id,
+    quantity: r.quantity,
+  }));
+}
+
+/** Replace a cart's items with `lines`. */
+async function writeCartLines(tx: Tx, storeId: string, cartId: string, lines: CartLine[]): Promise<void> {
+  await tx.delete(schema.cartItems).where(eq(schema.cartItems.cartId, cartId));
+  if (lines.length > 0) {
+    await tx.insert(schema.cartItems).values(
+      lines.map((line) => ({ storeId, cartId, variantId: line.variantId, quantity: line.quantity })),
+    );
+  }
+}
+
 /**
  * Get or create a Customer's cart for the given Store. Returns the cart id.
  * One cart per customer per store (enforced by a unique index).
@@ -1076,21 +1163,7 @@ export async function getOrCreateDbCart(
   storeId: string,
   customerId: string,
 ): Promise<string> {
-  return tenantClient(storeId, async (tx) => {
-    // Try to find existing.
-    const existing = await tx.execute(
-      sql`SELECT id FROM carts WHERE customer_id = ${customerId} LIMIT 1`,
-    );
-    if (existing.rows.length > 0) {
-      return existing.rows[0]!.id as string;
-    }
-    // Create new.
-    const [cart] = await tx
-      .insert(schema.carts)
-      .values({ storeId, customerId })
-      .returning();
-    return cart!.id;
-  });
+  return tenantClient(storeId, (tx) => lockOrCreateCart(tx, storeId, customerId));
 }
 
 /**
@@ -1108,23 +1181,13 @@ export async function getDbCart(
     if (cartRows.rows.length === 0) {
       return { storeId, lines: [] };
     }
-    const cartId = cartRows.rows[0]!.id as string;
-
-    const itemRows = await tx.execute(
-      sql`SELECT variant_id, quantity FROM cart_items WHERE cart_id = ${cartId}`,
-    );
-    return {
-      storeId,
-      lines: (itemRows.rows as Array<{ variant_id: string; quantity: number }>).map(
-        (r) => ({ variantId: r.variant_id, quantity: r.quantity }),
-      ),
-    };
+    return { storeId, lines: await readCartLines(tx, cartRows.rows[0]!.id as string) };
   });
 }
 
 /**
- * Save a cart's lines to the database, replacing any existing items.
- * Used after pure line-math operations are applied to a Cart domain object.
+ * Save a cart's lines to the database, replacing any existing items, in one
+ * transaction on one connection (creating the cart if needed).
  */
 export async function saveDbCartLines(
   storeId: string,
@@ -1132,24 +1195,8 @@ export async function saveDbCartLines(
   lines: CartLine[],
 ): Promise<void> {
   await tenantClient(storeId, async (tx) => {
-    const cartId = await getOrCreateDbCart(storeId, customerId);
-
-    // Delete existing items.
-    await tx
-      .delete(schema.cartItems)
-      .where(eq(schema.cartItems.cartId, cartId));
-
-    // Insert new items.
-    if (lines.length > 0) {
-      await tx.insert(schema.cartItems).values(
-        lines.map((line) => ({
-          storeId,
-          cartId,
-          variantId: line.variantId,
-          quantity: line.quantity,
-        })),
-      );
-    }
+    const cartId = await lockOrCreateCart(tx, storeId, customerId);
+    await writeCartLines(tx, storeId, cartId, lines);
   });
 }
 
