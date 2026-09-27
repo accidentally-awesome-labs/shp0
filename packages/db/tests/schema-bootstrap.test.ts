@@ -328,12 +328,23 @@ describe("applySchema() upgrades a database created before the Membership constr
    * and the owner-delete trigger would refuse to remove it); then remove role
    * text that is still not a Role, which grants nothing today
    * (getMembershipRole fails closed on it).
+   *
+   * Promoting owner-like text makes that person the Store's Owner, up from no
+   * access today, so the operator first previews exactly who
+   * (NEW_OWNERS_PREVIEW, the same condition as the UPDATE after it). These
+   * are the statements the PR's cleanup script runs, without its other
+   * previews.
    */
+  const NEW_OWNERS_PREVIEW = `SELECT store_id, user_id, role FROM memberships m
+     WHERE role <> 'owner' AND lower(btrim(role)) = 'owner'
+       AND NOT EXISTS (SELECT 1 FROM memberships o WHERE o.store_id = m.store_id AND o.role = 'owner')
+     ORDER BY store_id, created_at, id`;
   const CLEANUP = [
     `LOCK TABLE memberships IN SHARE ROW EXCLUSIVE MODE`,
     `UPDATE memberships SET role = lower(btrim(role))
      WHERE role NOT IN ('owner', 'admin', 'staff')
        AND lower(btrim(role)) IN ('admin', 'staff')`,
+    NEW_OWNERS_PREVIEW,
     `UPDATE memberships m SET role = 'owner'
      WHERE role <> 'owner' AND lower(btrim(role)) = 'owner'
        AND NOT EXISTS (SELECT 1 FROM memberships o WHERE o.store_id = m.store_id AND o.role = 'owner')`,
@@ -354,10 +365,14 @@ describe("applySchema() upgrades a database created before the Membership constr
     await olderDatabaseWith(VIOLATIONS);
     const ownerRow = (await allMemberships()).find((m) => m.user_id === "owner" && m.role === "owner");
 
+    let newOwners: unknown[] = [];
     const client = await old.connect();
     try {
       await client.query("BEGIN");
-      for (const statement of CLEANUP) await client.query(statement);
+      for (const statement of CLEANUP) {
+        const result = await client.query(statement);
+        if (statement === NEW_OWNERS_PREVIEW) newOwners = result.rows;
+      }
       await client.query("COMMIT");
     } catch (error) {
       await client.query("ROLLBACK");
@@ -365,6 +380,10 @@ describe("applySchema() upgrades a database created before the Membership constr
     } finally {
       client.release();
     }
+
+    // Only 'OWNER' in the Store with no Owner is promoted: 'Owner' in a Store
+    // that has its Owner (the Owner's own second row, and "impostor") is not.
+    expect(newOwners).toEqual([{ store_id: OWNERLESS_STORE, user_id: "heir", role: "OWNER" }]);
 
     await applySchema(OLD_URL);
     expect(membershipConstraints((await snapshot(old, OLD)).constraints)).toEqual(MEMBERSHIP_CONSTRAINTS);
