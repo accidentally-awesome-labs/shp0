@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 
 import { applySchema } from "../src/index";
+import { BASE_URL, urlWithSearchPath } from "./scoped-schema";
 
 /**
  * applySchema() must bootstrap an EMPTY database, and running it again must
@@ -11,32 +12,12 @@ import { applySchema } from "../src/index";
  * The shared shp0_test database is already bootstrapped by the other suites, so
  * this test gives applySchema() an empty namespace of its own: a throwaway
  * schema, with search_path pinned to it for every connection applySchema()
- * opens. Every unqualified CREATE / REFERENCES then resolves inside that schema
- * and nothing in `public` is visible, exactly as in a new database. (A throwaway
- * database would need CREATEDB, which the test roles deliberately lack.)
+ * opens (./scoped-schema). Every unqualified CREATE / REFERENCES then resolves
+ * inside that schema and nothing in `public` is visible, exactly as in a new
+ * database.
  */
-
-const BASE_URL =
-  process.env.PLATFORM_DATABASE_URL ??
-  "postgresql:///shp0_test?user=cloud_admin";
 
 const SCHEMA = `bootstrap_${randomUUID().replace(/-/g, "")}`;
-
-/**
- * `base` with `-c search_path=<schemaName>` added to its startup `options`.
- * Appends rather than replaces, so options already in the URL (for example a
- * hosted provider's `endpoint=...` routing option) are kept.
- */
-function urlWithSearchPath(base: string, schemaName: string): string {
-  const url = new URL(base);
-  const searchPath = `-c search_path=${schemaName}`;
-  const existing = url.searchParams.get("options");
-  url.searchParams.set(
-    "options",
-    existing ? `${existing} ${searchPath}` : searchPath,
-  );
-  return url.toString();
-}
 
 const SCOPED_URL = urlWithSearchPath(BASE_URL, SCHEMA);
 

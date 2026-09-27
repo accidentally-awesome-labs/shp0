@@ -23,8 +23,9 @@ import {
  * Role text other than exactly owner/admin/staff, and several Memberships
  * for one person in one Store, can no longer be stored
  * (membership-constraints.test.ts). The read still fails closed on them as
- * defense in depth; that rule, effectiveRole, is unit tested in
- * roles.test.ts.
+ * defense in depth: that rule, effectiveRole, is unit tested in
+ * roles.test.ts, and getMembershipRole is checked against such rows in
+ * membership-role-unconstrained.test.ts.
  */
 describe("getMembershipRole", () => {
   let pool: Pool;
