@@ -517,19 +517,32 @@ export async function applySchema(
     // snapshot, sees what the earlier one committed. owner-invariant.test.ts
     // runs those interleavings on two connections.
     //
-    // Only cloud_admin (the owner of both tables, so RLS on stores does not
-    // apply to it) changes memberships; "default" has no grant on it.
+    // The check takes nothing from the committing session. It names both
+    // tables through the trigger's own schema (TG_TABLE_SCHEMA; stores sits
+    // beside memberships), so neither a temporary table nor another schema
+    // on the session's search_path can stand in for them; its own
+    // search_path is pinned for everything else. row_security = off makes a
+    // Store that RLS would hide an error rather than a skipped check. Only
+    // cloud_admin (the owner of both tables, so RLS on stores does not apply
+    // to it) changes memberships today; "default" has no grant on it.
     await client.query(`
       CREATE OR REPLACE FUNCTION memberships_check_exactly_one_owner()
-      RETURNS trigger LANGUAGE plpgsql AS $func$
+      RETURNS trigger LANGUAGE plpgsql
+      SET search_path = pg_catalog, pg_temp
+      SET row_security = off
+      AS $func$
       DECLARE
+        store_exists boolean;
         owners integer;
       BEGIN
-        IF NOT EXISTS (SELECT 1 FROM stores WHERE id = OLD.store_id) THEN
+        EXECUTE format('SELECT EXISTS (SELECT 1 FROM %I.stores WHERE id = $1)', TG_TABLE_SCHEMA)
+          INTO store_exists USING OLD.store_id;
+        IF NOT store_exists THEN
           RETURN NULL;
         END IF;
-        SELECT count(*) INTO owners
-          FROM memberships WHERE store_id = OLD.store_id AND role = 'owner';
+        EXECUTE format('SELECT count(*) FROM %I.%I WHERE store_id = $1 AND role = %L',
+                       TG_TABLE_SCHEMA, TG_TABLE_NAME, 'owner')
+          INTO owners USING OLD.store_id;
         IF owners <> 1 THEN
           RAISE EXCEPTION 'Store % must have exactly one Owner; this transaction leaves it with %.',
             OLD.store_id, owners
