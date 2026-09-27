@@ -153,7 +153,7 @@ export const PUBLIC_ACTIONS = new Map([
   ],
   [
     "apps/web/app/actions/stripe.ts#createCheckoutSessionAction",
-    "storefront: Stripe Checkout for a pending Order of the request host's Store",
+    "storefront: Stripe Checkout for a pending Order of the request host's Store, only with the cart-token cookie that placed it",
   ],
   // Merchant, but not about one existing Store.
   [

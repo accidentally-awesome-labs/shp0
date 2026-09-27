@@ -1,15 +1,22 @@
 import { Suspense } from "react";
 import { notFound } from "next/navigation";
+import { readCartToken } from "@/lib/cart-token";
 import { resolveStorefrontStore } from "@/lib/current-store";
-import { getOrder, formatMoney, isOrderOpen } from "@shp0/db";
+import { getStorefrontOrder, formatMoney, isOrderOpen } from "@shp0/db";
 
 export const instant = false;
 
+/**
+ * The Order confirmation page. Only the request carrying the cart token that
+ * placed the Order (its own shp0_cart_token cookie) sees it; anyone else,
+ * with the Order id alone, gets the same not-found as for an Order that does
+ * not exist (getStorefrontOrder). Lines show titles, not Variant ids.
+ */
 async function OrderView({ orderId }: { orderId: string }) {
   const storeId = await resolveStorefrontStore();
   if (!storeId) notFound();
 
-  const order = await getOrder(storeId, orderId);
+  const order = await getStorefrontOrder(storeId, orderId, await readCartToken());
 
   if (!order) notFound();
 
@@ -44,7 +51,7 @@ async function OrderView({ orderId }: { orderId: string }) {
             {order.lines.map((line, i) => (
               <div key={i} className="flex justify-between text-sm">
                 <span className="text-gray-600">
-                  {line.variantId.slice(0, 8)}… × {line.quantity}
+                  {lineTitle(line)} × {line.quantity}
                 </span>
                 <span className="text-gray-500">
                   {formatMoney(line.unitPriceCents * line.quantity, "USD") as string}
@@ -69,6 +76,12 @@ async function OrderView({ orderId }: { orderId: string }) {
       </a>
     </div>
   );
+}
+
+function lineTitle(line: { productTitle: string | null; variantTitle: string | null }): string {
+  if (line.productTitle === null) return "Item no longer available";
+  if (line.variantTitle === null || line.variantTitle === "Default") return line.productTitle;
+  return `${line.productTitle} — ${line.variantTitle}`;
 }
 
 export default async function OrderPage({

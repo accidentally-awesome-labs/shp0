@@ -83,7 +83,7 @@ export type { Customer, NewCustomer } from "./schema";
 export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine, Collection, NewCollection } from "./schema";
 import type { Cart, CartChange, CartChangeResult, CartLine, CheckoutVariant } from "./cart";
 import { applyCartChange, CheckoutError, parseCartChange, priceCartForCheckout } from "./cart";
-import { UUID_PATTERN as UUID } from "./ids";
+import { isUuid, UUID_PATTERN as UUID } from "./ids";
 import { parseRole, roleRank } from "./roles";
 import type { Role } from "./roles";
 
@@ -1411,7 +1411,13 @@ export async function checkout(
 
 /**
  * Load an Order by id (with its lines), scoped to the Current Store via RLS.
- * Returns null if the Order doesn't exist or belongs to another Store.
+ * Returns null if the Order doesn't exist, belongs to another Store, or the
+ * id is not a UUID.
+ *
+ * Store-scoped only: it returns ANY Order of the Store to whoever asks. It is
+ * for Merchant and payment code that has already authorized the Store. The
+ * storefront must use getStorefrontOrder, which also requires the cart token
+ * that placed the Order.
  */
 export async function getOrder(
   storeId: string,
@@ -1427,6 +1433,7 @@ export async function getOrder(
     unitPriceCents: number;
   }>;
 } | null> {
+  if (!isUuid(orderId)) return null;
   return tenantClient(storeId, async (tx) => {
     const orderRows = await tx.execute(
       sql`SELECT id, payment_status, fulfillment_status, total_cents FROM orders WHERE id = ${orderId} LIMIT 1`,
@@ -1459,6 +1466,83 @@ export async function getOrder(
       fulfillmentStatus: o.fulfillment_status,
       totalCents: o.total_cents,
       lines,
+    };
+  });
+}
+
+/** An Order as the shopper who placed it sees it on the storefront. */
+export type StorefrontOrder = {
+  id: string;
+  paymentStatus: string;
+  fulfillmentStatus: string;
+  totalCents: number;
+  /** Titles, not Variant ids; null when the Variant has since been deleted. */
+  lines: Array<{
+    productTitle: string | null;
+    variantTitle: string | null;
+    quantity: number;
+    unitPriceCents: number;
+  }>;
+};
+
+/**
+ * Load an Order for the storefront, only for the cart token that placed it.
+ *
+ * Until checkout has Customer sign-in or a signed Order-access token, an
+ * Order's customer_id is the anonymous cart token (the httpOnly
+ * shp0_cart_token cookie) of the Cart it came from, and that token is the
+ * shopper's proof. The id and the token are matched in ONE query (under RLS,
+ * so the Order must also be in `storeId`): no token, another shopper's token,
+ * a malformed id or token, another Store's Order and a nonexistent Order all
+ * return null, indistinguishably. The Order id alone (it is in URLs, history
+ * and referrers) is not enough.
+ */
+export async function getStorefrontOrder(
+  storeId: string,
+  orderId: string,
+  cartToken: string | null | undefined,
+): Promise<StorefrontOrder | null> {
+  if (!isUuid(orderId) || !isUuid(cartToken)) return null;
+  return tenantClient(storeId, async (tx) => {
+    const orderRows = await tx.execute(
+      sql`SELECT id, payment_status, fulfillment_status, total_cents FROM orders
+          WHERE id = ${orderId} AND customer_id = ${cartToken} LIMIT 1`,
+    );
+    if (orderRows.rows.length === 0) return null;
+    const o = orderRows.rows[0] as {
+      id: string;
+      payment_status: string;
+      fulfillment_status: string;
+      total_cents: string | number;
+    };
+
+    const lineRows = await tx.execute(
+      sql`SELECT p.title AS product_title, v.title AS variant_title, ol.quantity, ol.unit_price_cents
+          FROM order_lines ol
+          LEFT JOIN variants v ON v.id = ol.variant_id
+          LEFT JOIN products p ON p.id = v.product_id
+          WHERE ol.order_id = ${o.id}
+          ORDER BY ol.created_at, ol.id`,
+    );
+    return {
+      id: o.id,
+      paymentStatus: o.payment_status,
+      fulfillmentStatus: o.fulfillment_status,
+      // bigint columns arrive as strings from raw queries.
+      totalCents: Number(o.total_cents),
+      lines: (
+        lineRows.rows as Array<{
+          product_title: string | null;
+          variant_title: string | null;
+          quantity: number;
+          unit_price_cents: string | number;
+        }>
+      ).map((r) => ({
+        productTitle: r.product_title,
+        variantTitle: r.variant_title,
+        quantity: r.quantity,
+        unitPriceCents: Number(r.unit_price_cents),
+      })),
     };
   });
 }
@@ -1650,10 +1734,14 @@ export async function getStoreIdByConnectAccount(
 /**
  * Load an Order with its lines in the shape needed by buildCheckoutSessionParams.
  * Includes product titles for the Stripe line item names.
+ *
+ * Only for the cart token that placed the Order, matched in the query like
+ * getStorefrontOrder: anyone else gets null, as for a nonexistent Order.
  */
 export async function getOrderForCheckout(
   storeId: string,
   orderId: string,
+  cartToken: string | null | undefined,
 ): Promise<{
   id: string;
   paymentStatus: string;
@@ -1665,9 +1753,11 @@ export async function getOrderForCheckout(
     unitPriceCents: number;
   }>;
 } | null> {
+  if (!isUuid(orderId) || !isUuid(cartToken)) return null;
   return tenantClient(storeId, async (tx) => {
     const orderRows = await tx.execute(
-      sql`SELECT id, payment_status, total_cents FROM orders WHERE id = ${orderId} LIMIT 1`,
+      sql`SELECT id, payment_status, total_cents FROM orders
+          WHERE id = ${orderId} AND customer_id = ${cartToken} LIMIT 1`,
     );
     if (orderRows.rows.length === 0) return null;
     const o = orderRows.rows[0] as {
