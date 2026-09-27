@@ -6,7 +6,9 @@
   "main": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./operator": "./src/operator.ts"
+    "./operator": "./src/operator.ts",
+    "./redirect": "./src/redirect.ts",
+    "./session-cookie": "./src/session-cookie.ts"
   },
   "scripts": {
     "test": "vitest run",
