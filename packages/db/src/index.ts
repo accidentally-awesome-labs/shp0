@@ -476,8 +476,10 @@ export async function applySchema(
     `);
     // Part 2: the owner row cannot be deleted, at once, whatever else the
     // transaction does. This also refuses the cascade that deleting the
-    // Store, or the Owner's user, runs over the owner row. Part 3 alone
-    // would refuse the latter too, but let a Store deletion through.
+    // Store, or the Owner's user (closing their account), runs over the
+    // owner row. Part 3 alone would refuse the latter too, but let a Store
+    // deletion through (owner-invariant.test.ts shows both with this
+    // trigger disabled).
     await client.query(`
       CREATE OR REPLACE FUNCTION memberships_prevent_owner_delete()
       RETURNS trigger LANGUAGE plpgsql AS $func$
@@ -525,6 +527,11 @@ export async function applySchema(
     // Store that RLS would hide an error rather than a skipped check. Only
     // cloud_admin (the owner of both tables, so RLS on stores does not apply
     // to it) changes memberships today; "default" has no grant on it.
+    //
+    // Row triggers do not fire on TRUNCATE, so neither part 2 nor part 3
+    // sees TRUNCATE memberships, or a TRUNCATE ... CASCADE of "user" that
+    // reaches it: either removes every owner row unchecked. Test fixtures do
+    // this; the application must never truncate these tables.
     await client.query(`
       CREATE OR REPLACE FUNCTION memberships_check_exactly_one_owner()
       RETURNS trigger LANGUAGE plpgsql
