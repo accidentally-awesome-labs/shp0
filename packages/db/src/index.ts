@@ -180,6 +180,15 @@ export async function tenantClient<T>(
  * Reserved for platform operations — operator admin, analytics, Store creation.
  * Never used to serve a single Store.
  *
+ * Like tenantClient, `fn` runs in one transaction: every write it makes
+ * commits together when it returns, or none does when it throws (the
+ * error is rethrown). No other connection sees those writes before `fn`
+ * returns, and a database error aborts the transaction, so `fn` must not
+ * catch one and carry on (every later statement would fail with 25P02);
+ * use a SAVEPOINT for a statement that may fail. Checks the schema defers
+ * to COMMIT (memberships_exactly_one_owner) run after `fn` returns, and
+ * their refusal rejects this call.
+ *
  * Like tenantClient, `fn` must not open another client.
  */
 export async function platformClient<T>(
@@ -188,8 +197,14 @@ export async function platformClient<T>(
   refuseNestedClient("platformClient");
   const client = await getPlatformPool().connect();
   try {
+    await client.query("BEGIN");
     const tx = drizzle(client, { schema });
-    return await openClient.run("platformClient", () => fn(tx));
+    const result = await openClient.run("platformClient", () => fn(tx));
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
   } finally {
     client.release();
   }
@@ -951,8 +966,12 @@ export async function closePools(): Promise<void> {
  *
  * Store creation is a platform operation: the platform mints the Store's id,
  * sets store_id = id, and creates the creator's Membership with role = 'owner'.
- * Both inserts run in a single transaction via platformClient — if either
- * fails, neither happens.
+ * Both inserts run in the one transaction platformClient opens: if either
+ * fails (an unknown ownerId is 23503 memberships_user_id_fkey, a taken
+ * subdomain 23505 stores_subdomain_key), neither is kept and the error is
+ * rethrown. Until it commits, the new Store row holds its subdomain: a
+ * concurrent call for the same subdomain waits for this one, then fails
+ * with 23505 if it committed, or goes ahead if it rolled back.
  */
 export async function provisionStore(opts: {
   name: string;
