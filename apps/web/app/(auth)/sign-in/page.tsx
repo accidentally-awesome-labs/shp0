@@ -2,12 +2,15 @@
 
 import { Suspense, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { safeRedirectPath } from "@shp0/auth/redirect";
 import { signIn } from "@/lib/auth-client";
 
 function SignInForm() {
   const router = useRouter();
   const params = useSearchParams();
-  const redirect = params.get("redirect") ?? "/dashboard";
+  // Only a same-origin path: ?redirect=https://evil.example or //evil.example
+  // would otherwise send a Merchant who just signed in to another site.
+  const redirect = safeRedirectPath(params.get("redirect"));
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");

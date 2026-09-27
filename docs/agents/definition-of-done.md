@@ -14,6 +14,7 @@ or setting enforces it.
 | --- | --- | --- |
 | CI: frozen install leaves the tree clean, banned patterns, CI script self-tests, typecheck, unit tests, production build | `.github/workflows/ci.yml` | Broken installs, `db:push`, focused tests, `applySchema()` outside tests, type errors, broken builds |
 | CI `integration` job: the full `packages/db` suite, then the `packages/auth` suite, against a Postgres 16 service starting from an empty `shp0_test` (non-superuser `cloud_admin` and `default` roles) | `.github/workflows/ci.yml` | An `applySchema()` that cannot bootstrap an empty database or is not idempotent; regressions in RLS isolation, Store provisioning, payments, auth and the other Postgres-backed paths |
+| Action guard: `"use server"` appears only in modules under `apps/web/app/actions/` (anywhere else in the repo, `packages/` included, fails); every export of those modules first awaits `authorizeStore(<its first parameter>, "<capability>")` or `requireOperator()`, with literal parameter defaults only, no second Store id parameter and no `arguments`, unless the script's commented allowlist names it as a storefront or session-scoped action; every page, layout, template and default file below `apps/web/app/dashboard/[<param>]/` (route groups and slots included) first awaits `authorizeStorePage(storeId, "<capability>")` and exports nothing else that runs, and no route handler lives there | `scripts/ci/action-guard.mjs`, run by `.github/workflows/ci.yml` | A dashboard action or page that reads or changes a Store without checking the caller's Membership and Role (it cannot tell whether the chosen capability is the right one: that is review, and `.github/CODEOWNERS` routes every action and dashboard file to it) |
 | Closure guard | `.github/workflows/closure-guard.yml` | Issues closed as completed without a merged PR (reopened); not-planned closes without `wontfix` or `superseded` |
 | Code owners | `.github/CODEOWNERS` | Security-sensitive paths get a review request from their owner |
 
@@ -32,7 +33,10 @@ on the web, `.claude/hooks/session-start.sh` does this at session start.
    checks the shape.
 4. **Every tenant read or write goes through `tenantClient` with a Store id the
    caller is authorized for.** Row-level security scopes to whatever Store id it
-   is given; it does not check who is asking.
+   is given; it does not check who is asking. On the dashboard that
+   authorization is `authorizeStore(storeId, capability)` in
+   `apps/web/lib/current-store.ts` (Membership plus a Role rank check); the
+   action guard checks that the call is there, not that the capability fits.
 5. **Agents do not close issues, apply triage labels or merge.** They open PRs.
 6. **Security-sensitive paths** (see `.github/CODEOWNERS`) need the code owner's
    review before merge.

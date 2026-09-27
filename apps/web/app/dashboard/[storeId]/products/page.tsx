@@ -1,9 +1,10 @@
 export const instant = false;
 import Link from "next/link";
-import { notFound } from "next/navigation";
 
-import { resolveDashboardStore } from "@/lib/current-store";
+import { can } from "@shp0/db/roles";
+import { authorizeStorePage } from "@/lib/current-store";
 import { getProducts } from "@/app/actions/products";
+import { RequiresRole } from "@/app/dashboard/requires-role";
 
 export default async function ProductsPage({
   params,
@@ -11,8 +12,8 @@ export default async function ProductsPage({
   params: Promise<{ storeId: string }>;
 }) {
   const { storeId } = await params;
-  const resolved = await resolveDashboardStore(storeId);
-  if (!resolved) notFound();
+  const access = await authorizeStorePage(storeId, "catalog.view");
+  if (access.status !== "ok") return <RequiresRole role={access.required} storeId={storeId} />;
 
   const products = await getProducts(storeId);
 
@@ -29,17 +30,21 @@ export default async function ProductsPage({
             </Link>
             <h1 className="mt-2 text-2xl font-bold">Products</h1>
           </div>
-          <Link
-            href={`/dashboard/${storeId}/products/new`}
-            className="rounded bg-black px-4 py-2 text-sm text-white hover:bg-gray-800"
-          >
-            + Add product
-          </Link>
+          {can(access.role, "catalog.manage") && (
+            <Link
+              href={`/dashboard/${storeId}/products/new`}
+              className="rounded bg-black px-4 py-2 text-sm text-white hover:bg-gray-800"
+            >
+              + Add product
+            </Link>
+          )}
         </div>
 
         {products.length === 0 ? (
           <div className="mt-8 rounded-lg border border-dashed p-12 text-center text-gray-500">
-            No products yet. Click &quot;Add product&quot; to create your first.
+            {can(access.role, "catalog.manage")
+              ? "No products yet. Click \"Add product\" to create your first."
+              : "No products yet."}
           </div>
         ) : (
           <div className="mt-8 overflow-hidden rounded-lg border">

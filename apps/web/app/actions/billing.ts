@@ -1,24 +1,24 @@
 "use server";
 
-import { headers } from "next/headers";
+import { authorizeStore } from "@/lib/current-store";
+import { getStoreTier, setStoreTier, getStoreUsage, TIERS } from "@shp0/db";
 
-import { auth } from "@/lib/auth";
-import { resolveDashboardStore } from "@/lib/current-store";
-import { getStoreTier, setStoreTier, getStoreUsage } from "@shp0/db";
-import { TIERS } from "@shp0/db";
+// Platform billing is the Owner's alone (CONTEXT.md). Viewing it is Owner-only
+// too: CONTEXT.md is silent on viewing, and that choice awaits the owner's
+// decision (see packages/db/src/roles.ts, "billing.view").
 
 export async function changeTierAction(storeId: string, formData: FormData) {
-  const resolved = await resolveDashboardStore(storeId);
-  if (!resolved) throw new Error("Not authorized for this store");
+  await authorizeStore(storeId, "billing.manage");
 
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) throw new Error("Not authenticated");
-
-  const tierId = formData.get("tierId") as "free" | "pro" | "scale";
-  await setStoreTier(storeId, tierId);
+  const tierId = formData.get("tierId");
+  if (typeof tierId !== "string" || !Object.hasOwn(TIERS, tierId)) {
+    throw new Error("Unknown tier");
+  }
+  await setStoreTier(storeId, tierId as keyof typeof TIERS);
 }
 
 export async function getDashboardBilling(storeId: string) {
+  await authorizeStore(storeId, "billing.view");
   const [tier, usage] = await Promise.all([getStoreTier(storeId), getStoreUsage(storeId)]);
   return { tier, usage, tiers: TIERS };
 }

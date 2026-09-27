@@ -2,7 +2,7 @@
 
 import type Stripe from "stripe";
 
-import { resolveStorefrontStore, resolveDashboardStore } from "@/lib/current-store";
+import { authorizeStore, resolveStorefrontStore } from "@/lib/current-store";
 import {
   getPaymentAccount,
   getStoreCommissionBps,
@@ -15,9 +15,9 @@ import {
   getStripe,
 } from "@/lib/stripe";
 
+// Payouts are Store settings: Admin and above.
 export async function onboardConnectAction(storeId: string): Promise<{ url: string }> {
-  const resolved = await resolveDashboardStore(storeId);
-  if (!resolved) throw new Error("No store resolved");
+  const resolved = await authorizeStore(storeId, "settings.manage");
 
   const existing = await getPaymentAccount(resolved.storeId);
   if (existing) {

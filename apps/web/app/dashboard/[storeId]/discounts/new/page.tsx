@@ -1,6 +1,8 @@
 export const instant = false;
 
 import { createDiscountAction, previewDiscountAction } from "@/app/actions/discounts";
+import { authorizeStorePage } from "@/lib/current-store";
+import { RequiresRole } from "@/app/dashboard/requires-role";
 
 export default async function NewDiscountPage({
   params,
@@ -8,6 +10,8 @@ export default async function NewDiscountPage({
   params: Promise<{ storeId: string }>;
 }) {
   const { storeId } = await params;
+  const access = await authorizeStorePage(storeId, "discounts.manage");
+  if (access.status !== "ok") return <RequiresRole role={access.required} storeId={storeId} />;
 
   return (
     <div className="mx-auto max-w-lg p-8">

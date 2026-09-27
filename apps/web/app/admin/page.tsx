@@ -21,10 +21,9 @@ export default async function AdminPage() {
   // This route resumes from an empty postponed shell, so the response has
   // already committed to 200: redirect() becomes a client-side redirect and
   // notFound() renders the not-found page (noindex), not an HTTP 404.
-  // proxy.ts deliberately does not match /admin: it looks for the unprefixed
-  // session cookie, but better-auth prefixes it with __Secure- when its base
-  // URL is https (or, with none set, in production), so the proxy would bounce
-  // every signed-in Operator to sign-in.
+  // proxy.ts deliberately does not match /admin: this gate already sends a
+  // signed-out visitor to sign-in, and the proxy only checks that a session
+  // cookie is present, which adds nothing here.
   const access = await getOperatorAccess();
   if (access.status === "unauthenticated") redirect("/sign-in?redirect=/admin");
   // Signed in but not an Operator: answer as if the admin did not exist.

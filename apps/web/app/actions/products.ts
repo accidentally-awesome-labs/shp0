@@ -1,10 +1,8 @@
 "use server";
 
-import { headers } from "next/headers";
 import { revalidatePath, revalidateTag } from "next/cache";
 
-import { auth } from "@/lib/auth";
-import { resolveDashboardStore } from "@/lib/current-store";
+import { authorizeStore } from "@/lib/current-store";
 import {
   createProduct as dbCreateProduct,
   listProducts as dbListProducts,
@@ -14,12 +12,12 @@ import {
   storeProductsTag,
 } from "@shp0/db";
 
-export async function createProductAction(storeId: string, formData: FormData) {
-  const resolved = await resolveDashboardStore(storeId);
-  if (!resolved) throw new Error("Not authorized for this store");
+// Every export is a public endpoint (callable by action id with any
+// arguments): each authorizes the caller for the Store and capability first.
+// Product ids are then scoped to that Store by RLS.
 
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) throw new Error("Not authenticated");
+export async function createProductAction(storeId: string, formData: FormData) {
+  await authorizeStore(storeId, "catalog.manage");
 
   const title = formData.get("title") as string;
   const slug = (formData.get("slug") as string) || slugify(title);
@@ -49,9 +47,7 @@ export async function createProductAction(storeId: string, formData: FormData) {
 }
 
 export async function deleteProductAction(storeId: string, productId: string) {
-  const resolved = await resolveDashboardStore(storeId);
-  if (!resolved) throw new Error("Not authorized for this store");
-
+  await authorizeStore(storeId, "catalog.manage");
   await dbDeleteProduct(storeId, productId);
   // Targeted cache invalidation.
   revalidateTag(productTag(storeId, productId), "default");
@@ -60,8 +56,7 @@ export async function deleteProductAction(storeId: string, productId: string) {
 }
 
 export async function getProducts(storeId: string) {
-  const resolved = await resolveDashboardStore(storeId);
-  if (!resolved) return [];
+  await authorizeStore(storeId, "catalog.view");
   return dbListProducts(storeId);
 }
 

@@ -1,10 +1,6 @@
 "use server";
 
-import { headers } from "next/headers";
-import { revalidatePath } from "next/cache";
-
-import { auth } from "@/lib/auth";
-import { resolveDashboardStore } from "@/lib/current-store";
+import { authorizeStore } from "@/lib/current-store";
 import {
   createCollection as dbCreateCollection,
   listCollections as dbListCollections,
@@ -19,12 +15,12 @@ function slugify(text: string): string {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 
-export async function createCollectionAction(storeId: string, formData: FormData) {
-  const resolved = await resolveDashboardStore(storeId);
-  if (!resolved) throw new Error("Not authorized for this store");
+// Every export is a public endpoint (callable by action id with any
+// arguments): each authorizes the caller for the Store and capability first.
+// The Collection and Product ids are then scoped to that Store by RLS.
 
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) throw new Error("Not authenticated");
+export async function createCollectionAction(storeId: string, formData: FormData) {
+  await authorizeStore(storeId, "catalog.manage");
 
   const name = formData.get("name") as string;
   const slug = (formData.get("slug") as string) || slugify(name);
@@ -53,9 +49,7 @@ export async function addCollectionMembersAction(
   collectionId: string,
   productIds: string[],
 ) {
-  const resolved = await resolveDashboardStore(storeId);
-  if (!resolved) throw new Error("Not authorized for this store");
-
+  await authorizeStore(storeId, "catalog.manage");
   await dbAddMembers(storeId, collectionId, productIds);
 }
 
@@ -64,20 +58,21 @@ export async function removeCollectionMemberAction(
   collectionId: string,
   productId: string,
 ) {
-  const resolved = await resolveDashboardStore(storeId);
-  if (!resolved) throw new Error("Not authorized for this store");
-
+  await authorizeStore(storeId, "catalog.manage");
   await dbRemoveMember(storeId, collectionId, productId);
 }
 
 export async function getDashboardCollections(storeId: string) {
+  await authorizeStore(storeId, "catalog.view");
   return dbListCollections(storeId);
 }
 
 export async function getDashboardCollectionMembers(storeId: string, collectionId: string) {
+  await authorizeStore(storeId, "catalog.view");
   return dbListMembers(storeId, collectionId);
 }
 
 export async function getDashboardProducts(storeId: string) {
+  await authorizeStore(storeId, "catalog.view");
   return dbListProducts(storeId);
 }

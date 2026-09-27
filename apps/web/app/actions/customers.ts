@@ -3,7 +3,7 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 
-import { resolveStorefrontStore } from "@/lib/current-store";
+import { authorizeStore, resolveStorefrontStore } from "@/lib/current-store";
 import {
   signUpCustomer,
   signInCustomer,
@@ -69,10 +69,16 @@ export async function getStorefrontCustomer() {
   return getCustomerBySession(storeId, token);
 }
 
+// Dashboard reads. This module is also imported by the storefront /account
+// pages, so these are registered there too: each authorizes the Merchant for
+// the Store first, whatever page the request is posted to.
+
 export async function getDashboardCustomers(storeId: string) {
+  await authorizeStore(storeId, "customers.view");
   return listCustomers(storeId);
 }
 
 export async function getDashboardCustomerOrders(storeId: string, customerId: string) {
+  await authorizeStore(storeId, "customers.view");
   return listCustomerOrders(storeId, customerId);
 }

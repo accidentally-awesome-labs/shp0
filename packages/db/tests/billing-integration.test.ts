@@ -70,4 +70,17 @@ describe("Platform billing — tier + commission (Issue #15)", () => {
     await setStoreTier(storeId, "free");
     expect(await getTierCommissionBps(storeId)).toBe(300);
   });
+
+  // A tier id reaches setStoreTier from a form field. An unknown one used to
+  // be stored as is, after which getStoreTier returned undefined and the
+  // billing page crashed.
+  it.each(["bogus", "enterprise-free", "", "Pro", "__proto__", "constructor", "toString"])(
+    "rejects the unknown tier id %j and leaves the Subscription unchanged",
+    async (tierId) => {
+      await setStoreTier(storeId, "pro");
+      await expect(setStoreTier(storeId, tierId as "free")).rejects.toThrow("Unknown tier");
+      const tier = await getStoreTier(storeId);
+      expect(tier.id).toBe("pro");
+    },
+  );
 });

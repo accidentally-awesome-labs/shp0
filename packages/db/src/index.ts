@@ -39,9 +39,24 @@ export type {
   DomainVerificationResult,
 } from "./domain-verification";
 export { hashPassword, verifyPassword } from "./customer-auth";
+export {
+  ROLES,
+  ROLE_LABEL,
+  CAPABILITY_MINIMUM_ROLE,
+  parseRole,
+  roleRank,
+  hasAtLeastRole,
+  isCapability,
+  minimumRole,
+  can,
+  decideStoreAccess,
+} from "./roles";
+export type { Role, Capability, StoreAccessDecision } from "./roles";
 export type { Customer, NewCustomer } from "./schema";
 export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine, Collection, NewCollection } from "./schema";
 import type { Cart, CartLine } from "./cart";
+import { parseRole, roleRank } from "./roles";
+import type { Role } from "./roles";
 
 /**
  * Two roles, two connection pools (per ADR-0001):
@@ -56,6 +71,9 @@ const TENANT_DATABASE_URL =
 const PLATFORM_DATABASE_URL =
   process.env.PLATFORM_DATABASE_URL ??
   "postgresql:///shp0_test?user=cloud_admin";
+
+/** A Store id, domain id etc.: anything else is rejected before it reaches SQL. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 let tenantPool: Pool | null = null;
 let platformPool: Pool | null = null;
@@ -725,20 +743,51 @@ export async function checkSubdomainAvailable(
 // hostname rules) lives in ./hostname so it can be unit tested without a DB.
 
 /**
- * Check whether a Merchant (user) holds an active Membership for the given Store.
- * This is the dashboard authorization gate: a Merchant's Store selection is
- * only honored if they actually belong to that Store.
+ * The Merchant's (user's) Role in the given Store, or null when they have
+ * none. This is the database half of the dashboard authorization gate; the
+ * web layer compares the Role with a capability's minimum Role (./roles).
+ *
+ * Fails closed, returning null (no capability at all) when:
+ * - the user holds no Membership in the Store, or the Store does not exist
+ *   (the two are indistinguishable to the caller);
+ * - the Store id is not a UUID (checked before any query, so a bad URL
+ *   segment is answered like a non-member instead of raising 22P02);
+ * - the stored role text is not exactly "owner", "admin" or "staff".
+ *
+ * memberships has no UNIQUE (user_id, store_id), so one person can have
+ * several rows in one Store. Then every row must hold a valid Role, and the
+ * lowest one is returned: extra rows can only take authority away.
+ */
+export async function getMembershipRole(
+  userId: string,
+  storeId: string,
+): Promise<Role | null> {
+  if (typeof userId !== "string" || userId.length === 0) return null;
+  if (typeof storeId !== "string" || !UUID.test(storeId)) return null;
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT role FROM memberships WHERE user_id = ${userId} AND store_id = ${storeId}`,
+    );
+    let lowest: Role | null = null;
+    for (const row of rows.rows as Array<{ role: unknown }>) {
+      const role = parseRole(row.role);
+      if (role === null) return null;
+      if (lowest === null || roleRank(role) < roleRank(lowest)) lowest = role;
+    }
+    return lowest;
+  });
+}
+
+/**
+ * Whether a Merchant (user) holds a Membership with a valid Role in the
+ * given Store. A boolean cannot enforce a Role: dashboard code authorizes
+ * through getMembershipRole (apps/web/lib/current-store.ts authorizeStore).
  */
 export async function authorizeStoreMembership(
   userId: string,
   storeId: string,
 ): Promise<boolean> {
-  return platformClient(async (tx) => {
-    const rows = await tx.execute(
-      sql`SELECT 1 FROM memberships WHERE user_id = ${userId} AND store_id = ${storeId} LIMIT 1`,
-    );
-    return rows.rows.length > 0;
-  });
+  return (await getMembershipRole(userId, storeId)) !== null;
 }
 
 /**
@@ -1556,6 +1605,12 @@ export async function listCollections(
 
 /**
  * Add products to a manual collection (insert join rows).
+ *
+ * Both ids must belong to this Store. Foreign-key checks bypass RLS, so a
+ * plain INSERT would accept another Store's collection or product id (and a
+ * foreign-key error would reveal whether an id exists anywhere). Selecting the
+ * pair through RLS links only ids this Store can see; any other id links
+ * nothing, silently, whether or not it exists elsewhere.
  */
 export async function addCollectionMembers(
   storeId: string,
@@ -1566,7 +1621,10 @@ export async function addCollectionMembers(
   return tenantClient(storeId, async (tx) => {
     for (const productId of productIds) {
       await tx.execute(
-        sql`INSERT INTO collection_products (collection_id, product_id) VALUES (${collectionId}, ${productId}) ON CONFLICT DO NOTHING`,
+        sql`INSERT INTO collection_products (collection_id, product_id)
+            SELECT c.id, p.id FROM collections c, products p
+            WHERE c.id = ${collectionId} AND p.id = ${productId}
+            ON CONFLICT DO NOTHING`,
       );
     }
   });
@@ -2007,6 +2065,11 @@ export async function setStoreTier(
   storeId: string,
   tierId: "free" | "pro" | "scale",
 ): Promise<void> {
+  // tier_id is free text: an unknown id would be stored, and getStoreTier
+  // would then return undefined for it.
+  if (typeof tierId !== "string" || !Object.hasOwn(TIERS, tierId)) {
+    throw new Error("Unknown tier");
+  }
   return platformClient(async (tx) => {
     await tx.execute(
       sql`
@@ -2197,8 +2260,6 @@ import {
   routeStorefrontHost,
   validateCustomDomain,
 } from "./hostname";
-
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Add a Custom Domain to a Store (starts as 'pending').
