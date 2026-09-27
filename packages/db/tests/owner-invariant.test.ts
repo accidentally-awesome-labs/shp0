@@ -76,17 +76,40 @@ describe("memberships: a Store keeps exactly one Owner", () => {
   }
 
   /**
-   * A Store with no Owner at all. Only a fixture: the database does not
-   * require an Owner when a Store is created (provisionStore inserts the
-   * Owner row after the Store row), so a Store can be ownerless, and moving
+   * A Store with no Owner at all: legacy data. A new Store must have its
+   * Owner when it commits (stores_exactly_one_owner_at_creation), but a
+   * database may still hold Stores created before that check, and moving
    * an Owner row into one is not refused by memberships_one_owner_per_store.
+   *
+   * Made the way such a Store came to be: with the creation-time check off.
+   * One transaction on one connection disables that trigger, inserts the
+   * Store, enables the trigger again and commits, so no other statement
+   * ever runs without it; the test then checks it is enabled.
    */
   async function newOwnerlessStore(): Promise<string> {
     const id = randomUUID();
-    await pool.query(
-      `INSERT INTO stores (id, store_id, name, subdomain) VALUES ($1, $1, 'Ownerless', $2)`,
-      [id, `ownerless-${id.slice(0, 8)}`],
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("ALTER TABLE stores DISABLE TRIGGER stores_exactly_one_owner_at_creation");
+      await client.query(
+        `INSERT INTO stores (id, store_id, name, subdomain) VALUES ($1, $1, 'Ownerless', $2)`,
+        [id, `ownerless-${id.slice(0, 8)}`],
+      );
+      await client.query("ALTER TABLE stores ENABLE TRIGGER stores_exactly_one_owner_at_creation");
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+    const { rows } = await pool.query<{ tgenabled: string }>(
+      `SELECT tgenabled FROM pg_trigger
+       WHERE tgrelid = 'stores'::regclass AND tgname = 'stores_exactly_one_owner_at_creation'`,
     );
+    expect(rows).toEqual([{ tgenabled: "O" }]);
+    expect(await ownersOf(id)).toEqual([]);
     return id;
   }
 
