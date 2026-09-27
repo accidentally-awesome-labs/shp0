@@ -61,6 +61,32 @@ test("allows applySchema() in tests, its definition and comments, but not in app
   );
 });
 
+test("keeps app code off getOrder (outside the Store dashboard) and the unvalidated cart writers", () => {
+  const violations = scanFiles({
+    "apps/web/app/(storefront)/order/[orderId]/page.tsx": "const order = await getOrder(storeId, orderId);",
+    "apps/web/app/account/orders/page.tsx": "const o = await db.getOrder (storeId, id);",
+    "apps/web/app/actions/cart.ts":
+      "await saveDbCartLines(storeId, token, lines);\nconst id = await getOrCreateDbCart(storeId, token);",
+    // Allowed: the token-scoped and validated functions, a gated dashboard
+    // page, the db package and its tests, and comments.
+    "apps/web/app/(storefront)/order/[orderId]/ok.tsx":
+      "await getStorefrontOrder(storeId, orderId, token);\nawait getOrderForCheckout(storeId, orderId, token);",
+    "apps/web/app/actions/checkout.ts": "// never getOrder(storeId, id) here\nawait changeDbCart(storeId, token, change);",
+    "apps/web/app/dashboard/[storeId]/orders/[orderId]/page.tsx": "const order = await getOrder(storeId, orderId);",
+    "packages/db/src/index.ts": "export async function saveDbCartLines(\nreturn getOrder(storeId, orderId);",
+    "packages/db/tests/cart.test.ts": "await saveDbCartLines(A, t, []);\nawait getOrder(A, id);",
+  });
+  assert.deepEqual(
+    violations.map((v) => [v.file, v.line, v.rule]),
+    [
+      ["apps/web/app/(storefront)/order/[orderId]/page.tsx", 1, "no-store-wide-order-read-in-app"],
+      ["apps/web/app/account/orders/page.tsx", 1, "no-store-wide-order-read-in-app"],
+      ["apps/web/app/actions/cart.ts", 1, "no-unvalidated-cart-write-in-app"],
+      ["apps/web/app/actions/cart.ts", 2, "no-unvalidated-cart-write-in-app"],
+    ],
+  );
+});
+
 test("exits 1 on a repo with a db:push script and 0 once it is removed", () => {
   const dir = mkdtempSync(join(tmpdir(), "banned-patterns-"));
   try {

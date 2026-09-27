@@ -1,10 +1,9 @@
 import { Suspense } from "react";
 import { notFound } from "next/navigation";
 
+import { readCartToken } from "@/lib/cart-token";
 import { resolveStorefrontStore } from "@/lib/current-store";
-import { getDbCart, formatMoney, listPublishedProducts } from "@shp0/db";
-import { cookies } from "next/headers";
-import { randomUUID } from "node:crypto";
+import { getDbCart, formatMoney, listPublishedProducts, MAX_LINE_QUANTITY } from "@shp0/db";
 import CartActions from "./cart-actions";
 
 export const instant = false;
@@ -13,14 +12,9 @@ async function CartView() {
   const storeId = await resolveStorefrontStore();
   if (!storeId) notFound();
 
-  // Get the anon cart token (same logic as the cart action).
-  const cookieStore = await cookies();
-  let token = cookieStore.get("shp0_cart_token")?.value;
-  if (!token) {
-    token = randomUUID();
-  }
-
-  const cart = await getDbCart(storeId, token);
+  // No cart token yet: an empty Cart (pages cannot set the cookie).
+  const token = await readCartToken();
+  const cart = token === null ? { storeId, lines: [] } : await getDbCart(storeId, token);
 
   // Fetch prices for the cart items.
   const products = await listPublishedProducts(storeId);
@@ -51,7 +45,11 @@ async function CartView() {
                 <p className="font-medium">Variant: {line.variantId.slice(0, 8)}…</p>
                 <p className="text-sm text-gray-500">Qty: {line.quantity}</p>
               </div>
-              <CartActions variantId={line.variantId} quantity={line.quantity} />
+              <CartActions
+                variantId={line.variantId}
+                quantity={line.quantity}
+                maxQuantity={MAX_LINE_QUANTITY}
+              />
             </div>
           ))}
 
