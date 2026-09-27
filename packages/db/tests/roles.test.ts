@@ -11,6 +11,7 @@ import {
   minimumRole,
   can,
   decideStoreAccess,
+  effectiveRole,
 } from "../src/roles";
 import type { Capability, Role } from "../src/roles";
 
@@ -125,6 +126,38 @@ describe("rank", () => {
 
   it("has a display label for every Role", () => {
     expect(ROLE_LABEL).toEqual({ owner: "Owner", admin: "Admin", staff: "Staff" });
+  });
+});
+
+describe("effectiveRole (every Membership row of one person in one Store)", () => {
+  it("is null with no row: no Membership", () => {
+    expect(effectiveRole([])).toBe(null);
+  });
+
+  it.each(["owner", "admin", "staff"] as const)("is the Role of a single %s row", (role) => {
+    expect(effectiveRole([role])).toBe(role);
+  });
+
+  it.each([
+    [["admin", "staff"], "staff"],
+    [["staff", "admin"], "staff"],
+    [["owner", "admin"], "admin"],
+    [["owner", "staff", "admin"], "staff"],
+    [["admin", "admin"], "admin"],
+  ] as const)("with several rows %j, grants only the lowest Role (%s)", (rows, expected) => {
+    expect(effectiveRole(rows)).toBe(expected);
+  });
+
+  it.each([
+    [["Owner"]],
+    [["garbage"]],
+    [[""]],
+    [["admin", "garbage"]],
+    [["garbage", "owner"]],
+    [["owner", "Owner"]],
+    [["staff", null]],
+  ])("fails closed on %j: one row that is not a Role means no Role", (rows) => {
+    expect(effectiveRole(rows)).toBe(null);
   });
 });
 

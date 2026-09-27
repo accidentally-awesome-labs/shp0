@@ -88,6 +88,24 @@ export function roleRank(role: unknown): number {
   return parsed === null ? 0 : RANK[parsed];
 }
 
+/**
+ * The Role granted by the role text of every Membership row one person
+ * holds in one Store, or null for none.
+ *
+ * With several rows, every row must hold a Role and the lowest one counts,
+ * so an extra row can only take authority away; one row that is not a Role
+ * means no Role at all (fail closed).
+ */
+export function effectiveRole(storedRoles: readonly unknown[]): Role | null {
+  let lowest: Role | null = null;
+  for (const raw of storedRoles) {
+    const role = parseRole(raw);
+    if (role === null) return null;
+    if (lowest === null || RANK[role] < RANK[lowest]) lowest = role;
+  }
+  return lowest;
+}
+
 /** Whether `role` ranks at or above `minimum`. Not a Role: never. */
 export function hasAtLeastRole(role: unknown, minimum: Role): boolean {
   const rank = roleRank(role);

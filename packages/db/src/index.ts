@@ -55,7 +55,7 @@ export type { Role, Capability, StoreAccessDecision } from "./roles";
 export type { Customer, NewCustomer } from "./schema";
 export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine, Collection, NewCollection } from "./schema";
 import type { Cart, CartLine } from "./cart";
-import { parseRole, roleRank } from "./roles";
+import { effectiveRole } from "./roles";
 import type { Role } from "./roles";
 
 /**
@@ -756,7 +756,8 @@ export async function checkSubdomainAvailable(
  *
  * memberships has no UNIQUE (user_id, store_id), so one person can have
  * several rows in one Store. Then every row must hold a valid Role, and the
- * lowest one is returned: extra rows can only take authority away.
+ * lowest one is returned: extra rows can only take authority away
+ * (effectiveRole in ./roles).
  */
 export async function getMembershipRole(
   userId: string,
@@ -768,13 +769,7 @@ export async function getMembershipRole(
     const rows = await tx.execute(
       sql`SELECT role FROM memberships WHERE user_id = ${userId} AND store_id = ${storeId}`,
     );
-    let lowest: Role | null = null;
-    for (const row of rows.rows as Array<{ role: unknown }>) {
-      const role = parseRole(row.role);
-      if (role === null) return null;
-      if (lowest === null || roleRank(role) < roleRank(lowest)) lowest = role;
-    }
-    return lowest;
+    return effectiveRole((rows.rows as Array<{ role: unknown }>).map((row) => row.role));
   });
 }
 
