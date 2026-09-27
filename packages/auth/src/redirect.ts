@@ -46,3 +46,12 @@ export function safeRedirectPath(raw: unknown, fallback: string = DEFAULT_REDIRE
 
   return `${url.pathname}${url.search}${url.hash}`;
 }
+
+/**
+ * The sign-in page, returning to `returnTo` afterwards: a same-origin path
+ * (with its query), or DEFAULT_REDIRECT_PATH when it is anything else. The
+ * sign-in page checks the value again with safeRedirectPath.
+ */
+export function signInPath(returnTo: unknown): string {
+  return `/sign-in?redirect=${encodeURIComponent(safeRedirectPath(returnTo))}`;
+}

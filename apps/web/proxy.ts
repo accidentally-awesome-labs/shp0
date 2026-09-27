@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from "next/server";
 
+import { signInPath } from "@shp0/auth/redirect";
 import { hasSessionCookie } from "@shp0/auth/session-cookie";
 
 /**
@@ -23,9 +24,10 @@ import { hasSessionCookie } from "@shp0/auth/session-cookie";
  */
 export function proxy(request: NextRequest) {
   if (!hasSessionCookie(request.headers)) {
-    const signInUrl = new URL("/sign-in", request.url);
-    signInUrl.searchParams.set("redirect", request.nextUrl.pathname);
-    return NextResponse.redirect(signInUrl);
+    // Return to the same page, query included (Next strips its internal _rsc
+    // parameter before the proxy sees the URL).
+    const returnTo = request.nextUrl.pathname + request.nextUrl.search;
+    return NextResponse.redirect(new URL(signInPath(returnTo), request.url));
   }
 
   return NextResponse.next();

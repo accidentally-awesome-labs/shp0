@@ -2,11 +2,11 @@ import { headers } from "next/headers";
 import { notFound, redirect } from "next/navigation";
 import { cache } from "react";
 
+import { signInPath } from "@shp0/auth/redirect";
 import {
-  can,
+  decideStoreAccess,
   getMembershipRole,
   isCapability,
-  minimumRole,
   resolveStoreByHost,
   type Capability,
   type Role,
@@ -54,18 +54,18 @@ const getRole = cache((userId: string, storeId: string) => getMembershipRole(use
  *
  * `storeId` is untrusted (any value can arrive through a server action), so
  * anything that is not a Store id the Merchant belongs to is "not_member".
+ * The decision itself is decideStoreAccess (packages/db/src/roles.ts, unit
+ * tested); this function only looks up its inputs.
  */
 export async function getStoreAccess(storeId: unknown, capability: Capability): Promise<StoreAccess> {
   if (!isCapability(capability)) throw new Error(NOT_AUTHORIZED_FOR_STORE);
   const userId = await getSessionUserId();
-  if (userId === null) return { status: "unauthenticated" };
-  if (typeof storeId !== "string") return { status: "not_member" };
-  const role = await getRole(userId, storeId);
-  if (role === null) return { status: "not_member" };
-  if (!can(role, capability)) {
-    return { status: "insufficient_role", storeId, userId, role, required: minimumRole(capability) };
-  }
-  return { status: "ok", storeId, userId, role };
+  const role = userId !== null && typeof storeId === "string" ? await getRole(userId, storeId) : null;
+  const decision = decideStoreAccess(userId !== null, role, capability);
+  if (decision.status === "unauthenticated" || decision.status === "not_member") return decision;
+  // A Role was found, so there is a session and a string Store id.
+  if (userId === null || typeof storeId !== "string") return { status: "not_member" };
+  return { ...decision, storeId, userId };
 }
 
 /**
@@ -95,8 +95,9 @@ export async function authorizeStore(storeId: string, capability: Capability): P
  *   const access = await authorizeStorePage(storeId, "catalog.view");
  *   if (access.status !== "ok") return <RequiresRole role={access.required} />;
  *
- * - Not signed in (the proxy only checks that a cookie is present): redirect
- *   to sign-in.
+ * - Not signed in (the proxy only checks that a cookie is present, so this
+ *   is a stale, revoked or forged one): redirect to sign-in, returning to
+ *   the Store's dashboard afterwards.
  * - No Membership, or no such Store: notFound(), exactly alike.
  * - A member whose Role is too low: returned, so the page can say which Role
  *   it requires (they already know the Store exists) without fetching the
@@ -118,7 +119,10 @@ export async function authorizeStorePage(
   const access = await getStoreAccess(storeId, capability);
   switch (access.status) {
     case "unauthenticated":
-      redirect("/sign-in?redirect=/dashboard");
+      // The gate does not know which page asked, so return to the Store's
+      // dashboard. storeId is untrusted: it is one encoded path segment, and
+      // signInPath and the sign-in page accept only a same-origin path.
+      redirect(signInPath(`/dashboard/${encodeURIComponent(storeId)}`));
     case "not_member":
       notFound();
     case "insufficient_role":

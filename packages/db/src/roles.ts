@@ -112,3 +112,35 @@ export function can(role: unknown, capability: Capability): boolean {
   if (!isCapability(capability)) return false;
   return hasAtLeastRole(role, CAPABILITY_MINIMUM_ROLE[capability]);
 }
+
+/** A Merchant's standing in one Store for one capability. */
+export type StoreAccessDecision =
+  | { status: "unauthenticated" }
+  /** No Membership with a valid Role, or no such Store: indistinguishable. */
+  | { status: "not_member" }
+  | { status: "insufficient_role"; role: Role; required: Role }
+  | { status: "ok"; role: Role };
+
+/**
+ * The dashboard gate's decision, without I/O. apps/web/lib/current-store.ts
+ * supplies whether the request has a valid session and the caller's
+ * Membership Role in the Store (null when there is none, the Store does not
+ * exist or the id is not a Store id), then acts on the result.
+ *
+ * Role text that is not exactly a Role counts as no Membership. An unknown
+ * capability is a programming error and throws, whoever asks.
+ */
+export function decideStoreAccess(
+  signedIn: boolean,
+  role: unknown,
+  capability: Capability,
+): StoreAccessDecision {
+  if (!isCapability(capability)) throw new Error(`Unknown capability: ${String(capability)}`);
+  if (!signedIn) return { status: "unauthenticated" };
+  const parsed = parseRole(role);
+  if (parsed === null) return { status: "not_member" };
+  if (!can(parsed, capability)) {
+    return { status: "insufficient_role", role: parsed, required: minimumRole(capability) };
+  }
+  return { status: "ok", role: parsed };
+}

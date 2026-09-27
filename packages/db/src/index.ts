@@ -49,8 +49,9 @@ export {
   isCapability,
   minimumRole,
   can,
+  decideStoreAccess,
 } from "./roles";
-export type { Role, Capability } from "./roles";
+export type { Role, Capability, StoreAccessDecision } from "./roles";
 export type { Customer, NewCustomer } from "./schema";
 export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine, Collection, NewCollection } from "./schema";
 import type { Cart, CartLine } from "./cart";
