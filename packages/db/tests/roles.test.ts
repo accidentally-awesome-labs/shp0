@@ -10,6 +10,7 @@ import {
   isCapability,
   minimumRole,
   can,
+  decideStoreAccess,
 } from "../src/roles";
 import type { Capability, Role } from "../src/roles";
 
@@ -205,6 +206,65 @@ describe("can", () => {
     "an unknown capability %j is allowed to nobody, not even the Owner",
     (capability) => {
       for (const role of ROLES) expect(can(role, capability as Capability)).toBe(false);
+    },
+  );
+});
+
+/**
+ * The dashboard gate's decision (apps/web/lib/current-store.ts does only the
+ * I/O around it: the session, the Membership Role lookup, then throw,
+ * notFound(), redirect or render). Actions throw one generic error for every
+ * status but "ok"; pages redirect "unauthenticated", show "not_member" the
+ * not-found page and name the required Role for "insufficient_role".
+ */
+describe("decideStoreAccess", () => {
+  it("is unauthenticated without a session, whatever the Role", () => {
+    for (const role of [...ROLES, null, "garbage"]) {
+      expect(decideStoreAccess(false, role, "catalog.view")).toEqual({ status: "unauthenticated" });
+    }
+  });
+
+  it.each([null, undefined, "Owner", "ADMIN", " staff", "garbage", "", 3, {}])(
+    "treats role %j as no Membership (a missing Store reads the same)",
+    (role) => {
+      for (const capability of CAPABILITIES) {
+        expect(decideStoreAccess(true, role, capability)).toEqual({ status: "not_member" });
+      }
+    },
+  );
+
+  describe.each(CAPABILITIES)("%s", (capability) => {
+    const minimum = EXPECTED_MINIMUM_ROLE[capability];
+    it.each(ROLES)(`role %s is ok at or above ${minimum}, else insufficient`, (role) => {
+      const decision = decideStoreAccess(true, role, capability);
+      if (roleRank(role) >= roleRank(minimum)) {
+        expect(decision).toEqual({ status: "ok", role });
+      } else {
+        expect(decision).toEqual({ status: "insufficient_role", role, required: minimum });
+      }
+    });
+  });
+
+  it("matches the brief's examples", () => {
+    expect(decideStoreAccess(true, "staff", "catalog.manage")).toEqual({
+      status: "insufficient_role",
+      role: "staff",
+      required: "admin",
+    });
+    expect(decideStoreAccess(true, "admin", "billing.view")).toEqual({
+      status: "insufficient_role",
+      role: "admin",
+      required: "owner",
+    });
+    expect(decideStoreAccess(true, "owner", "billing.manage")).toEqual({ status: "ok", role: "owner" });
+    expect(decideStoreAccess(true, "staff", "customers.view")).toEqual({ status: "ok", role: "staff" });
+  });
+
+  it.each(["catalog", "", "__proto__", "toString", null])(
+    "refuses an unknown capability %j by throwing, even for the Owner",
+    (capability) => {
+      expect(() => decideStoreAccess(true, "owner", capability as Capability)).toThrow(/^Unknown capability/);
+      expect(() => decideStoreAccess(false, null, capability as Capability)).toThrow(/^Unknown capability/);
     },
   );
 });
