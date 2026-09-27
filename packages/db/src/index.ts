@@ -180,6 +180,16 @@ export async function tenantClient<T>(
  * Reserved for platform operations — operator admin, analytics, Store creation.
  * Never used to serve a single Store.
  *
+ * Like tenantClient, `fn` runs in one transaction: every write it makes
+ * commits together when it returns, or none does when it throws (the
+ * error is rethrown). No other connection sees those writes before `fn`
+ * returns, and a database error aborts the transaction, so `fn` must not
+ * catch one and carry on (every later statement would fail with 25P02);
+ * use a SAVEPOINT for a statement that may fail. Checks the schema defers
+ * to COMMIT (a new Store's Owner, stores_exactly_one_owner_at_creation; an
+ * Owner row's changes, memberships_exactly_one_owner) run after `fn`
+ * returns, and their refusal rejects this call.
+ *
  * Like tenantClient, `fn` must not open another client.
  */
 export async function platformClient<T>(
@@ -188,8 +198,14 @@ export async function platformClient<T>(
   refuseNestedClient("platformClient");
   const client = await getPlatformPool().connect();
   try {
+    await client.query("BEGIN");
     const tx = drizzle(client, { schema });
-    return await openClient.run("platformClient", () => fn(tx));
+    const result = await openClient.run("platformClient", () => fn(tx));
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
   } finally {
     client.release();
   }
@@ -457,8 +473,8 @@ export async function applySchema(
       );
     `);
     await addMembershipConstraints(client);
-    // Single-Owner invariant, in three parts. Ownership transfer (not
-    // implemented yet) passes all three, and must keep one Membership per
+    // Single-Owner invariant, in four parts. Ownership transfer (not
+    // implemented yet) passes all four, and must keep one Membership per
     // person per Store: to a person with no Membership in the Store, UPDATE
     // the owner row's user_id; to an existing member, in one transaction,
     // first demote the owner row to 'admin' or 'staff', then promote the
@@ -573,6 +589,94 @@ export async function applySchema(
         DEFERRABLE INITIALLY DEFERRED
         FOR EACH ROW WHEN (OLD.role = 'owner')
         EXECUTE FUNCTION memberships_check_exactly_one_owner();
+    `);
+    // Part 4: a new Store has exactly one Owner, checked at COMMIT. Every
+    // Store a transaction inserts must have exactly one owner row when the
+    // transaction commits, unless that Store row no longer exists (deleted
+    // in the same transaction). Deferred, because the owner row can only
+    // be inserted after the Store row it references: provisionStore
+    // inserts both in the one transaction platformClient opens. A
+    // transaction that commits a new Store without its Owner is refused
+    // (SQLSTATE 23000, constraint stores_exactly_one_owner_at_creation)
+    // and rolls back whole. After creation, parts 1 to 3 keep the Owner.
+    //
+    // A Store with no Membership can still be given another id (memberships'
+    // foreign key refuses that once the Store has any Membership; nothing
+    // in the application changes stores.id). The Store under its new id is
+    // a new Store, so an UPDATE that changes id is checked like an INSERT,
+    // under the new id: a transaction cannot insert a Store and move it to
+    // another id to skip the check. An UPDATE that names id but keeps it is
+    // not checked.
+    //
+    // It checks only an INSERT and a change of id, so existing Stores,
+    // ownerless ones included, are not checked unless their id changes, and
+    // an upgrade cannot fail on them. This read-only query lists the Stores
+    // that do not have exactly one Owner:
+    //   SELECT s.id, s.subdomain, count(m.id) AS owners FROM stores s
+    //   LEFT JOIN memberships m ON m.store_id = s.id AND m.role = 'owner'
+    //   GROUP BY s.id HAVING count(m.id) <> 1;
+    //
+    // Rollout: every Store creation must insert the Store and its Owner's
+    // Membership in one transaction. Code that commits them separately (a
+    // provisionStore on a platformClient without BEGIN, as before this
+    // check existed, or an ad-hoc script in autocommit) has every Store
+    // creation refused once this trigger exists. So the transactional
+    // platformClient ships before this trigger is installed, or with it;
+    // rolling the code back to a non-transactional platformClient needs
+    // DROP TRIGGER stores_exactly_one_owner_at_creation ON stores first.
+    //
+    // Hardened like part 3: memberships is named through the trigger's own
+    // schema (it sits beside stores), search_path is pinned, and
+    // row_security = off makes a Store that RLS would hide an error rather
+    // than a skipped check. A transaction that inserts a Store cannot then
+    // ALTER or TRUNCATE stores: Postgres refuses both while the Store's
+    // check is pending.
+    await client.query(`
+      CREATE OR REPLACE FUNCTION stores_check_exactly_one_owner_at_creation()
+      RETURNS trigger LANGUAGE plpgsql
+      SET search_path = pg_catalog, pg_temp
+      SET row_security = off
+      AS $func$
+      DECLARE
+        store_exists boolean;
+        owners integer;
+      BEGIN
+        IF TG_OP = 'UPDATE' AND NEW.id IS NOT DISTINCT FROM OLD.id THEN
+          RETURN NULL;
+        END IF;
+        EXECUTE format('SELECT EXISTS (SELECT 1 FROM %I.%I WHERE id = $1)', TG_TABLE_SCHEMA, TG_TABLE_NAME)
+          INTO store_exists USING NEW.id;
+        IF NOT store_exists THEN
+          RETURN NULL;
+        END IF;
+        EXECUTE format('SELECT count(*) FROM %I.memberships WHERE store_id = $1 AND role = %L',
+                       TG_TABLE_SCHEMA, 'owner')
+          INTO owners USING NEW.id;
+        IF owners <> 1 THEN
+          RAISE EXCEPTION 'Store % must have exactly one Owner when it is created; this transaction creates it with %.',
+            NEW.id, owners
+            USING ERRCODE = 'integrity_constraint_violation',
+                  CONSTRAINT = TG_NAME,
+                  SCHEMA = TG_TABLE_SCHEMA,
+                  TABLE = TG_TABLE_NAME,
+                  DETAIL = CASE TG_OP
+                    WHEN 'UPDATE' THEN format('This transaction changed its id from %s.', OLD.id)
+                    ELSE 'This transaction inserted it.'
+                  END,
+                  HINT = 'Insert the Store and its Owner''s Membership in one transaction, '
+                    || 'as provisionStore does.';
+        END IF;
+        RETURN NULL;
+      END;
+      $func$;
+    `);
+    await client.query(`
+      DROP TRIGGER IF EXISTS stores_exactly_one_owner_at_creation ON stores;
+      CREATE CONSTRAINT TRIGGER stores_exactly_one_owner_at_creation
+        AFTER INSERT OR UPDATE OF id ON stores
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW
+        EXECUTE FUNCTION stores_check_exactly_one_owner_at_creation();
     `);
 
     // ── products + variants (TENANT tables — store_id GUC, RLS-protected) ──
@@ -951,8 +1055,12 @@ export async function closePools(): Promise<void> {
  *
  * Store creation is a platform operation: the platform mints the Store's id,
  * sets store_id = id, and creates the creator's Membership with role = 'owner'.
- * Both inserts run in a single transaction via platformClient — if either
- * fails, neither happens.
+ * Both inserts run in the one transaction platformClient opens: if either
+ * fails (an unknown ownerId is 23503 memberships_user_id_fkey, a taken
+ * subdomain 23505 stores_subdomain_key), neither is kept and the error is
+ * rethrown. Until it commits, the new Store row holds its subdomain: a
+ * concurrent call for the same subdomain waits for this one, then fails
+ * with 23505 if it committed, or goes ahead if it rolled back.
  */
 export async function provisionStore(opts: {
   name: string;

@@ -61,22 +61,36 @@ describe("getMembershipRole on a database without the Membership constraints", (
       ALTER TABLE memberships
         DROP CONSTRAINT memberships_user_store_key,
         DROP CONSTRAINT memberships_role_check`);
-    await scoped.query(
-      `INSERT INTO stores (id, store_id, name, subdomain)
-       VALUES ($1, $1, 'Unconstrained', 'unconstrained')`,
-      [STORE],
-    );
-    for (const [userId, roles] of Object.entries(MEMBERSHIPS)) {
-      await scoped.query(
-        `INSERT INTO "user" (id, name, email) VALUES ($1, $1, $1 || '@unconstrained.test')`,
-        [userId],
+    // The Store and every Membership in one transaction: the database
+    // refuses to commit a new Store without its Owner
+    // (stores_exactly_one_owner_at_creation), and STORE's Owner is the
+    // "owner" row of ownerAndMisCasedOwner.
+    const client = await scoped.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO stores (id, store_id, name, subdomain)
+         VALUES ($1, $1, 'Unconstrained', 'unconstrained')`,
+        [STORE],
       );
-      for (const role of roles) {
-        await scoped.query(
-          "INSERT INTO memberships (user_id, store_id, role) VALUES ($1, $2, $3)",
-          [userId, STORE, role],
+      for (const [userId, roles] of Object.entries(MEMBERSHIPS)) {
+        await client.query(
+          `INSERT INTO "user" (id, name, email) VALUES ($1, $1, $1 || '@unconstrained.test')`,
+          [userId],
         );
+        for (const role of roles) {
+          await client.query(
+            "INSERT INTO memberships (user_id, store_id, role) VALUES ($1, $2, $3)",
+            [userId, STORE, role],
+          );
+        }
       }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
     }
   });
 

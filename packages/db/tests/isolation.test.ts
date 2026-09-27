@@ -4,7 +4,7 @@ import { Pool } from "pg";
 import { sql } from "drizzle-orm";
 
 import { tenantClient, platformClient, applySchema, closePools } from "../src/index";
-import { stores } from "../src/schema";
+import { memberships, stores, user } from "../src/schema";
 
 /**
  * ADR-0001 — Postgres RLS for multi-tenant isolation.
@@ -21,13 +21,25 @@ describe("RLS multi-tenant isolation (ADR-0001)", () => {
     await applySchema();
     // Seed two Stores via the platform client, which bypasses RLS (cloud_admin).
     // Store creation is a platform op: the platform mints the Store's id and sets
-    // store_id = id (the tenant's own row).
+    // store_id = id (the tenant's own row). Each Store gets its Owner in the
+    // same transaction, as provisionStore does: the database refuses to
+    // commit a new Store without one (stores_exactly_one_owner_at_creation).
     storeA = await platformClient(async (tx) => {
       await tx.execute(sql`TRUNCATE stores RESTART IDENTITY CASCADE`);
       const aId = randomUUID();
       await tx.insert(stores).values({ id: aId, storeId: aId, name: "Acme", subdomain: "acme-iso" });
       const bId = randomUUID();
       await tx.insert(stores).values({ id: bId, storeId: bId, name: "Beta", subdomain: "beta-iso" });
+      const aOwner = `owner-${aId}`;
+      const bOwner = `owner-${bId}`;
+      await tx.insert(user).values([
+        { id: aOwner, name: "Acme Owner", email: `${aOwner}@isolation.test` },
+        { id: bOwner, name: "Beta Owner", email: `${bOwner}@isolation.test` },
+      ]);
+      await tx.insert(memberships).values([
+        { userId: aOwner, storeId: aId, role: "owner" },
+        { userId: bOwner, storeId: bId, role: "owner" },
+      ]);
       storeB = bId;
       return aId;
     });
