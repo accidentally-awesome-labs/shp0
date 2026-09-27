@@ -125,7 +125,7 @@ export const PUBLIC_ACTIONS = new Map([
   ],
   [
     "apps/web/app/actions/cart.ts#updateCartItem",
-    "storefront: the Store is the request host's, the Cart the shopper's own cookie; only a published Variant of that Store, quantity 0-99",
+    "storefront: the Store is the request host's, the Cart the shopper's own cookie; quantity 1-99 only for a published Variant of that Store, 0 removes the line",
   ],
   [
     "apps/web/app/actions/cart.ts#removeCartItem",
