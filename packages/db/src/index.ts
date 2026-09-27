@@ -1,15 +1,41 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
-import { eq, sql, and } from "drizzle-orm";
+import { eq, sql, and, inArray } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import * as schema from "./schema";
 
 export * as schema from "./schema";
 export { parseMoney, formatMoney, applyPercent } from "./money";
-export { addLine, updateLine, removeLine, computeSubtotal, mergeCarts } from "./cart";
-export type { Cart, CartLine } from "./cart";
+export {
+  addLine,
+  updateLine,
+  removeLine,
+  computeSubtotal,
+  mergeCarts,
+  MAX_LINE_QUANTITY,
+  isValidLineQuantity,
+  parseCartChange,
+  applyCartChange,
+  priceCartForCheckout,
+  cartChangeRejectionMessage,
+  checkoutRejectionMessage,
+  CheckoutError,
+} from "./cart";
+export type {
+  Cart,
+  CartLine,
+  CartChange,
+  CartChangeRejection,
+  CartChangeResult,
+  ParsedCartChange,
+  CheckoutVariant,
+  CheckoutLineProblem,
+  CheckoutRejection,
+  PricedCart,
+} from "./cart";
+export { isUuid } from "./ids";
 export { transitionPayment, transitionFulfillment, isOrderOpen } from "./order";
 export type { PaymentStatus, FulfillmentStatus } from "./order";
 export { computeApplicationFee, buildCheckoutSessionParams } from "./payments";
@@ -55,7 +81,9 @@ export {
 export type { Role, Capability, StoreAccessDecision } from "./roles";
 export type { Customer, NewCustomer } from "./schema";
 export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine, Collection, NewCollection } from "./schema";
-import type { Cart, CartLine } from "./cart";
+import type { Cart, CartChange, CartChangeResult, CartLine, CheckoutVariant } from "./cart";
+import { applyCartChange, CheckoutError, parseCartChange, priceCartForCheckout } from "./cart";
+import { UUID_PATTERN as UUID } from "./ids";
 import { parseRole, roleRank } from "./roles";
 import type { Role } from "./roles";
 
@@ -72,9 +100,6 @@ const TENANT_DATABASE_URL =
 const PLATFORM_DATABASE_URL =
   process.env.PLATFORM_DATABASE_URL ??
   "postgresql:///shp0_test?user=cloud_admin";
-
-/** A Store id, domain id etc.: anything else is rejected before it reaches SQL. */
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 let tenantPool: Pool | null = null;
 let platformPool: Pool | null = null;
@@ -1135,9 +1160,10 @@ async function lockOrCreateCart(tx: Tx, storeId: string, customerId: string): Pr
   return raced;
 }
 
+/** A cart's lines in the order they were first added (created_at, see the writers below). */
 async function readCartLines(tx: Tx, cartId: string): Promise<CartLine[]> {
   const rows = await tx.execute(
-    sql`SELECT variant_id, quantity FROM cart_items WHERE cart_id = ${cartId}`,
+    sql`SELECT variant_id, quantity FROM cart_items WHERE cart_id = ${cartId} ORDER BY created_at, id`,
   );
   return (rows.rows as Array<{ variant_id: string; quantity: number }>).map((r) => ({
     variantId: r.variant_id,
@@ -1145,14 +1171,77 @@ async function readCartLines(tx: Tx, cartId: string): Promise<CartLine[]> {
   }));
 }
 
-/** Replace a cart's items with `lines`. */
+/**
+ * Replace a cart's items with `lines`, one row per line in order: each row
+ * gets its own clock_timestamp() as created_at (now() is the same for a whole
+ * transaction), so readCartLines returns them in this order.
+ */
 async function writeCartLines(tx: Tx, storeId: string, cartId: string, lines: CartLine[]): Promise<void> {
   await tx.delete(schema.cartItems).where(eq(schema.cartItems.cartId, cartId));
-  if (lines.length > 0) {
-    await tx.insert(schema.cartItems).values(
-      lines.map((line) => ({ storeId, cartId, variantId: line.variantId, quantity: line.quantity })),
+  for (const line of lines) {
+    await tx.execute(
+      sql`INSERT INTO cart_items (store_id, cart_id, variant_id, quantity, created_at)
+          VALUES (${storeId}, ${cartId}, ${line.variantId}, ${line.quantity}, clock_timestamp())`,
     );
   }
+}
+
+/**
+ * Set one Variant's line in a cart to `quantity`, or remove it (null). The
+ * line keeps its place (the created_at of its earliest row); a new line goes
+ * last. Rows for the Variant are collapsed into one, so a duplicate left by
+ * older code does not survive a change to it.
+ */
+async function writeCartLine(
+  tx: Tx,
+  storeId: string,
+  cartId: string,
+  variantId: string,
+  quantity: number | null,
+): Promise<void> {
+  if (quantity === null) {
+    await tx.execute(sql`DELETE FROM cart_items WHERE cart_id = ${cartId} AND variant_id = ${variantId}`);
+    return;
+  }
+  await tx.execute(
+    sql`WITH gone AS (
+          DELETE FROM cart_items WHERE cart_id = ${cartId} AND variant_id = ${variantId} RETURNING created_at
+        )
+        INSERT INTO cart_items (store_id, cart_id, variant_id, quantity, created_at)
+        SELECT ${storeId}, ${cartId}, ${variantId}, ${quantity},
+               coalesce((SELECT min(created_at) FROM gone), clock_timestamp())`,
+  );
+}
+
+/**
+ * Whether `variantId` is a Variant of a PUBLISHED Product in the
+ * transaction's Store. One query; RLS scopes both tables to the Store, so
+ * another Store's Variant is not found, exactly like an unknown id.
+ */
+async function isAvailableVariant(tx: Tx, variantId: string): Promise<boolean> {
+  const rows = await tx.execute(
+    sql`SELECT 1 FROM variants v JOIN products p ON p.id = v.product_id
+        WHERE v.id = ${variantId} AND p.status = 'published' LIMIT 1`,
+  );
+  return rows.rows.length > 0;
+}
+
+/** Price and published state of the given Variants the transaction's Store can see (RLS). */
+async function readCheckoutVariants(tx: Tx, variantIds: string[]): Promise<Map<string, CheckoutVariant>> {
+  const ids = [...new Set(variantIds)];
+  if (ids.length === 0) return new Map();
+  const rows = await tx
+    .select({
+      id: schema.variants.id,
+      priceCents: schema.variants.priceCents,
+      status: schema.products.status,
+    })
+    .from(schema.variants)
+    .innerJoin(schema.products, eq(schema.products.id, schema.variants.productId))
+    .where(inArray(schema.variants.id, ids));
+  return new Map(
+    rows.map((r) => [r.id, { priceCents: r.priceCents, published: r.status === "published" }]),
+  );
 }
 
 /**
@@ -1201,6 +1290,46 @@ export async function saveDbCartLines(
 }
 
 /**
+ * Apply one shopper change to a Customer's Cart, validated, in ONE
+ * transaction on one connection. This is how the storefront changes a Cart.
+ *
+ * - The change is re-parsed (parseCartChange: UUID shape, quantity rule), so
+ *   bad input never reaches SQL.
+ * - add, and set to a quantity above 0, need the Variant to be one of a
+ *   PUBLISHED Product in this Store (one query under RLS); otherwise
+ *   "unavailable", whether the id is unknown, a draft or another Store's.
+ * - The Cart row is locked, then the pure line math applies the change
+ *   (applyCartChange: an add may not take a line above MAX_LINE_QUANTITY), so
+ *   concurrent changes to one Cart are serialized and none is lost.
+ * - A refused change writes nothing. remove and set never create a Cart.
+ */
+export async function changeDbCart(
+  storeId: string,
+  customerId: string,
+  change: CartChange,
+): Promise<CartChangeResult> {
+  const parsed = parseCartChange(change.kind, change.variantId, "quantity" in change ? change.quantity : undefined);
+  if (!parsed.ok) return parsed;
+  const valid = parsed.change;
+  const needsAvailableVariant = valid.kind === "add" || (valid.kind === "set" && valid.quantity > 0);
+
+  return tenantClient(storeId, async (tx): Promise<CartChangeResult> => {
+    if (needsAvailableVariant && !(await isAvailableVariant(tx, valid.variantId))) {
+      return { ok: false, reason: "unavailable" };
+    }
+    const cartId =
+      valid.kind === "add" ? await lockOrCreateCart(tx, storeId, customerId) : await lockCart(tx, customerId);
+    if (cartId === null) return { ok: true, cart: { storeId, lines: [] } };
+
+    const result = applyCartChange({ storeId, lines: await readCartLines(tx, cartId) }, valid);
+    if (!result.ok) return result;
+    const line = result.cart.lines.find((l) => l.variantId === valid.variantId);
+    await writeCartLine(tx, storeId, cartId, valid.variantId, line?.quantity ?? null);
+    return result;
+  });
+}
+
+/**
  * Delete a Customer's cart (and all its items, via cascade).
  */
 export async function deleteDbCart(
@@ -1224,9 +1353,14 @@ export async function deleteDbCart(
 /**
  * Convert a Customer's Cart into an Order.
  *
- * 1. Loads the cart + live variant prices.
- * 2. Creates an Order in payment=pending, fulfillment=unfulfilled.
- * 3. Creates Order Lines with snapshotted unit prices (frozen at checkout).
+ * 1. Locks the Cart row: a second checkout of the same Cart waits here, then
+ *    finds it consumed ("empty_cart"), so one Cart makes at most one Order.
+ * 2. Re-validates every line against the live catalog (priceCartForCheckout):
+ *    a Variant of a PUBLISHED Product in this Store (RLS), at a whole quantity
+ *    from 1 to MAX_LINE_QUANTITY. Any invalid line refuses the WHOLE checkout
+ *    with a CheckoutError and writes nothing; no line is dropped silently.
+ * 3. Creates an Order in payment=pending, fulfillment=unfulfilled, with Order
+ *    Lines at snapshotted unit prices (frozen at checkout).
  * 4. Consumes the Cart (deletes it).
  *
  * Inventory is NOT decremented here — that happens in the payment transaction.
@@ -1236,48 +1370,18 @@ export async function checkout(
   customerId: string,
 ): Promise<{ orderId: string; totalCents: number }> {
   return tenantClient(storeId, async (tx) => {
-    // 1. Load cart + prices.
-    const cartRows = await tx.execute(
-      sql`SELECT id FROM carts WHERE customer_id = ${customerId} LIMIT 1`,
+    const cartId = await lockCart(tx, customerId);
+    if (cartId === null) throw new CheckoutError("empty_cart");
+    const lines = await readCartLines(tx, cartId);
+
+    const priced = priceCartForCheckout(
+      lines,
+      await readCheckoutVariants(tx, lines.map((l) => l.variantId)),
     );
-    if (cartRows.rows.length === 0) {
-      throw new Error("Cannot checkout: cart is empty or does not exist");
-    }
-    const cartId = cartRows.rows[0]!.id as string;
-
-    const itemRows = await tx.execute(
-      sql`SELECT variant_id, quantity FROM cart_items WHERE cart_id = ${cartId}`,
-    );
-    const lines = itemRows.rows as Array<{ variant_id: string; quantity: number }>;
-    if (lines.length === 0) {
-      throw new Error("Cannot checkout: cart has no items");
+    if (!priced.ok) {
+      throw new CheckoutError(priced.reason, priced.reason === "invalid_lines" ? priced.problems : []);
     }
 
-    // Snapshot live prices for each variant.
-    let totalCents = 0;
-    const pricedLines: Array<{
-      variantId: string;
-      quantity: number;
-      unitPriceCents: number;
-    }> = [];
-
-    for (const line of lines) {
-      const priceRows = await tx.execute(
-        sql`SELECT price_cents FROM variants WHERE id = ${line.variant_id} LIMIT 1`,
-      );
-      if (priceRows.rows.length === 0) {
-        throw new Error(`Variant ${line.variant_id} not found`);
-      }
-      const unitPriceCents = priceRows.rows[0]!.price_cents as number;
-      totalCents += unitPriceCents * line.quantity;
-      pricedLines.push({
-        variantId: line.variant_id,
-        quantity: line.quantity,
-        unitPriceCents,
-      });
-    }
-
-    // 2. Create the Order (pending/unfulfilled).
     const [order] = await tx
       .insert(schema.orders)
       .values({
@@ -1285,12 +1389,11 @@ export async function checkout(
         customerId,
         paymentStatus: "pending",
         fulfillmentStatus: "unfulfilled",
-        totalCents,
+        totalCents: priced.totalCents,
       })
       .returning();
 
-    // 3. Create Order Lines with snapshotted prices.
-    for (const line of pricedLines) {
+    for (const line of priced.lines) {
       await tx.insert(schema.orderLines).values({
         storeId,
         orderId: order!.id,
@@ -1300,10 +1403,9 @@ export async function checkout(
       });
     }
 
-    // 4. Consume the cart (delete it — cascade removes cart_items).
     await tx.delete(schema.carts).where(eq(schema.carts.id, cartId));
 
-    return { orderId: order!.id, totalCents };
+    return { orderId: order!.id, totalCents: priced.totalCents };
   });
 }
 
