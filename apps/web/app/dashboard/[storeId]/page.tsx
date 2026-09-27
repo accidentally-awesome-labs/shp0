@@ -11,7 +11,7 @@ const SECTIONS: Array<{ path: string; title: string; description: string; capabi
   {
     path: "products",
     title: "Products",
-    description: "Manage your catalog — products, variants, pricing.",
+    description: "Your catalog — products, variants, pricing.",
     capability: "catalog.view",
   },
   {

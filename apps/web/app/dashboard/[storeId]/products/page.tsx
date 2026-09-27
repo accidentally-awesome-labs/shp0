@@ -42,7 +42,9 @@ export default async function ProductsPage({
 
         {products.length === 0 ? (
           <div className="mt-8 rounded-lg border border-dashed p-12 text-center text-gray-500">
-            No products yet. Click &quot;Add product&quot; to create your first.
+            {can(access.role, "catalog.manage")
+              ? "No products yet. Click \"Add product\" to create your first."
+              : "No products yet."}
           </div>
         ) : (
           <div className="mt-8 overflow-hidden rounded-lg border">

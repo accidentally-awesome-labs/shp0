@@ -33,7 +33,11 @@ export default async function DiscountsPage({
       </div>
 
       {discounts.length === 0 ? (
-        <p className="text-gray-500">No discounts yet. Create one to run promotions.</p>
+        <p className="text-gray-500">
+          {can(access.role, "discounts.manage")
+            ? "No discounts yet. Create one to run promotions."
+            : "No discounts yet."}
+        </p>
       ) : (
         <ul className="divide-y rounded-lg border">
           {discounts.map((d) => (

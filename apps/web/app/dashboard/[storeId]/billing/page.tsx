@@ -1,5 +1,6 @@
 export const instant = false;
 
+import { can } from "@shp0/db/roles";
 import { changeTierAction, getDashboardBilling } from "@/app/actions/billing";
 import { authorizeStorePage } from "@/lib/current-store";
 import { RequiresRole } from "@/app/dashboard/requires-role";
@@ -42,45 +43,51 @@ export default async function BillingPage({
         </dl>
       </div>
 
-      <h2 className="mb-4 font-medium">Change Plan</h2>
-      <div className="grid grid-cols-3 gap-4">
-        {(["free", "pro", "scale"] as const).map((id) => {
-          const t = tiers[id];
-          const isCurrent = tier.id === id;
-          return (
-            <div
-              key={id}
-              className={`rounded-lg border p-4 ${isCurrent ? "border-blue-600 ring-1 ring-blue-600" : ""}`}
-            >
-              <h3 className="font-bold capitalize">{t.name}</h3>
-              <p className="text-2xl font-bold">
-                ${(t.priceCents / 100).toFixed(0)}
-                <span className="text-sm font-normal text-gray-500">/mo</span>
-              </p>
-              <p className="mt-2 text-sm text-gray-600">{(t.commissionBps / 100)}% commission</p>
-              <ul className="mt-2 space-y-1 text-xs text-gray-500">
-                <li>{t.limits.maxProducts} products</li>
-                <li>{t.limits.maxOrdersPerMonth} orders/mo</li>
-                <li>{t.limits.maxStaffSeats} staff seats</li>
-              </ul>
-              {!isCurrent && (
-                <form action={changeTierAction.bind(null, storeId)} className="mt-4">
-                  <input type="hidden" name="tierId" value={id} />
-                  <button
-                    type="submit"
-                    className="w-full rounded bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700"
-                  >
-                    Switch to {t.name}
-                  </button>
-                </form>
-              )}
-              {isCurrent && (
-                <p className="mt-4 text-center text-xs font-medium text-blue-600">Current plan</p>
-              )}
-            </div>
-          );
-        })}
-      </div>
+      {/* Changing the Tier is its own capability (billing.manage), so this
+          stays right whoever may view billing. */}
+      {can(access.role, "billing.manage") && (
+        <>
+          <h2 className="mb-4 font-medium">Change Plan</h2>
+          <div className="grid grid-cols-3 gap-4">
+            {(["free", "pro", "scale"] as const).map((id) => {
+              const t = tiers[id];
+              const isCurrent = tier.id === id;
+              return (
+                <div
+                  key={id}
+                  className={`rounded-lg border p-4 ${isCurrent ? "border-blue-600 ring-1 ring-blue-600" : ""}`}
+                >
+                  <h3 className="font-bold capitalize">{t.name}</h3>
+                  <p className="text-2xl font-bold">
+                    ${(t.priceCents / 100).toFixed(0)}
+                    <span className="text-sm font-normal text-gray-500">/mo</span>
+                  </p>
+                  <p className="mt-2 text-sm text-gray-600">{(t.commissionBps / 100)}% commission</p>
+                  <ul className="mt-2 space-y-1 text-xs text-gray-500">
+                    <li>{t.limits.maxProducts} products</li>
+                    <li>{t.limits.maxOrdersPerMonth} orders/mo</li>
+                    <li>{t.limits.maxStaffSeats} staff seats</li>
+                  </ul>
+                  {!isCurrent && (
+                    <form action={changeTierAction.bind(null, storeId)} className="mt-4">
+                      <input type="hidden" name="tierId" value={id} />
+                      <button
+                        type="submit"
+                        className="w-full rounded bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700"
+                      >
+                        Switch to {t.name}
+                      </button>
+                    </form>
+                  )}
+                  {isCurrent && (
+                    <p className="mt-4 text-center text-xs font-medium text-blue-600">Current plan</p>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
     </div>
   );
 }

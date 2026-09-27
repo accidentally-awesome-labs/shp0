@@ -32,7 +32,11 @@ export default async function CollectionsPage({
       </div>
 
       {collections.length === 0 ? (
-        <p className="text-gray-500">No collections yet. Create one to group your products.</p>
+        <p className="text-gray-500">
+          {can(access.role, "catalog.manage")
+            ? "No collections yet. Create one to group your products."
+            : "No collections yet."}
+        </p>
       ) : (
         <ul className="divide-y rounded-lg border">
           {collections.map((col) => (
