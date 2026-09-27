@@ -278,5 +278,57 @@ describe("Cart and checkout validation", () => {
       expect((rejected.reason as CheckoutError).reason).toBe("empty_cart");
       expect(await orderCount(storeA, token)).toBe(1);
     });
+
+    // An add that finds no Cart creates one; if another add created it first
+    // and a checkout consumed it meanwhile, the add must create a fresh Cart,
+    // not fail. Every accepted unit then ends up in exactly one place.
+    it("adds racing checkouts of one Cart all succeed, and every added unit is ordered or still in the Cart", async () => {
+      const ROUNDS = 3;
+      const PAIRS = 40;
+      for (let round = 0; round < ROUNDS; round++) {
+        const token = randomUUID();
+        await changeDbCart(storeA, token, { kind: "add", variantId: published, quantity: 1 });
+        const adds: Array<Promise<string>> = [];
+        const checkouts: Array<Promise<string>> = [];
+        for (let i = 0; i < PAIRS; i++) {
+          checkouts.push(
+            checkout(storeA, token).then(
+              () => "order",
+              (e: unknown) => (e instanceof CheckoutError ? `refused:${e.reason}` : `threw:${String(e)}`),
+            ),
+          );
+          adds.push(
+            changeDbCart(storeA, token, { kind: "add", variantId: published, quantity: 1 }).then(
+              (r) => (r.ok ? "ok" : `refused:${r.reason}`),
+              (e: unknown) => `threw:${String(e)}`,
+            ),
+          );
+        }
+        const addOutcomes = await Promise.all(adds);
+        const checkoutOutcomes = await Promise.all(checkouts);
+
+        expect(addOutcomes.filter((o) => o !== "ok")).toEqual([]);
+        expect(checkoutOutcomes.filter((o) => o !== "order" && o !== "refused:empty_cart")).toEqual([]);
+
+        const ordered = await db.execute(
+          sql`SELECT coalesce(sum(ol.quantity), 0)::int AS units,
+                     count(DISTINCT o.id)::int AS orders,
+                     count(DISTINCT o.id) FILTER (WHERE o.total_cents <> (
+                       SELECT sum(x.quantity * x.unit_price_cents) FROM order_lines x WHERE x.order_id = o.id
+                     ))::int AS inconsistent
+              FROM orders o JOIN order_lines ol ON ol.order_id = o.id
+              WHERE o.store_id = ${storeA} AND o.customer_id = ${token}`,
+        );
+        const { units, orders, inconsistent } = ordered.rows[0] as {
+          units: number;
+          orders: number;
+          inconsistent: number;
+        };
+        const left = (await getDbCart(storeA, token)).lines.reduce((sum, l) => sum + l.quantity, 0);
+        expect(orders).toBe(checkoutOutcomes.filter((o) => o === "order").length);
+        expect(inconsistent).toBe(0);
+        expect(units + left).toBe(1 + PAIRS);
+      }
+    }, 60000);
   });
 });
