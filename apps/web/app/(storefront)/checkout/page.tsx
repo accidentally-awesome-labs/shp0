@@ -30,7 +30,12 @@ async function CheckoutView() {
       ) : (
         <div className="mt-6 space-y-6">
           <div className="rounded-lg border p-6">
-            <h2 className="font-semibold">Order Summary</h2>
+            <div className="flex items-baseline justify-between">
+              <h2 className="font-semibold">Order Summary</h2>
+              <a href="/cart" className="text-sm underline">
+                Edit cart
+              </a>
+            </div>
             <div className="mt-4 space-y-2">
               {cart.lines.map((line) => (
                 <div

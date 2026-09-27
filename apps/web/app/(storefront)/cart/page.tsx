@@ -3,7 +3,7 @@ import { notFound } from "next/navigation";
 
 import { readCartToken } from "@/lib/cart-token";
 import { resolveStorefrontStore } from "@/lib/current-store";
-import { getDbCart, formatMoney, listPublishedProducts } from "@shp0/db";
+import { getDbCart, formatMoney, listPublishedProducts, MAX_LINE_QUANTITY } from "@shp0/db";
 import CartActions from "./cart-actions";
 
 export const instant = false;
@@ -45,7 +45,11 @@ async function CartView() {
                 <p className="font-medium">Variant: {line.variantId.slice(0, 8)}…</p>
                 <p className="text-sm text-gray-500">Qty: {line.quantity}</p>
               </div>
-              <CartActions variantId={line.variantId} quantity={line.quantity} />
+              <CartActions
+                variantId={line.variantId}
+                quantity={line.quantity}
+                maxQuantity={MAX_LINE_QUANTITY}
+              />
             </div>
           ))}
 
