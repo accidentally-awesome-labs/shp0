@@ -1,9 +1,6 @@
 "use server";
 
-import { headers } from "next/headers";
-
-import { auth } from "@/lib/auth";
-import { resolveDashboardStore } from "@/lib/current-store";
+import { authorizeStore } from "@/lib/current-store";
 import {
   createDiscount as dbCreateDiscount,
   listDiscounts as dbListDiscounts,
@@ -15,12 +12,11 @@ function slugify(text: string): string {
   return text.toUpperCase().replace(/[^A-Z0-9]+/g, "").slice(0, 20);
 }
 
-export async function createDiscountAction(storeId: string, formData: FormData) {
-  const resolved = await resolveDashboardStore(storeId);
-  if (!resolved) throw new Error("Not authorized for this store");
+// Every export is a public endpoint (callable by action id with any
+// arguments): each authorizes the caller for the Store and capability first.
 
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) throw new Error("Not authenticated");
+export async function createDiscountAction(storeId: string, formData: FormData) {
+  await authorizeStore(storeId, "discounts.manage");
 
   const name = formData.get("name") as string;
   const code = (formData.get("code") as string) || slugify(name);
@@ -57,18 +53,19 @@ export async function createDiscountAction(storeId: string, formData: FormData) 
 }
 
 export async function getDashboardDiscounts(storeId: string) {
+  await authorizeStore(storeId, "discounts.view");
   return dbListDiscounts(storeId);
 }
 
 /**
  * Preview a discount on a sample cart (the lever that keeps the engine intuitive).
  * This is the dashboard preview — calls the pure stacking engine.
- */export async function previewDiscountAction(
+ */
+export async function previewDiscountAction(
   storeId: string,
   formData: FormData,
 ): Promise<{ finalTotalCents: number; totalDiscountCents: number }> {
-  const resolved = await resolveDashboardStore(storeId);
-  if (!resolved) throw new Error("Not authorized for this store");
+  await authorizeStore(storeId, "discounts.manage");
 
   const sampleTotal = parseFloat(formData.get("sampleTotal") as string) * 100;
   const rewardType = formData.get("rewardType") as string;

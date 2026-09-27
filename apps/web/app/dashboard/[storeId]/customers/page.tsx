@@ -1,6 +1,8 @@
 export const instant = false;
 
 import { getDashboardCustomers } from "@/app/actions/customers";
+import { authorizeStorePage } from "@/lib/current-store";
+import { RequiresRole } from "@/app/dashboard/requires-role";
 
 export default async function CustomersPage({
   params,
@@ -8,6 +10,9 @@ export default async function CustomersPage({
   params: Promise<{ storeId: string }>;
 }) {
   const { storeId } = await params;
+  const access = await authorizeStorePage(storeId, "customers.view");
+  if (access.status !== "ok") return <RequiresRole role={access.required} storeId={storeId} />;
+
   const customers = await getDashboardCustomers(storeId);
 
   return (

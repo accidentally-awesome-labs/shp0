@@ -1,9 +1,8 @@
 export const instant = false;
 
-import { notFound } from "next/navigation";
-
 import { getDashboardDomains, retryDomainAction } from "@/app/actions/domains";
-import { resolveDashboardStore } from "@/lib/current-store";
+import { authorizeStorePage } from "@/lib/current-store";
+import { RequiresRole } from "@/app/dashboard/requires-role";
 import { AddDomainForm } from "./add-domain-form";
 
 export default async function DomainsPage({
@@ -12,10 +11,10 @@ export default async function DomainsPage({
   params: Promise<{ storeId: string }>;
 }) {
   const { storeId } = await params;
-
-  // Authorization gate: 404 unless the Merchant holds a Membership here.
-  const resolved = await resolveDashboardStore(storeId);
-  if (!resolved) notFound();
+  // Custom Domains (and their TXT values) are Store settings: Admin and above.
+  // A non-member gets the not-found page.
+  const access = await authorizeStorePage(storeId, "domains.manage");
+  if (access.status !== "ok") return <RequiresRole role={access.required} storeId={storeId} />;
 
   const domains = await getDashboardDomains(storeId);
 

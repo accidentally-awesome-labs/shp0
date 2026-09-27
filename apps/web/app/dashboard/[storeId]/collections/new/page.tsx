@@ -1,5 +1,7 @@
 export const instant = false;
 import { createCollectionAction } from "@/app/actions/collections";
+import { authorizeStorePage } from "@/lib/current-store";
+import { RequiresRole } from "@/app/dashboard/requires-role";
 
 export default async function NewCollectionPage({
   params,
@@ -7,6 +9,8 @@ export default async function NewCollectionPage({
   params: Promise<{ storeId: string }>;
 }) {
   const { storeId } = await params;
+  const access = await authorizeStorePage(storeId, "catalog.manage");
+  if (access.status !== "ok") return <RequiresRole role={access.required} storeId={storeId} />;
 
   return (
     <div className="mx-auto max-w-lg p-8">

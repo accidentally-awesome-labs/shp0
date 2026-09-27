@@ -1,6 +1,8 @@
 export const instant = false;
 
 import { changeTierAction, getDashboardBilling } from "@/app/actions/billing";
+import { authorizeStorePage } from "@/lib/current-store";
+import { RequiresRole } from "@/app/dashboard/requires-role";
 
 export default async function BillingPage({
   params,
@@ -8,6 +10,11 @@ export default async function BillingPage({
   params: Promise<{ storeId: string }>;
 }) {
   const { storeId } = await params;
+  // Platform billing, viewing included, is the Owner's (see
+  // packages/db/src/roles.ts, "billing.view").
+  const access = await authorizeStorePage(storeId, "billing.view");
+  if (access.status !== "ok") return <RequiresRole role={access.required} storeId={storeId} />;
+
   const { tier, usage, tiers } = await getDashboardBilling(storeId);
 
   return (
