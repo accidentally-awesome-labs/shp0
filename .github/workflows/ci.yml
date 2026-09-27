@@ -45,16 +45,29 @@ jobs:
       - name: CI script self-tests
         run: node --test 'scripts/ci/*.test.mjs'
 
-      # Pure Operator allowlist policy (Issue #52). Needs no database, unlike
-      # the rest of packages/auth/tests, so it runs with the fast checks.
+      # Pure auth policy: the Operator allowlist (Issue #52), same-origin
+      # sign-in redirects and the session cookie names the proxy accepts. Needs
+      # no database, unlike the rest of packages/auth/tests, so it runs with
+      # the fast checks.
       - name: Auth unit tests
         working-directory: packages/auth
-        run: pnpm exec vitest run tests/operator.test.ts
+        run: >-
+          pnpm exec vitest run
+          tests/operator.test.ts
+          tests/redirect.test.ts
+          tests/session-cookie.test.ts
 
       # Every platform admin server action calls requireOperator() first, and
       # no other apps/web file reaches the Operator-only db helpers (Issue #52).
       - name: Operator guard
         run: node scripts/ci/operator-guard.mjs
+
+      # Every server action authorizes first (authorizeStore with its Store id
+      # and a capability, or requireOperator) unless it is on the script's
+      # commented allowlist of storefront and session-scoped actions, and every
+      # Store dashboard page gates before it fetches.
+      - name: Action guard
+        run: node scripts/ci/action-guard.mjs
 
       - name: Typecheck
         run: pnpm -r typecheck
@@ -75,6 +88,7 @@ jobs:
           tests/store-status.test.ts
           tests/domain-verification.test.ts
           tests/hostname.test.ts
+          tests/roles.test.ts
 
       - name: Build
         env:
