@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 import { eq, sql, and } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 
@@ -139,6 +139,146 @@ export async function platformClient<T>(
 }
 
 /**
+ * Add memberships' two constraints to a database that an older applySchema()
+ * created without them: memberships_user_store_key (one Membership per
+ * person per Store) and memberships_role_check (role text is exactly
+ * 'owner', 'admin' or 'staff'; this also closes the gap a mis-cased 'Owner'
+ * left in the single-Owner index and the owner-delete trigger, which match
+ * role = 'owner' exactly). A fresh database has both from CREATE TABLE, and
+ * then this only reads pg_constraint.
+ *
+ * Postgres has no ADD CONSTRAINT IF NOT EXISTS, so a DO block adds each one
+ * only when pg_constraint lacks it. Existing rows that break them are never
+ * rewritten or deleted here: with memberships locked, any such rows are
+ * listed in the error thrown and the transaction rolls back, so a person
+ * decides what each row becomes.
+ */
+async function addMembershipConstraints(client: PoolClient): Promise<void> {
+  const present = await client.query<{ n: number }>(`
+    SELECT count(*)::int AS n FROM pg_constraint
+    WHERE conrelid = 'memberships'::regclass
+      AND conname IN ('memberships_user_store_key', 'memberships_role_check')
+  `);
+  if (present.rows[0]!.n === 2) return;
+
+  await client.query("BEGIN");
+  try {
+    // The ALTER TABLE below takes this lock anyway. Taking it first means no
+    // row changes between the check and the constraints, and no lock upgrade
+    // mid-transaction that could deadlock with a concurrent reader.
+    await client.query("LOCK TABLE memberships IN ACCESS EXCLUSIVE MODE");
+    const violations = await describeMembershipViolations(client);
+    if (violations !== null) throw new Error(violations);
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'memberships'::regclass AND conname = 'memberships_user_store_key'
+        ) THEN
+          ALTER TABLE memberships
+            ADD CONSTRAINT memberships_user_store_key UNIQUE (user_id, store_id);
+        END IF;
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid = 'memberships'::regclass AND conname = 'memberships_role_check'
+        ) THEN
+          ALTER TABLE memberships
+            ADD CONSTRAINT memberships_role_check CHECK (role IN ('owner', 'admin', 'staff'));
+        END IF;
+      END
+      $$;
+    `);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  }
+}
+
+/** How many offending rows an error lists before "...and N more". */
+const LISTED_VIOLATIONS = 20;
+
+/**
+ * The error message for memberships rows that break memberships_user_store_key
+ * or memberships_role_check, or null when there are none.
+ */
+async function describeMembershipViolations(client: PoolClient): Promise<string | null> {
+  const duplicates = await client.query<{
+    user_id: string;
+    store_id: string;
+    roles: string[];
+    total: number;
+  }>(
+    `SELECT user_id, store_id::text AS store_id,
+            array_agg(role ORDER BY created_at, id) AS roles,
+            count(*) OVER ()::int AS total
+     FROM memberships
+     GROUP BY user_id, store_id
+     HAVING count(*) > 1
+     ORDER BY store_id, user_id
+     LIMIT $1`,
+    [LISTED_VIOLATIONS],
+  );
+  const invalid = await client.query<{
+    user_id: string;
+    store_id: string;
+    role: string;
+    total: number;
+  }>(
+    `SELECT user_id, store_id::text AS store_id, role, count(*) OVER ()::int AS total
+     FROM memberships
+     WHERE role NOT IN ('owner', 'admin', 'staff')
+     ORDER BY store_id, user_id, created_at, id
+     LIMIT $1`,
+    [LISTED_VIOLATIONS],
+  );
+  if (duplicates.rows.length === 0 && invalid.rows.length === 0) return null;
+
+  const more = (listed: number, total: number) =>
+    total > listed ? [`  ...and ${total - listed} more`] : [];
+  const lines = [
+    "applySchema: cannot add the memberships constraints, because existing rows break them. " +
+      "No Membership row was changed or deleted.",
+  ];
+  if (duplicates.rows.length > 0) {
+    const total = duplicates.rows[0]!.total;
+    lines.push(
+      "",
+      `memberships_user_store_key (one Membership per person per Store): ${total} ` +
+        `${total === 1 ? "person has" : "people have"} several Memberships in one Store:`,
+      ...duplicates.rows.map(
+        (d) =>
+          `  user_id=${JSON.stringify(d.user_id)} store_id=${d.store_id} roles=${JSON.stringify(d.roles)}`,
+      ),
+      ...more(duplicates.rows.length, total),
+    );
+  }
+  if (invalid.rows.length > 0) {
+    const total = invalid.rows[0]!.total;
+    lines.push(
+      "",
+      `memberships_role_check (role is exactly 'owner', 'admin' or 'staff'): ${total} ` +
+        `${total === 1 ? "Membership has" : "Memberships have"} role text other than 'owner', 'admin' or 'staff':`,
+      ...invalid.rows.map(
+        (r) =>
+          `  user_id=${JSON.stringify(r.user_id)} store_id=${r.store_id} role=${JSON.stringify(r.role)}`,
+      ),
+      ...more(invalid.rows.length, total),
+    );
+  }
+  lines.push(
+    "",
+    "Fix these rows by hand, in one transaction, then run applySchema again: lowercase the " +
+      "role text (never making a second Owner in a Store); keep one row per person per Store, the " +
+      "one with the highest valid Role, never removing a Store's Owner row; and decide what each " +
+      "row that is still not a Role becomes (such a row grants no access today). In a throwaway " +
+      "test database, TRUNCATE memberships (or recreate the database) instead.",
+  );
+  return lines.join("\n");
+}
+
+/**
  * Apply the schema + RLS roles/policies. Idempotent. Run as `cloud_admin`.
  *
  * Must bootstrap an empty database: every table is created after the tables its
@@ -148,6 +288,10 @@ export async function platformClient<T>(
  * The tenant bootstrap `stores` table has no stamping trigger: the platform
  * creates Stores (so the per-request GUC is not set then), and the inserting
  * code sets `store_id = id` itself (see provisionStore()).
+ *
+ * Over a database an older applySchema() created, it throws, changing no
+ * Membership row, when memberships holds rows its constraints refuse (see
+ * addMembershipConstraints()).
  */
 export async function applySchema(
   connectionString: string = PLATFORM_DATABASE_URL,
@@ -241,15 +385,21 @@ export async function applySchema(
     // Auth tables are platform tables — cloud_admin owns them, no RLS, no grant to "default".
 
     // ── memberships (PLATFORM table — bridges global users to Stores) ──
+    // One Membership per person per Store, holding exactly one of the three
+    // Roles. A database created before these two constraints gets them from
+    // addMembershipConstraints() below.
     await client.query(`
       CREATE TABLE IF NOT EXISTS memberships (
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id text NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
         store_id uuid NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
         role text NOT NULL,
-        created_at timestamptz NOT NULL DEFAULT now()
+        created_at timestamptz NOT NULL DEFAULT now(),
+        CONSTRAINT memberships_user_store_key UNIQUE (user_id, store_id),
+        CONSTRAINT memberships_role_check CHECK (role IN ('owner', 'admin', 'staff'))
       );
     `);
+    await addMembershipConstraints(client);
     // Single-Owner invariant part 1: at most one owner per Store.
     await client.query(`
       DROP INDEX IF EXISTS memberships_one_owner_per_store;
@@ -754,10 +904,13 @@ export async function checkSubdomainAvailable(
  *   segment is answered like a non-member instead of raising 22P02);
  * - the stored role text is not exactly "owner", "admin" or "staff".
  *
- * memberships has no UNIQUE (user_id, store_id), so one person can have
- * several rows in one Store. Then every row must hold a valid Role, and the
- * lowest one is returned: extra rows can only take authority away
- * (effectiveRole in ./roles).
+ * The database holds at most one Membership per person per Store, with one
+ * of those three role texts (memberships_user_store_key and
+ * memberships_role_check, see applySchema()). The read does not rely on it:
+ * as defense in depth, for a database those constraints have not reached,
+ * it reads every row and effectiveRole (./roles) fails closed. With several
+ * rows every row must hold a valid Role and the lowest one is returned, so
+ * extra rows can only take authority away; one invalid row means null.
  */
 export async function getMembershipRole(
   userId: string,

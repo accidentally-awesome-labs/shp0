@@ -22,9 +22,10 @@ import type { Capability, Role } from "../src/roles";
  * Roles are ranked Owner > Admin > Staff, and a Role has its own capabilities
  * plus every lower Role's, so authorization is a rank comparison against a
  * capability's minimum Role. Anything that is not exactly one of the three
- * stored role strings grants nothing (fail closed): memberships.role is free
- * text with no CHECK constraint, and a mis-cased "Owner" escapes the
- * single-Owner index and the owner-delete trigger.
+ * stored role strings grants nothing (fail closed). The database refuses any
+ * other role text and a second Membership for one person in one Store
+ * (memberships_role_check, memberships_user_store_key); failing closed here
+ * as well is defense in depth.
  *
  * Pure: no database.
  */

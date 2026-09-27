@@ -368,6 +368,11 @@ export type ProcessedEvent = typeof processedEvents.$inferSelect;
  * identity domain (Merchants) to the tenant domain (Stores). Queried via
  * platformClient for both "which Stores does this user belong to?" (switcher)
  * and "who are the members of this Store?" (team management).
+ *
+ * applySchema() also holds it to one Membership per person per Store
+ * (memberships_user_store_key) and role text of exactly 'owner', 'admin' or
+ * 'staff' (memberships_role_check), besides the single-Owner index and the
+ * owner-delete trigger.
  */
 export const memberships = pgTable("memberships", {
   id: uuid("id").primaryKey().defaultRandom(),
