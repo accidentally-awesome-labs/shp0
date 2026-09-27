@@ -80,13 +80,14 @@ const OWNER_TRIGGERS = [
 
 /**
  * The creation-time Owner check on stores: a constraint trigger that checks
- * at COMMIT that every Store the transaction inserted has exactly one Owner.
+ * at COMMIT that every Store the transaction inserted, or gave a new id, has
+ * exactly one Owner.
  */
 const STORE_TRIGGERS = [
   {
     tgname: "stores_exactly_one_owner_at_creation",
     def:
-      "CREATE CONSTRAINT TRIGGER stores_exactly_one_owner_at_creation AFTER INSERT ON <schema>.stores " +
+      "CREATE CONSTRAINT TRIGGER stores_exactly_one_owner_at_creation AFTER INSERT OR UPDATE OF id ON <schema>.stores " +
       "DEFERRABLE INITIALLY DEFERRED FOR EACH ROW " +
       "EXECUTE FUNCTION stores_check_exactly_one_owner_at_creation()",
   },

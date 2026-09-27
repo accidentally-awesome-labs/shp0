@@ -129,6 +129,36 @@ describe("Store creation: atomic, and never without its Owner", () => {
     `INSERT INTO public.memberships (user_id, store_id, role) VALUES ($1, $2, $3)`,
     [userId, storeId, role],
   ];
+  /** Give the Store another id (a Store's own row carries store_id = id). */
+  const changeStoreId = (storeId: string, newId: string): Statement => [
+    `UPDATE public.stores SET id = $2, store_id = $2 WHERE id = $1`,
+    [storeId, newId],
+  ];
+
+  /**
+   * An existing Store with no Owner and no Membership: legacy data, from
+   * before the creation-time check. Made with that check off, in one
+   * committed transaction on one connection (disable, insert, enable), as
+   * owner-invariant.test.ts does; then the trigger is checked to be on.
+   */
+  async function legacyOwnerlessStore(): Promise<string> {
+    const storeId = randomUUID();
+    await transaction([
+      [`ALTER TABLE stores DISABLE TRIGGER stores_exactly_one_owner_at_creation`],
+      insertStore(storeId, newSubdomain("legacy")),
+      [`ALTER TABLE stores ENABLE TRIGGER stores_exactly_one_owner_at_creation`],
+    ]).then(({ commitError }) => {
+      if (commitError) throw commitError;
+    });
+    const { rows } = await pool.query<{ tgenabled: string }>(
+      `SELECT tgenabled FROM pg_trigger
+       WHERE tgrelid = 'stores'::regclass AND tgname = 'stores_exactly_one_owner_at_creation'`,
+    );
+    expect(rows).toEqual([{ tgenabled: "O" }]);
+    expect(await storeExists(storeId)).toBe(true);
+    expect(await membershipsOf(storeId)).toEqual([]);
+    return storeId;
+  }
 
   beforeAll(async () => {
     await applySchema();
@@ -353,6 +383,90 @@ describe("Store creation: atomic, and never without its Owner", () => {
       ]);
       expect(commitError).toBeNull();
       expect(await storeExists(storeId)).toBe(false);
+    });
+
+    /**
+     * A Store with no Membership yet can still be given another id
+     * (memberships' foreign key only stops that once a Membership points at
+     * it). The Store under its new id is a new Store, so the check follows
+     * it there: moving a new Store to another id does not skip the check.
+     */
+    describe("a Store given a new id is checked under that id", () => {
+      it("a transaction that inserts a Store and changes its id is refused at COMMIT without an Owner, and rolls back whole", async () => {
+        const storeId = randomUUID();
+        const newId = randomUUID();
+
+        const { commitError } = await transaction([insertStore(storeId), changeStoreId(storeId, newId)]);
+
+        expect(commitError).toMatchObject({
+          ...creationRefusal(newId),
+          detail: `This transaction changed its id from ${storeId}.`,
+        });
+        expect(await storeExists(storeId)).toBe(false);
+        expect(await storeExists(newId)).toBe(false);
+      });
+
+      it("a platformClient callback that inserts a Store and changes its id is refused at COMMIT", async () => {
+        const storeId = randomUUID();
+        const newId = randomUUID();
+        await expect(
+          platformClient(async (tx) => {
+            await tx.execute(
+              sql`INSERT INTO stores (id, store_id, name, subdomain) VALUES (${storeId}, ${storeId}, 'Raw', ${newSubdomain("pc")})`,
+            );
+            await tx.execute(sql`UPDATE stores SET id = ${newId}, store_id = ${newId} WHERE id = ${storeId}`);
+          }),
+        ).rejects.toMatchObject(creationRefusal(newId));
+        expect(await storeExists(storeId)).toBe(false);
+        expect(await storeExists(newId)).toBe(false);
+      });
+
+      it("the transaction commits when it gives the Store its Owner under the new id", async () => {
+        const storeId = randomUUID();
+        const newId = randomUUID();
+        const owner = await newUser("owner");
+
+        const { commitError } = await transaction([
+          insertStore(storeId),
+          changeStoreId(storeId, newId),
+          insertMembership(newId, owner, "owner"),
+        ]);
+
+        expect(commitError).toBeNull();
+        expect(await storeExists(storeId)).toBe(false);
+        expect(await membershipsOf(newId)).toEqual([[owner, "owner"]]);
+      });
+
+      it("an existing ownerless Store given a new id must get its Owner in that transaction", async () => {
+        const storeId = await legacyOwnerlessStore();
+        const newId = randomUUID();
+
+        const { commitError } = await transaction([changeStoreId(storeId, newId)]);
+        expect(commitError).toMatchObject(creationRefusal(newId));
+        expect(await storeExists(storeId)).toBe(true);
+        expect(await storeExists(newId)).toBe(false);
+
+        const owner = await newUser("owner");
+        const retry = await transaction([changeStoreId(storeId, newId), insertMembership(newId, owner, "owner")]);
+        expect(retry.commitError).toBeNull();
+        expect(await storeExists(storeId)).toBe(false);
+        expect(await membershipsOf(newId)).toEqual([[owner, "owner"]]);
+      });
+
+      it("an existing ownerless Store is not checked by an UPDATE that keeps its id", async () => {
+        const storeId = await legacyOwnerlessStore();
+
+        const { commitError } = await transaction([
+          [`UPDATE stores SET name = 'Renamed' WHERE id = $1`, [storeId]],
+          // Names id, but keeps it: still the same Store, not a new one.
+          [`UPDATE stores SET id = id, store_id = store_id, status = 'suspended' WHERE id = $1`, [storeId]],
+        ]);
+
+        expect(commitError).toBeNull();
+        const { rows } = await pool.query(`SELECT name, status FROM stores WHERE id = $1`, [storeId]);
+        expect(rows).toEqual([{ name: "Renamed", status: "suspended" }]);
+        expect(await membershipsOf(storeId)).toEqual([]);
+      });
     });
 
     it("a platformClient callback that inserts a Store without its Owner is refused at COMMIT", async () => {
