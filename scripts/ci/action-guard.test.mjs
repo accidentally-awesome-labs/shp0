@@ -332,6 +332,85 @@ export function sync() {
   ]);
 });
 
+test("a guarded action takes no second Store id and never reads `arguments`", () => {
+  const source = `import { authorizeStore } from "@/lib/current-store";
+export async function secondStoreId(storeId: string, targetStoreId: string) {
+  await authorizeStore(storeId, "customers.view");
+  return listCustomers(targetStoreId);
+}
+export async function destructuredStoreId(storeId: string, { otherStoreId }: { otherStoreId: string }) {
+  await authorizeStore(storeId, "customers.view");
+  return listCustomers(otherStoreId);
+}
+export async function viaArguments(storeId: string) {
+  await authorizeStore(storeId, "customers.view");
+  return listCustomers(arguments[1]);
+}
+export async function propertyNamedArguments(storeId: string, call: { arguments: string[] }) {
+  await authorizeStore(storeId, "customers.view");
+  return call.arguments.length;
+}
+`;
+  assert.deepEqual(ruleLines(checkActionsModule(FILE, source, new Map())), [
+    ["extra-store-param", 2],
+    ["extra-store-param", 6],
+    ["arguments-used", 12],
+  ]);
+});
+
+test("parameter defaults are literals: they run before the guard", () => {
+  const source = `import { authorizeStore } from "@/lib/current-store";
+export async function deletesFirst(storeId: string, productId: string, _x = deleteProduct(storeId, productId)) {
+  await authorizeStore(storeId, "catalog.manage");
+}
+export async function readsFirst(storeId: string, leak = listCustomers(storeId)) {
+  await authorizeStore(storeId, "customers.view");
+  return leak;
+}
+export async function inPattern(storeId: string, { rows = listCustomers(storeId) }: { rows?: unknown }) {
+  await authorizeStore(storeId, "customers.view");
+  return rows;
+}
+export async function computedKey(storeId: string, { [pick(storeId)]: rows }: Record<string, unknown>) {
+  await authorizeStore(storeId, "customers.view");
+  return rows;
+}
+export async function awaited(storeId: string, rows = await Promise.resolve(1)) {
+  await authorizeStore(storeId, "customers.view");
+  return rows;
+}
+export async function literals(
+  storeId: string,
+  quantity: number = 1,
+  offset = -1,
+  label = "x",
+  flag = false,
+  none = null,
+  missing = undefined,
+  list: string[] = [],
+  options = {},
+  typed = {} as Record<string, string>,
+) {
+  await authorizeStore(storeId, "catalog.view");
+}
+`;
+  assert.deepEqual(ruleLines(checkActionsModule(FILE, source, new Map())), [
+    ["param-default", 2],
+    ["param-default", 5],
+    ["param-default", 9],
+    ["param-default", 13],
+    ["param-default", 17],
+  ]);
+
+  const publicAction = `"use server";
+export async function addToCart(variantId: string, quantity: number = 1, _x = sideEffect()) {
+  return variantId;
+}
+`;
+  const allowlist = new Map([[`${FILE}#addToCart`, "storefront: Store from the host"]]);
+  assert.deepEqual(ruleLines(checkActionsModule(FILE, publicAction, allowlist)), [["param-default", 2]]);
+});
+
 test("the allowlist exempts named public actions, and only those", () => {
   const source = `"use server";
 import { resolveStorefrontStore } from "@/lib/current-store";
@@ -436,6 +515,129 @@ export async function generateMetadata({ params }: { params: Promise<{ storeId: 
     'import { getStoreAccess as authorizeStorePage } from "@/lib/current-store";',
   );
   assert.deepEqual(rules(checkDashboardPage(PAGE, renamedGate)), ["page-gate-first"]);
+});
+
+test("a dashboard page exports nothing that runs besides the page and literal segment config", () => {
+  const cases = [
+    [
+      "a local function in an export list",
+      `async function generateMetadata({ params }: { params: Promise<{ storeId: string }> }) {
+  const { storeId } = await params;
+  return { title: (await listCustomers(storeId))[0]?.email };
+}
+export { generateMetadata };
+`,
+    ],
+    ["a re-export", `export { generateMetadata } from "./meta";\n`],
+    ["a star re-export", `export * from "./meta";\n`],
+    ["an exported const bound to a function value", `import { meta } from "./meta";\nexport const generateMetadata = meta;\n`],
+    ["segment config computed at load", `export const revalidate = compute();\n`],
+    ["an exported non-config const", `export const title = "Things";\n`],
+    ["an exported let", `export let instant = false;\n`],
+    ["an exported class", `export class Thing {}\n`],
+  ];
+  for (const [label, extra] of cases) {
+    assert.deepEqual(rules(checkDashboardPage(PAGE, PAGE_OK + extra)), ["page-export"], label);
+  }
+
+  const allowed = `${PAGE_OK}
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+export const maxDuration = 30;
+export type ThingsProps = { storeId: string };
+export interface ThingsView { id: string }
+export { type ThingsProps as Props };
+`;
+  assert.deepEqual(checkDashboardPage(PAGE, allowed).violations, []);
+});
+
+test("the repo check covers 'use server' anywhere in the repo, not only apps/web", () => {
+  const files = {
+    "packages/db/src/evil-actions.ts": `"use server";
+import { listCustomers } from "./index";
+export async function unguarded(storeId: string) {
+  return listCustomers(storeId);
+}
+`,
+    "packages/auth/src/inline.ts": `export function make() {
+  return async function act() {
+    "use server";
+  };
+}
+`,
+    "scripts/ci/fixture.test.mjs": 'const text = `"use server";`;\n',
+  };
+  const result = checkRepo(Object.keys(files), (f) => files[f], new Map());
+  assert.deepEqual(
+    result.violations.map((v) => [v.file, v.line, v.rule]),
+    [
+      ["packages/db/src/evil-actions.ts", 1, "use-server-outside-actions"],
+      ["packages/auth/src/inline.ts", 3, "use-server-outside-actions"],
+    ],
+  );
+});
+
+test("every route file under a Store dashboard segment is gated, wherever the segment sits", () => {
+  const ungatedLayout = `import { listCustomers } from "@shp0/db";
+export default async function Layout({ children, params }: { children: React.ReactNode; params: Promise<{ storeId: string }> }) {
+  const { storeId } = await params;
+  const customers = await listCustomers(storeId);
+  return <div>{customers[0]?.email}{children}</div>;
+}
+`;
+  const gatedLayout = `import { authorizeStorePage } from "@/lib/current-store";
+export default async function Layout({ children, params }: { children: React.ReactNode; params: Promise<{ storeId: string }> }) {
+  const { storeId } = await params;
+  const access = await authorizeStorePage(storeId, "store.view");
+  return <div>{children}</div>;
+}
+`;
+  const ungatedPage = `import { listCustomers } from "@shp0/db";
+export default async function Page({ params }: { params: Promise<{ storeId: string }> }) {
+  const { storeId } = await params;
+  return <p>{(await listCustomers(storeId))[0]?.email}</p>;
+}
+`;
+  const routeHandler = `import { listCustomers } from "@shp0/db";
+export async function GET(_request: Request, { params }: { params: Promise<{ storeId: string }> }) {
+  const { storeId } = await params;
+  return Response.json(await listCustomers(storeId));
+}
+`;
+  const files = {
+    "apps/web/app/dashboard/[storeId]/layout.tsx": ungatedLayout,
+    "apps/web/app/dashboard/[storeId]/things/template.tsx": ungatedLayout,
+    "apps/web/app/dashboard/[storeId]/@panel/default.tsx": ungatedPage,
+    "apps/web/app/dashboard/[storeId]/customers/export/route.ts": routeHandler,
+    "apps/web/app/dashboard/[storeId]/opengraph-image.tsx": routeHandler,
+    "apps/web/app/(shell)/dashboard/[storeId]/grouped/page.tsx": ungatedPage,
+    "apps/web/app/dashboard/(settings)/[storeId]/settings/page.tsx": ungatedPage,
+    "apps/web/app/dashboard/[store]/page.tsx": ungatedPage.replaceAll("storeId", "store"),
+    "apps/web/app/(.)dashboard/[storeId]/modal/page.tsx": ungatedPage,
+    // Gated: fine.
+    "apps/web/app/dashboard/[storeId]/other/layout.tsx": gatedLayout,
+    // Not under a Store segment: session-scoped pages, and components.
+    "apps/web/app/dashboard/page.tsx": ungatedPage,
+    "apps/web/app/dashboard/onboarding/page.tsx": ungatedPage,
+    "apps/web/app/dashboard/[storeId]/things/list.tsx": ungatedPage,
+    "apps/web/app/dashboard/[storeId]/loading.tsx": `export default function Loading() {\n  return null;\n}\n`,
+  };
+  const result = checkRepo(Object.keys(files), (f) => files[f], new Map());
+  assert.deepEqual(
+    result.violations.map((v) => [v.file, v.rule]).sort(),
+    [
+      ["apps/web/app/(.)dashboard/[storeId]/modal/page.tsx", "page-gate-first"],
+      ["apps/web/app/(shell)/dashboard/[storeId]/grouped/page.tsx", "page-gate-first"],
+      ["apps/web/app/dashboard/(settings)/[storeId]/settings/page.tsx", "page-gate-first"],
+      ["apps/web/app/dashboard/[store]/page.tsx", "page-gate-first"],
+      ["apps/web/app/dashboard/[storeId]/@panel/default.tsx", "page-gate-first"],
+      ["apps/web/app/dashboard/[storeId]/customers/export/route.ts", "dashboard-route-handler"],
+      ["apps/web/app/dashboard/[storeId]/layout.tsx", "page-gate-first"],
+      ["apps/web/app/dashboard/[storeId]/opengraph-image.tsx", "dashboard-route-handler"],
+      ["apps/web/app/dashboard/[storeId]/things/template.tsx", "page-gate-first"],
+    ],
+  );
+  assert.deepEqual(result.pages, [["apps/web/app/dashboard/[storeId]/other/layout.tsx", "store.view"]]);
 });
 
 test("the repo check: 'use server' only in the actions directory, and stale allowlist entries", () => {
