@@ -127,6 +127,34 @@ describe("Storefront Order access (the placing cart token)", () => {
       expect(await getStorefrontOrder(storeA, orderA1, `${tokenA1} `)).toBeNull();
     });
 
+    it("lists lines in Cart order", async () => {
+      const token = randomUUID();
+      const first = await createProduct(storeA, {
+        title: "First",
+        slug: "first",
+        status: "published",
+        variants: [{ sku: "F-1", title: "Default", priceCents: 100, inventory: 10 }],
+      });
+      const second = await createProduct(storeA, {
+        title: "Second",
+        slug: "second",
+        status: "published",
+        variants: [{ sku: "S-1", title: "Default", priceCents: 200, inventory: 10 }],
+      });
+      const third = await createProduct(storeA, {
+        title: "Third",
+        slug: "third",
+        status: "published",
+        variants: [{ sku: "T-1", title: "Default", priceCents: 300, inventory: 10 }],
+      });
+      for (const p of [third, first, second]) {
+        await changeDbCart(storeA, token, { kind: "add", variantId: p.variants[0]!.id, quantity: 1 });
+      }
+      const { orderId } = await checkout(storeA, token);
+      const order = await getStorefrontOrder(storeA, orderId, token);
+      expect(order!.lines.map((l) => l.productTitle)).toEqual(["Third", "First", "Second"]);
+    });
+
     it("keeps a line whose Variant was deleted, without a title", async () => {
       const order = await getStorefrontOrder(storeA, orderWithGoneVariant, tokenA2);
       expect(order).toMatchObject({

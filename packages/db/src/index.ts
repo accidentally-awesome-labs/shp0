@@ -1400,6 +1400,9 @@ export async function checkout(
         variantId: line.variantId,
         quantity: line.quantity,
         unitPriceCents: line.unitPriceCents,
+        // Its own timestamp (now() is the transaction's), so the lines read
+        // back in Cart order (getStorefrontOrder orders by created_at).
+        createdAt: sql`clock_timestamp()`,
       });
     }
 
