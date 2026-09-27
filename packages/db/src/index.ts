@@ -457,23 +457,27 @@ export async function applySchema(
       );
     `);
     await addMembershipConstraints(client);
-    // Single-Owner invariant part 1: at most one owner per Store.
+    // Single-Owner invariant, in three parts. Ownership transfer (not
+    // implemented yet) passes all three, and must keep one Membership per
+    // person per Store: to a person with no Membership in the Store, UPDATE
+    // the owner row's user_id; to an existing member, in one transaction,
+    // first demote the owner row to 'admin' or 'staff', then promote the
+    // member's row to 'owner' (the other order trips the index in part 1).
+    // An UPDATE of user_id onto an existing member trips
+    // memberships_user_store_key. After the transfer commits, or later in
+    // the same transaction, the old Owner's row can be deleted like any
+    // other Membership.
+    //
+    // Part 1: at most one owner per Store.
     await client.query(`
       DROP INDEX IF EXISTS memberships_one_owner_per_store;
       CREATE UNIQUE INDEX memberships_one_owner_per_store
         ON memberships(store_id) WHERE role = 'owner';
     `);
-    // Single-Owner invariant part 2: the owner row cannot be deleted.
-    // Ownership transfer (not implemented yet) must keep one Membership per
-    // person per Store: to a person with no Membership in the Store, UPDATE
-    // the owner row's user_id; to an existing member, in one transaction,
-    // first demote the owner row to 'admin' or 'staff', then promote the
-    // member's row to 'owner' (the other order trips the index above). An
-    // UPDATE of user_id onto an existing member trips
-    // memberships_user_store_key.
-    // Known gap: this fires only on DELETE, so an UPDATE that demotes the
-    // owner row, or moves it to another Store, can still leave a Store with
-    // no Owner. No application code updates memberships today.
+    // Part 2: the owner row cannot be deleted, at once, whatever else the
+    // transaction does. This also refuses the cascade that deleting the
+    // Store, or the Owner's user, runs over the owner row. Part 3 alone
+    // would refuse the latter too, but let a Store deletion through.
     await client.query(`
       CREATE OR REPLACE FUNCTION memberships_prevent_owner_delete()
       RETURNS trigger LANGUAGE plpgsql AS $func$
@@ -490,6 +494,65 @@ export async function applySchema(
       CREATE TRIGGER memberships_no_delete_owner
         BEFORE DELETE ON memberships
         FOR EACH ROW EXECUTE FUNCTION memberships_prevent_owner_delete();
+    `);
+    // Part 3: no Store is left without its owner, checked at COMMIT. Whenever
+    // a transaction updates or deletes an owner row (demotes it, moves it to
+    // another Store, gives it to another person), the Store it was the
+    // Owner of must have exactly one owner row when the transaction commits,
+    // unless that Store row no longer exists (a Store deleted in the same
+    // transaction; part 2 still refuses that while the owner row is in it).
+    // Deferred, so a transfer can demote and then promote in two statements;
+    // a transaction that leaves the Store without an Owner is refused at
+    // COMMIT (SQLSTATE 23000, constraint memberships_exactly_one_owner) and
+    // rolls back whole. Promotions need no check here: part 1 refuses a
+    // second owner at once.
+    //
+    // No lock is taken beyond the rows the transaction changed. By part 1 a
+    // Store has at most one live owner row; a transaction this fires for has
+    // changed it and holds its row lock until it ends, and any other
+    // transaction that changes that row, or makes another row the Store's
+    // owner, waits for it (for the row lock, or in part 1's uniqueness
+    // check). So the two are checked one after the other, and under READ
+    // COMMITTED the later one's count, run at its COMMIT with a fresh
+    // snapshot, sees what the earlier one committed. owner-invariant.test.ts
+    // runs those interleavings on two connections.
+    //
+    // Only cloud_admin (the owner of both tables, so RLS on stores does not
+    // apply to it) changes memberships; "default" has no grant on it.
+    await client.query(`
+      CREATE OR REPLACE FUNCTION memberships_check_exactly_one_owner()
+      RETURNS trigger LANGUAGE plpgsql AS $func$
+      DECLARE
+        owners integer;
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM stores WHERE id = OLD.store_id) THEN
+          RETURN NULL;
+        END IF;
+        SELECT count(*) INTO owners
+          FROM memberships WHERE store_id = OLD.store_id AND role = 'owner';
+        IF owners <> 1 THEN
+          RAISE EXCEPTION 'Store % must have exactly one Owner; this transaction leaves it with %.',
+            OLD.store_id, owners
+            USING ERRCODE = 'integrity_constraint_violation',
+                  CONSTRAINT = TG_NAME,
+                  SCHEMA = TG_TABLE_SCHEMA,
+                  TABLE = TG_TABLE_NAME,
+                  HINT = 'Transfer ownership in one transaction: demote the Owner''s Membership, '
+                    || 'then promote the new Owner''s; or give the Owner''s Membership to a person '
+                    || 'with no Membership in the Store.';
+        END IF;
+        RETURN NULL;
+      END;
+      $func$;
+    `);
+    // CREATE OR REPLACE TRIGGER does not apply to constraint triggers.
+    await client.query(`
+      DROP TRIGGER IF EXISTS memberships_exactly_one_owner ON memberships;
+      CREATE CONSTRAINT TRIGGER memberships_exactly_one_owner
+        AFTER UPDATE OR DELETE ON memberships
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW WHEN (OLD.role = 'owner')
+        EXECUTE FUNCTION memberships_check_exactly_one_owner();
     `);
 
     // ── products + variants (TENANT tables — store_id GUC, RLS-protected) ──

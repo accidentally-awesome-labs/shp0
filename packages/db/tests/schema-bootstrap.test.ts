@@ -205,7 +205,13 @@ describe("applySchema() bootstraps an empty database", () => {
     expect(membershipTriggers(first, SCHEMA)).toEqual(OWNER_TRIGGERS);
     expect(
       first.constraints.filter((c) => c.relname === "memberships" && c.conname === "memberships_exactly_one_owner"),
-    ).toEqual([{ relname: "memberships", conname: "memberships_exactly_one_owner", def: "TRIGGER" }]);
+    ).toEqual([
+      {
+        relname: "memberships",
+        conname: "memberships_exactly_one_owner",
+        def: "TRIGGER DEFERRABLE INITIALLY DEFERRED",
+      },
+    ]);
 
     // Idempotent: applying again to the bootstrapped schema succeeds and
     // leaves every definition exactly as it was.
