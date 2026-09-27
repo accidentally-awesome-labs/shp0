@@ -6,12 +6,12 @@
  * use a capability when their Role ranks at or above the capability's
  * minimum Role.
  *
- * Fails closed. memberships.role is free text with no CHECK constraint, so
- * only the exact stored strings "owner", "admin" and "staff" are Roles.
- * Anything else (a mis-cased "Owner", which also escapes the single-Owner
- * index and the owner-delete trigger, unknown text, the empty string, a
- * non-string) has rank 0 and no capability. So does an unknown capability
- * name.
+ * Fails closed: only the exact stored strings "owner", "admin" and "staff"
+ * are Roles. Anything else (a mis-cased "Owner", unknown text, the empty
+ * string, a non-string) has rank 0 and no capability. So does an unknown
+ * capability name. The database stores no other role text
+ * (memberships_role_check, see applySchema()); parsing still fails closed,
+ * as defense in depth for a database that constraint has not reached.
  *
  * Pure and dependency-free (no I/O), so it is unit-tested without a database
  * (tests/roles.test.ts) and safe to import anywhere.
@@ -86,6 +86,27 @@ export function parseRole(raw: unknown): Role | null {
 export function roleRank(role: unknown): number {
   const parsed = parseRole(role);
   return parsed === null ? 0 : RANK[parsed];
+}
+
+/**
+ * The Role granted by the role text of every Membership row one person
+ * holds in one Store, or null for none.
+ *
+ * The database holds at most one such row, with valid role text
+ * (memberships_user_store_key and memberships_role_check, see
+ * applySchema()). This still fails closed on anything else, as defense in
+ * depth: with several rows, every row must hold a Role and the lowest one
+ * counts, so an extra row can only take authority away; one row that is not
+ * a Role means no Role at all.
+ */
+export function effectiveRole(storedRoles: readonly unknown[]): Role | null {
+  let lowest: Role | null = null;
+  for (const raw of storedRoles) {
+    const role = parseRole(raw);
+    if (role === null) return null;
+    if (lowest === null || RANK[role] < RANK[lowest]) lowest = role;
+  }
+  return lowest;
 }
 
 /** Whether `role` ranks at or above `minimum`. Not a Role: never. */

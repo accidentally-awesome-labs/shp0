@@ -18,8 +18,14 @@ import {
  * getMembershipRole is the database half of the Role check: the web layer
  * compares what it returns against a capability's minimum Role
  * (src/roles.ts). It must fail closed: no Membership, a Store that does not
- * exist, a malformed Store id and role text that is not exactly
- * owner/admin/staff all return null, which grants nothing.
+ * exist and a malformed Store id all return null, which grants nothing.
+ *
+ * Role text other than exactly owner/admin/staff, and several Memberships
+ * for one person in one Store, can no longer be stored
+ * (membership-constraints.test.ts). The read still fails closed on them as
+ * defense in depth: that rule, effectiveRole, is unit tested in
+ * roles.test.ts, and getMembershipRole is checked against such rows in
+ * membership-role-unconstrained.test.ts.
  */
 describe("getMembershipRole", () => {
   let pool: Pool;
@@ -42,17 +48,7 @@ describe("getMembershipRole", () => {
       sql`TRUNCATE memberships, stores, "user", "session", "account", "verification" CASCADE`,
     );
 
-    for (const name of [
-      "owner",
-      "admin",
-      "staff",
-      "outsider",
-      "misCasedOwner",
-      "garbage",
-      "empty",
-      "twoRoles",
-      "roleAndGarbage",
-    ]) {
+    for (const name of ["owner", "admin", "staff", "outsider"]) {
       users[name] = randomUUID();
       await db.execute(
         sql`INSERT INTO "user" (id, name, email) VALUES (${users[name]}, ${name}, ${`${name}@role.test`})`,
@@ -67,15 +63,6 @@ describe("getMembershipRole", () => {
 
     await addMembership(users.admin!, "admin");
     await addMembership(users.staff!, "staff");
-    // memberships.role is free text with no CHECK constraint, and nothing
-    // stops a second row for the same person and Store.
-    await addMembership(users.misCasedOwner!, "Owner");
-    await addMembership(users.garbage!, "garbage");
-    await addMembership(users.empty!, "");
-    await addMembership(users.twoRoles!, "admin");
-    await addMembership(users.twoRoles!, "staff");
-    await addMembership(users.roleAndGarbage!, "admin");
-    await addMembership(users.roleAndGarbage!, "garbage");
   });
 
   afterAll(async () => {
@@ -111,27 +98,9 @@ describe("getMembershipRole", () => {
     expect(await getMembershipRole("", storeId)).toBe(null);
   });
 
-  it.each([
-    ["mis-cased 'Owner'", "misCasedOwner"],
-    ["'garbage'", "garbage"],
-    ["the empty string", "empty"],
-  ])("fails closed on role text %s: null, so no capability at all", async (_label, user) => {
-    expect(await getMembershipRole(users[user]!, storeId)).toBe(null);
-  });
-
-  it("with several Memberships in one Store, grants only the lowest Role", async () => {
-    expect(await getMembershipRole(users.twoRoles!, storeId)).toBe("staff");
-  });
-
-  it("with several Memberships in one Store, fails closed if any role text is malformed", async () => {
-    expect(await getMembershipRole(users.roleAndGarbage!, storeId)).toBe(null);
-  });
-
-  it("authorizeStoreMembership (boolean) agrees: true only with a valid Role", async () => {
+  it("authorizeStoreMembership (boolean) agrees: true only with a Role in that Store", async () => {
     expect(await authorizeStoreMembership(users.staff!, storeId)).toBe(true);
     expect(await authorizeStoreMembership(users.outsider!, storeId)).toBe(false);
-    expect(await authorizeStoreMembership(users.garbage!, storeId)).toBe(false);
-    expect(await authorizeStoreMembership(users.misCasedOwner!, storeId)).toBe(false);
     expect(await authorizeStoreMembership(users.owner!, "not-a-uuid")).toBe(false);
   });
 });

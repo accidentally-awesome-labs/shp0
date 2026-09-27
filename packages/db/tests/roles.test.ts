@@ -11,6 +11,7 @@ import {
   minimumRole,
   can,
   decideStoreAccess,
+  effectiveRole,
 } from "../src/roles";
 import type { Capability, Role } from "../src/roles";
 
@@ -21,9 +22,10 @@ import type { Capability, Role } from "../src/roles";
  * Roles are ranked Owner > Admin > Staff, and a Role has its own capabilities
  * plus every lower Role's, so authorization is a rank comparison against a
  * capability's minimum Role. Anything that is not exactly one of the three
- * stored role strings grants nothing (fail closed): memberships.role is free
- * text with no CHECK constraint, and a mis-cased "Owner" escapes the
- * single-Owner index and the owner-delete trigger.
+ * stored role strings grants nothing (fail closed). The database refuses any
+ * other role text and a second Membership for one person in one Store
+ * (memberships_role_check, memberships_user_store_key); failing closed here
+ * as well is defense in depth.
  *
  * Pure: no database.
  */
@@ -125,6 +127,38 @@ describe("rank", () => {
 
   it("has a display label for every Role", () => {
     expect(ROLE_LABEL).toEqual({ owner: "Owner", admin: "Admin", staff: "Staff" });
+  });
+});
+
+describe("effectiveRole (every Membership row of one person in one Store)", () => {
+  it("is null with no row: no Membership", () => {
+    expect(effectiveRole([])).toBe(null);
+  });
+
+  it.each(["owner", "admin", "staff"] as const)("is the Role of a single %s row", (role) => {
+    expect(effectiveRole([role])).toBe(role);
+  });
+
+  it.each([
+    [["admin", "staff"], "staff"],
+    [["staff", "admin"], "staff"],
+    [["owner", "admin"], "admin"],
+    [["owner", "staff", "admin"], "staff"],
+    [["admin", "admin"], "admin"],
+  ] as const)("with several rows %j, grants only the lowest Role (%s)", (rows, expected) => {
+    expect(effectiveRole(rows)).toBe(expected);
+  });
+
+  it.each([
+    [["Owner"]],
+    [["garbage"]],
+    [[""]],
+    [["admin", "garbage"]],
+    [["garbage", "owner"]],
+    [["owner", "Owner"]],
+    [["staff", null]],
+  ])("fails closed on %j: one row that is not a Role means no Role", (rows) => {
+    expect(effectiveRole(rows)).toBe(null);
   });
 });
 
