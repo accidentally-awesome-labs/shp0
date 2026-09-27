@@ -1,10 +1,9 @@
 import { Suspense } from "react";
 import { notFound } from "next/navigation";
 
+import { readCartToken } from "@/lib/cart-token";
 import { resolveStorefrontStore } from "@/lib/current-store";
 import { getDbCart, formatMoney, listPublishedProducts } from "@shp0/db";
-import { cookies } from "next/headers";
-import { randomUUID } from "node:crypto";
 import CartActions from "./cart-actions";
 
 export const instant = false;
@@ -13,14 +12,9 @@ async function CartView() {
   const storeId = await resolveStorefrontStore();
   if (!storeId) notFound();
 
-  // Get the anon cart token (same logic as the cart action).
-  const cookieStore = await cookies();
-  let token = cookieStore.get("shp0_cart_token")?.value;
-  if (!token) {
-    token = randomUUID();
-  }
-
-  const cart = await getDbCart(storeId, token);
+  // No cart token yet: an empty Cart (pages cannot set the cookie).
+  const token = await readCartToken();
+  const cart = token === null ? { storeId, lines: [] } : await getDbCart(storeId, token);
 
   // Fetch prices for the cart items.
   const products = await listPublishedProducts(storeId);

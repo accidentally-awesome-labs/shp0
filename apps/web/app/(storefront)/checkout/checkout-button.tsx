@@ -14,9 +14,14 @@ export default function CheckoutButton() {
     setLoading(true);
     try {
       const result = await checkoutAction();
+      if (!result.ok) {
+        setError(result.error);
+        return;
+      }
       router.push(`/order/${result.orderId}`);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Checkout failed");
+    } catch {
+      // A thrown error's message is a digest in production: say something useful.
+      setError("Checkout failed. Please try again.");
     } finally {
       setLoading(false);
     }

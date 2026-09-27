@@ -117,14 +117,15 @@ const PAGE_GUARD_MODULE = "@/lib/current-store";
  */
 export const PUBLIC_ACTIONS = new Map([
   // Storefront Cart and checkout: the Store comes from the request host (never
-  // an argument) and the Cart from the shopper's own httpOnly cookie.
+  // an argument) and the Cart from the shopper's own httpOnly cookie. The
+  // arguments are parsed before any query (parseCartChange in @shp0/db).
   [
     "apps/web/app/actions/cart.ts#addToCart",
-    "storefront: the Store is the request host's, the Cart the shopper's own cookie",
+    "storefront: the Store is the request host's, the Cart the shopper's own cookie; only a published Variant of that Store, quantity 1-99",
   ],
   [
     "apps/web/app/actions/cart.ts#updateCartItem",
-    "storefront: the Store is the request host's, the Cart the shopper's own cookie",
+    "storefront: the Store is the request host's, the Cart the shopper's own cookie; only a published Variant of that Store, quantity 0-99",
   ],
   [
     "apps/web/app/actions/cart.ts#removeCartItem",
@@ -136,7 +137,7 @@ export const PUBLIC_ACTIONS = new Map([
   ],
   [
     "apps/web/app/actions/checkout.ts#checkoutAction",
-    "storefront: checks out the shopper's own Cart (cookie) in the request host's Store",
+    "storefront: checks out the shopper's own Cart (cookie) in the request host's Store, re-validating every line",
   ],
   // Storefront Customer identity (a separate identity domain from Merchants).
   [
