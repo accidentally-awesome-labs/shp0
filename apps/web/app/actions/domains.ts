@@ -1,31 +1,56 @@
 "use server";
 
-import { headers } from "next/headers";
+import { revalidatePath } from "next/cache";
 
-import { auth } from "@/lib/auth";
 import { resolveDashboardStore } from "@/lib/current-store";
-import { addCustomDomain, listCustomDomains, applyDomainVerification } from "@shp0/db";
+import {
+  addCustomDomain,
+  listCustomDomains,
+  applyDomainVerification,
+  InvalidCustomDomainError,
+} from "@shp0/db";
 
-export async function addDomainAction(storeId: string, formData: FormData) {
+// Every action here is a public endpoint: each one authorizes the Merchant for
+// the Store (Membership) before touching data, and every DB call is scoped by
+// that Store's id.
+//
+// There is deliberately no "verify" action. A Custom Domain may only become
+// verified through proof of DNS control, and automatic verification is not
+// built yet (Issue #58), so nothing here can mark a domain verified.
+
+async function authorize(storeId: string): Promise<void> {
   const resolved = await resolveDashboardStore(storeId);
   if (!resolved) throw new Error("Not authorized for this store");
-
-  const session = await auth.api.getSession({ headers: await headers() });
-  if (!session) throw new Error("Not authenticated");
-
-  const hostname = formData.get("hostname") as string;
-  await addCustomDomain(storeId, hostname);
 }
 
-export async function verifyDomainAction(domainId: string) {
-  // Manual verify trigger (in production: the DNS check job does this).
-  await applyDomainVerification(domainId, "dns_ok");
+export async function addDomainAction(
+  storeId: string,
+  _previous: { error: string | null; hostname: string },
+  formData: FormData,
+): Promise<{ error: string | null; hostname: string }> {
+  await authorize(storeId);
+
+  const raw = formData.get("hostname");
+  const hostname = typeof raw === "string" ? raw : "";
+  try {
+    await addCustomDomain(storeId, hostname);
+  } catch (error) {
+    if (error instanceof InvalidCustomDomainError) return { error: error.message, hostname };
+    throw error;
+  }
+
+  revalidatePath(`/dashboard/${storeId}/domains`);
+  return { error: null, hostname: "" };
 }
 
-export async function retryDomainAction(domainId: string) {
-  await applyDomainVerification(domainId, "retry");
+export async function retryDomainAction(storeId: string, domainId: string) {
+  await authorize(storeId);
+  // Scoped by store and domain: another Store's domain id changes nothing.
+  await applyDomainVerification(storeId, domainId, "retry");
+  revalidatePath(`/dashboard/${storeId}/domains`);
 }
 
 export async function getDashboardDomains(storeId: string) {
+  await authorize(storeId);
   return listCustomDomains(storeId);
 }

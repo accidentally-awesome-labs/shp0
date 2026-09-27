@@ -21,6 +21,17 @@ export { checkUsagePolicy, TIERS } from "./billing";
 export type { Tier, TierLimits, Usage, UsageAction, UsagePolicy } from "./billing";
 export { transitionStoreStatus } from "./store-status";
 export type { StoreStatus, StoreEvent, StoreStatusResult } from "./store-status";
+export {
+  PLATFORM_DOMAIN,
+  parseSubdomain,
+  normalizeRequestHost,
+  isPlatformHost,
+  validateCustomDomain,
+  customDomainRejectionMessage,
+  routeStorefrontHost,
+  InvalidCustomDomainError,
+} from "./hostname";
+export type { CustomDomainRejection, CustomDomainValidation, StorefrontHostRoute } from "./hostname";
 export { transitionDomainVerification } from "./domain-verification";
 export type {
   DomainVerificationStatus,
@@ -710,36 +721,8 @@ export async function checkSubdomainAvailable(
 // storeId; these functions decide which storeId a request may even be in.
 // ─────────────────────────────────────────────────────────────────────────
 
-/** Subdomains reserved for the platform itself, never a Store. */
-const RESERVED_SUBDOMAINS = new Set(["app", "www", "dashboard", "api", "mail"]);
-
-/**
- * Parse a request host and extract the Store subdomain, if any.
- *
- * Pure function — no DB call. Returns the subdomain string for a Store host
- * like "acme.shp0.dev", or null for the platform domain, localhost/dev, and
- * reserved subdomains (app, www, dashboard, api, mail).
- */
-export function parseSubdomain(
-  host: string,
-  platformDomain: string = "shp0.dev",
-): string | null {
-  // Strip port if present (e.g. "localhost:3000").
-  const hostname = host.split(":")[0]!;
-
-  // Must end with the platform domain.
-  if (!hostname.endsWith(`.${platformDomain}`)) return null;
-
-  const subdomain = hostname.slice(0, hostname.length - platformDomain.length - 1);
-
-  // No subdomain = the platform domain itself.
-  if (!subdomain) return null;
-
-  // Reserved subdomains are platform, not a Store.
-  if (RESERVED_SUBDOMAINS.has(subdomain)) return null;
-
-  return subdomain;
-}
+// Pure host parsing (parseSubdomain, the platform domain, Custom Domain
+// hostname rules) lives in ./hostname so it can be unit tested without a DB.
 
 /**
  * Check whether a Merchant (user) holds an active Membership for the given Store.
@@ -2199,45 +2182,65 @@ export async function applyStoreStatusAction(
 // ─────────────────────────────────────────────────────────────────────────
 // Custom Domains — host→Store mapping + verification lifecycle (Issue #14).
 //
-// PLATFORM table (no RLS) — the host-to-Store resolution runs before we know
-// the Store. Only VERIFIED domains resolve to a Store (security).
+// PLATFORM table (no RLS, no grant to "default") — the host-to-Store
+// resolution runs before we know the Store. Only VERIFIED domains resolve to a
+// Store (security). Because RLS does not scope this table, every per-Store
+// read or write below carries an explicit `store_id` predicate; the caller
+// must already have authorized the Merchant for that Store.
 // ─────────────────────────────────────────────────────────────────────────
 
 import { transitionDomainVerification } from "./domain-verification";
 import type { DomainVerificationStatus, DomainVerificationEvent } from "./domain-verification";
+import {
+  InvalidCustomDomainError,
+  customDomainRejectionMessage,
+  routeStorefrontHost,
+  validateCustomDomain,
+} from "./hostname";
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Add a Custom Domain to a Store (starts as 'pending').
+ *
+ * The hostname is validated and normalized first (see validateCustomDomain):
+ * the platform domain and its subdomains, URLs, IP literals, wildcards and
+ * other malformed names throw InvalidCustomDomainError and store nothing. So
+ * does a hostname that is already stored, for this Store or another one
+ * (reason "already_added").
  * Detects apex vs subdomain automatically.
  */
 export async function addCustomDomain(
   storeId: string,
   hostname: string,
 ): Promise<{ id: string; txtVerificationValue: string }> {
+  const validated = validateCustomDomain(hostname);
+  if (!validated.ok) throw new InvalidCustomDomainError(validated.reason, validated.message);
+  const normalized = validated.hostname;
+
   // Detect apex: a hostname with no dots (after the TLD) is apex.
   // Simple heuristic: if it has exactly 1 dot (e.g. "acme.com") it's apex.
   // If it has 2+ dots (e.g. "shop.acme.com") it's a subdomain.
-  const dotCount = (hostname.match(/\./g) || []).length;
+  const dotCount = (normalized.match(/\./g) || []).length;
   const isApex = dotCount === 1;
   const txtValue = `shp0-verify=${randomUUID()}`;
 
-  return platformClient(async (tx) => {
+  const id = await platformClient(async (tx) => {
+    // hostname is UNIQUE across all Stores. A hostname that is already stored
+    // inserts nothing, and is reported as a typed error instead of a raw
+    // unique violation.
     const rows = await tx.execute(
-      sql`INSERT INTO custom_domains (store_id, hostname, is_apex, txt_verification_value) VALUES (${storeId}, ${hostname}, ${isApex}, ${txtValue}) RETURNING id`,
+      sql`INSERT INTO custom_domains (store_id, hostname, is_apex, txt_verification_value) VALUES (${storeId}, ${normalized}, ${isApex}, ${txtValue}) ON CONFLICT (hostname) DO NOTHING RETURNING id`,
     );
-    return { id: (rows.rows[0] as { id: string }).id, txtVerificationValue: txtValue };
+    return (rows.rows[0] as { id: string } | undefined)?.id;
   });
+  if (!id) {
+    throw new InvalidCustomDomainError("already_added", customDomainRejectionMessage("already_added"));
+  }
+  return { id, txtVerificationValue: txtValue };
 }
 
-/**
- * Resolve a host to a Store — ONLY if the domain is VERIFIED.
- * Returns null for pending/failed/unknown hosts (no Current Store = security).
- *
- * This is the host-to-Store resolution seam (complements resolveStoreBySubdomain).
- */
-export async function resolveStoreByCustomDomain(
-  hostname: string,
-): Promise<string | null> {
+async function findVerifiedCustomDomainStore(hostname: string): Promise<string | null> {
   return platformClient(async (tx) => {
     const rows = await tx.execute(
       sql`SELECT store_id FROM custom_domains WHERE hostname = ${hostname} AND verification_status = 'verified' LIMIT 1`,
@@ -2248,20 +2251,64 @@ export async function resolveStoreByCustomDomain(
 }
 
 /**
- * Apply a verification result to a custom domain (via the pure state machine).
- * This is called by the DNS verification job (HITL) or manual verification.
+ * Resolve a host to a Store — ONLY if the domain is VERIFIED.
+ * Returns null for pending/failed/unknown hosts (no Current Store = security).
+ *
+ * The host is normalized first (lowercase, port and one trailing dot
+ * stripped). The platform domain and its subdomains always return null: they
+ * are never resolved through the Custom Domain table, whatever it holds.
+ */
+export async function resolveStoreByCustomDomain(
+  host: string,
+): Promise<string | null> {
+  const route = routeStorefrontHost(host);
+  if (route.kind !== "custom_domain") return null;
+  return findVerifiedCustomDomainStore(route.hostname);
+}
+
+/**
+ * Resolve a storefront request host to a Store (ADR-0005 resolution order).
+ *
+ * The platform domain and its subdomains are decided by Subdomain resolution
+ * only; any other host by a VERIFIED Custom Domain only. See
+ * routeStorefrontHost for the pure decision.
+ */
+export async function resolveStoreByHost(host: string): Promise<string | null> {
+  const route = routeStorefrontHost(host);
+  switch (route.kind) {
+    case "subdomain":
+      return resolveStoreBySubdomain(route.subdomain);
+    case "custom_domain":
+      return findVerifiedCustomDomainStore(route.hostname);
+    case "none":
+      return null;
+  }
+}
+
+/**
+ * Apply a verification result to one of a Store's custom domains (via the
+ * pure state machine). Intended for the DNS verification job; the dashboard
+ * only sends "retry".
+ *
+ * Scoped by BOTH store id and domain id: a domain that belongs to another
+ * Store is reported exactly like one that does not exist ("not_found"), and
+ * is left unchanged.
  */
 export async function applyDomainVerification(
+  storeId: string,
   domainId: string,
   event: DomainVerificationEvent,
-): Promise<{ ok: true; status: DomainVerificationStatus } | { ok: false; reason: "invalid_transition" }> {
+): Promise<
+  | { ok: true; status: DomainVerificationStatus }
+  | { ok: false; reason: "invalid_transition" | "not_found" }
+> {
+  if (!UUID.test(storeId) || !UUID.test(domainId)) return { ok: false, reason: "not_found" };
+
   return platformClient(async (tx) => {
     const rows = await tx.execute(
-      sql`SELECT verification_status FROM custom_domains WHERE id = ${domainId} LIMIT 1`,
+      sql`SELECT verification_status FROM custom_domains WHERE id = ${domainId} AND store_id = ${storeId} LIMIT 1`,
     );
-    if (rows.rows.length === 0) {
-      throw new Error(`Custom domain ${domainId} not found`);
-    }
+    if (rows.rows.length === 0) return { ok: false, reason: "not_found" } as const;
     const current = rows.rows[0]!.verification_status as DomainVerificationStatus;
 
     const result = transitionDomainVerification(current, event);
@@ -2269,25 +2316,47 @@ export async function applyDomainVerification(
 
     const lastVerified = result.status === "verified" ? sql`now()` : sql`last_verified_at`;
     await tx.execute(
-      sql`UPDATE custom_domains SET verification_status = ${result.status}, last_verified_at = ${lastVerified}, updated_at = now() WHERE id = ${domainId}`,
+      sql`UPDATE custom_domains SET verification_status = ${result.status}, last_verified_at = ${lastVerified}, updated_at = now() WHERE id = ${domainId} AND store_id = ${storeId}`,
     );
 
-    return { ok: true, status: result.status };
+    return { ok: true, status: result.status } as const;
   });
 }
 
 /**
- * List all custom domains for a Store (dashboard view).
+ * List all custom domains for a Store (dashboard view), with the TXT value
+ * the Merchant is asked to publish.
  */
 export async function listCustomDomains(
   storeId: string,
-): Promise<Array<{ id: string; hostname: string; verificationStatus: string; isApex: boolean }>> {
+): Promise<
+  Array<{
+    id: string;
+    hostname: string;
+    verificationStatus: string;
+    isApex: boolean;
+    txtVerificationValue: string | null;
+  }>
+> {
   return platformClient(async (tx) => {
     const rows = await tx.execute(
-      sql`SELECT id, hostname, verification_status, is_apex FROM custom_domains WHERE store_id = ${storeId} ORDER BY created_at DESC`,
+      sql`SELECT id, hostname, verification_status, is_apex, txt_verification_value FROM custom_domains WHERE store_id = ${storeId} ORDER BY created_at DESC`,
     );
-    return (rows.rows as Array<{ id: string; hostname: string; verification_status: string; is_apex: boolean }>)
-      .map((r) => ({ id: r.id, hostname: r.hostname, verificationStatus: r.verification_status, isApex: r.is_apex }));
+    return (
+      rows.rows as Array<{
+        id: string;
+        hostname: string;
+        verification_status: string;
+        is_apex: boolean;
+        txt_verification_value: string | null;
+      }>
+    ).map((r) => ({
+      id: r.id,
+      hostname: r.hostname,
+      verificationStatus: r.verification_status,
+      isApex: r.is_apex,
+      txtVerificationValue: r.txt_verification_value,
+    }));
   });
 }
 
