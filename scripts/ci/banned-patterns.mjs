@@ -27,6 +27,26 @@ export const RULES = [
     pattern: /\bapplySchema\s*\(/,
     ignoreLine: /^\s*(?:\/\/|\*|\/\*)|\bfunction\s+applySchema\s*\(/,
   },
+  // The storefront's Order and Cart fixes live in @shp0/db; these keep app
+  // code from calling around them. Store dashboard pages are gated by
+  // authorizeStorePage (scripts/ci/action-guard.mjs), so they may read any
+  // Order of their Store; a Merchant action that needs getOrder must be
+  // reviewed and added to allowPath.
+  {
+    id: "no-store-wide-order-read-in-app",
+    why: "getOrder returns ANY Order of the Store to whoever asks; storefront code uses getStorefrontOrder / getOrderForCheckout, which require the cart token that placed the Order",
+    files: /^apps\/.*\.[cm]?[jt]sx?$/,
+    allowPath: /^apps\/web\/app\/dashboard\//,
+    pattern: /\bgetOrder\s*\(/,
+    ignoreLine: /^\s*(?:\/\/|\*|\/\*)/,
+  },
+  {
+    id: "no-unvalidated-cart-write-in-app",
+    why: "saveDbCartLines and getOrCreateDbCart store any Variant id and quantity unchecked; storefront Cart changes go through changeDbCart (a published Variant of the Store, quantity 1 to MAX_LINE_QUANTITY)",
+    files: /^apps\/.*\.[cm]?[jt]sx?$/,
+    pattern: /\b(?:saveDbCartLines|getOrCreateDbCart)\s*\(/,
+    ignoreLine: /^\s*(?:\/\/|\*|\/\*)/,
+  },
 ];
 
 // These two files necessarily contain the patterns they ban.

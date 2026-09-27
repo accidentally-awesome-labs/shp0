@@ -2,6 +2,7 @@
 
 import type Stripe from "stripe";
 
+import { readCartToken } from "@/lib/cart-token";
 import { authorizeStore, resolveStorefrontStore } from "@/lib/current-store";
 import {
   getPaymentAccount,
@@ -32,19 +33,23 @@ export async function onboardConnectAction(storeId: string): Promise<{ url: stri
   return { url };
 }
 
+// Storefront: pay for an Order of the request host's Store. Only the request
+// carrying the cart token that placed the Order (its own shp0_cart_token
+// cookie) may: getOrderForCheckout matches both in one query, so no token,
+// another shopper's token and a nonexistent Order all read "Order not found".
 export async function createCheckoutSessionAction(orderId: string): Promise<{ url: string }> {
   const storeId = await resolveStorefrontStore();
   if (!storeId) throw new Error("No store resolved");
 
-  const account = await getPaymentAccount(storeId);
-  if (!account || !account.chargesEnabled) {
-    throw new Error("Store has not completed Stripe onboarding");
-  }
-
-  const order = await getOrderForCheckout(storeId, orderId);
+  const order = await getOrderForCheckout(storeId, orderId, await readCartToken());
   if (!order) throw new Error("Order not found");
   if (order.paymentStatus !== "pending") {
     throw new Error("Order is not pending payment");
+  }
+
+  const account = await getPaymentAccount(storeId);
+  if (!account || !account.chargesEnabled) {
+    throw new Error("Store has not completed Stripe onboarding");
   }
 
   const commissionBps = await getStoreCommissionBps(storeId);
@@ -53,7 +58,7 @@ export async function createCheckoutSessionAction(orderId: string): Promise<{ ur
     order,
     commissionBps,
     connectAccountId: account.connectAccountId,
-    successUrl: `${process.env.NEXT_PUBLIC_APP_URL}/order/${orderId}`,
+    successUrl: `${process.env.NEXT_PUBLIC_APP_URL}/order/${order.id}`,
     cancelUrl: `${process.env.NEXT_PUBLIC_APP_URL}/checkout`,
   });
 

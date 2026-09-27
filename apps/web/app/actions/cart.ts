@@ -1,78 +1,68 @@
 "use server";
 
-import { cookies } from "next/headers";
-import { randomUUID } from "node:crypto";
-
+import { newCartToken, readCartToken, setCartTokenCookie } from "@/lib/cart-token";
 import { resolveStorefrontStore } from "@/lib/current-store";
 import {
+  cartChangeRejectionMessage,
+  changeDbCart,
   getDbCart,
-  saveDbCartLines,
-  addLine,
-  updateLine,
-  removeLine,
+  parseCartChange,
   type Cart,
+  type ParsedCartChange,
 } from "@shp0/db";
 
-const ANON_CART_COOKIE = "shp0_cart_token";
-
 /**
- * Get or create the anonymous cart token (cookie). This is used as the
- * `customer_id` in the DB for now — a simple approach that works without Vercel
- * KV. When KV is set up (HITL), swap this to read/write from KV instead.
+ * Storefront Cart actions. The Store is the request host's and the Cart the
+ * shopper's own cart-token cookie; nothing about either comes from the
+ * arguments.
+ *
+ * Every export is callable over HTTP with ANY arguments (any JSON value), so
+ * the arguments are parsed first (parseCartChange: a UUID Variant id and a
+ * whole quantity from 1 to MAX_LINE_QUANTITY, or 0 to remove), before any
+ * query runs. changeDbCart then accepts only a Variant of a published Product
+ * of this Store and writes the change in one transaction.
+ *
+ * A shopper without a cart token gets one only when an add is accepted: a
+ * refused change stores nothing, so it sets no cookie either (a cookie set by
+ * an action makes Next re-render the page in the response, which for an
+ * unpublished Product is a not-found page instead of the message).
+ *
+ * A refusal is returned, not thrown: production builds replace a thrown
+ * error's message with a digest, and the shopper should see why.
  */
-async function getCartToken(): Promise<string> {
-  const cookieStore = await cookies();
-  let token = cookieStore.get(ANON_CART_COOKIE)?.value;
-  if (!token) {
-    token = randomUUID();
-    cookieStore.set(ANON_CART_COOKIE, token, {
-      httpOnly: true,
-      sameSite: "lax",
-      maxAge: 60 * 60 * 24 * 30, // 30 days
-    });
-  }
-  return token;
-}
+export type CartActionResult = { ok: true } | { ok: false; error: string };
 
-/**
- * Get the storeId for the current storefront request.
- * In local dev (no subdomain), returns null — cart actions need a resolved store.
- */
-async function requireStoreId(): Promise<string> {
+const STORE_UNAVAILABLE = "This store is not available.";
+
+async function applyToCart(parsed: ParsedCartChange): Promise<CartActionResult> {
+  if (!parsed.ok) return { ok: false, error: cartChangeRejectionMessage(parsed.reason) };
   const storeId = await resolveStorefrontStore();
-  if (!storeId) throw new Error("No store resolved for this request");
-  return storeId;
+  if (!storeId) return { ok: false, error: STORE_UNAVAILABLE };
+  const existing = await readCartToken();
+  const token = existing ?? newCartToken();
+  const result = await changeDbCart(storeId, token, parsed.change);
+  if (!result.ok) return { ok: false, error: cartChangeRejectionMessage(result.reason) };
+  // Only an add creates a Cart; set and remove without a token change nothing.
+  if (existing === null && parsed.change.kind === "add") await setCartTokenCookie(token);
+  return { ok: true };
 }
 
-export async function addToCart(variantId: string, quantity: number = 1) {
-  const storeId = await requireStoreId();
-  const token = await getCartToken();
-
-  const cart = await getDbCart(storeId, token);
-  const updated = addLine(cart, { variantId, quantity });
-  await saveDbCartLines(storeId, token, updated.lines);
+export async function addToCart(variantId: string, quantity: number = 1): Promise<CartActionResult> {
+  return applyToCart(parseCartChange("add", variantId, quantity));
 }
 
-export async function updateCartItem(variantId: string, quantity: number) {
-  const storeId = await requireStoreId();
-  const token = await getCartToken();
-
-  const cart = await getDbCart(storeId, token);
-  const updated = updateLine(cart, { variantId, quantity });
-  await saveDbCartLines(storeId, token, updated.lines);
+/** Set a line's quantity; 0 removes the line. */
+export async function updateCartItem(variantId: string, quantity: number): Promise<CartActionResult> {
+  return applyToCart(parseCartChange("set", variantId, quantity));
 }
 
-export async function removeCartItem(variantId: string) {
-  const storeId = await requireStoreId();
-  const token = await getCartToken();
-
-  const cart = await getDbCart(storeId, token);
-  const updated = removeLine(cart, variantId);
-  await saveDbCartLines(storeId, token, updated.lines);
+export async function removeCartItem(variantId: string): Promise<CartActionResult> {
+  return applyToCart(parseCartChange("remove", variantId));
 }
 
 export async function getCart(): Promise<Cart> {
-  const storeId = await requireStoreId();
-  const token = await getCartToken();
-  return getDbCart(storeId, token);
+  const storeId = await resolveStorefrontStore();
+  if (!storeId) throw new Error("No store resolved for this request");
+  const token = await readCartToken();
+  return token === null ? { storeId, lines: [] } : getDbCart(storeId, token);
 }

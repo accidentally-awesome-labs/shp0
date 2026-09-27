@@ -1,14 +1,41 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
-import { eq, sql, and } from "drizzle-orm";
+import { eq, sql, and, inArray } from "drizzle-orm";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import * as schema from "./schema";
 
 export * as schema from "./schema";
 export { parseMoney, formatMoney, applyPercent } from "./money";
-export { addLine, updateLine, removeLine, computeSubtotal, mergeCarts } from "./cart";
-export type { Cart, CartLine } from "./cart";
+export {
+  addLine,
+  updateLine,
+  removeLine,
+  computeSubtotal,
+  mergeCarts,
+  MAX_LINE_QUANTITY,
+  isValidLineQuantity,
+  parseCartChange,
+  applyCartChange,
+  priceCartForCheckout,
+  cartChangeRejectionMessage,
+  checkoutRejectionMessage,
+  CheckoutError,
+} from "./cart";
+export type {
+  Cart,
+  CartLine,
+  CartChange,
+  CartChangeRejection,
+  CartChangeResult,
+  ParsedCartChange,
+  CheckoutVariant,
+  CheckoutLineProblem,
+  CheckoutRejection,
+  PricedCart,
+} from "./cart";
+export { isUuid } from "./ids";
 export { transitionPayment, transitionFulfillment, isOrderOpen } from "./order";
 export type { PaymentStatus, FulfillmentStatus } from "./order";
 export { computeApplicationFee, buildCheckoutSessionParams } from "./payments";
@@ -54,7 +81,9 @@ export {
 export type { Role, Capability, StoreAccessDecision } from "./roles";
 export type { Customer, NewCustomer } from "./schema";
 export type { Store, NewStore, Membership, NewMembership, Product, NewProduct, Variant, NewVariant, CartRow, NewCart, CartItem, NewCartItem, Order, NewOrder, OrderLine, NewOrderLine, Collection, NewCollection } from "./schema";
-import type { Cart, CartLine } from "./cart";
+import type { Cart, CartChange, CartChangeResult, CartLine, CheckoutVariant } from "./cart";
+import { applyCartChange, CheckoutError, parseCartChange, priceCartForCheckout } from "./cart";
+import { isUuid, UUID_PATTERN as UUID } from "./ids";
 import { parseRole, roleRank } from "./roles";
 import type { Role } from "./roles";
 
@@ -71,9 +100,6 @@ const TENANT_DATABASE_URL =
 const PLATFORM_DATABASE_URL =
   process.env.PLATFORM_DATABASE_URL ??
   "postgresql:///shp0_test?user=cloud_admin";
-
-/** A Store id, domain id etc.: anything else is rejected before it reaches SQL. */
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 let tenantPool: Pool | null = null;
 let platformPool: Pool | null = null;
@@ -92,17 +118,45 @@ function getPlatformPool(): Pool {
 type Tx = NodePgDatabase<typeof schema>;
 
 /**
+ * Which client callback, if any, the current async call chain is running in.
+ *
+ * Both pools keep pg's default size (10 connections) and are shared by every
+ * Store. A callback that opens another client holds one connection while it
+ * waits for a second: ten such calls at once take every connection and then
+ * wait forever for an eleventh, which wedges the pool for all Stores (a burst
+ * of add-to-cart requests did exactly this). So nesting is refused outright,
+ * on the first call and not only under load: work inside a callback uses the
+ * `tx` it was given, through helpers that take a Tx.
+ */
+const openClient = new AsyncLocalStorage<string>();
+
+function refuseNestedClient(name: string): void {
+  const outer = openClient.getStore();
+  if (outer !== undefined) {
+    throw new Error(
+      `${name}() was called inside another database client (a ${outer}() callback). ` +
+        "That holds two pool connections at once and deadlocks the shared pool under load: " +
+        "use the transaction the outer callback was given (pass its tx to a helper).",
+    );
+  }
+}
+
+/**
  * Run `fn` against the current Store's data, scoped by the database itself.
  *
  * `app.store_id` is set with `SET LOCAL` inside a transaction, so the GUC is
  * structurally inseparable from the query and resets at COMMIT. RLS policies
  * enforce `current_setting('app.store_id', true) = store_id`; with the GUC unset
  * the policy matches zero rows (fail-closed). This is the only tenant query path.
+ *
+ * `fn` must not open another client (tenantClient or platformClient, directly
+ * or through an exported function): that throws, see refuseNestedClient.
  */
 export async function tenantClient<T>(
   storeId: string,
   fn: (tx: Tx) => Promise<T>,
 ): Promise<T> {
+  refuseNestedClient("tenantClient");
   const client = await getTenantPool().connect();
   try {
     await client.query("BEGIN");
@@ -110,7 +164,7 @@ export async function tenantClient<T>(
     // unlike SET, accepts a bind parameter — so the store id is never string-built.
     await client.query("SELECT set_config('app.store_id', $1, true)", [storeId]);
     const tx = drizzle(client, { schema });
-    const result = await fn(tx);
+    const result = await openClient.run("tenantClient", () => fn(tx));
     await client.query("COMMIT");
     return result;
   } catch (error) {
@@ -125,14 +179,17 @@ export async function tenantClient<T>(
  * Run `fn` with cross-Store access, bypassing RLS (the `cloud_admin` role).
  * Reserved for platform operations — operator admin, analytics, Store creation.
  * Never used to serve a single Store.
+ *
+ * Like tenantClient, `fn` must not open another client.
  */
 export async function platformClient<T>(
   fn: (tx: Tx) => Promise<T>,
 ): Promise<T> {
+  refuseNestedClient("platformClient");
   const client = await getPlatformPool().connect();
   try {
     const tx = drizzle(client, { schema });
-    return await fn(tx);
+    return await openClient.run("platformClient", () => fn(tx));
   } finally {
     client.release();
   }
@@ -1068,6 +1125,127 @@ export function storeProductsTag(storeId: string): string {
 // these functions persist/restore it.
 // ─────────────────────────────────────────────────────────────────────────
 
+// The helpers below take the transaction their caller already holds (never a
+// Store id to open their own), so one cart operation is one pool connection.
+
+/**
+ * The id of the Customer's cart in the transaction's Store, row-locked until
+ * the transaction ends, or null if there is none. The lock serializes writes
+ * to one Cart (two tabs, a double click), so none is lost.
+ */
+async function lockCart(tx: Tx, customerId: string): Promise<string | null> {
+  const rows = await tx.execute(
+    sql`SELECT id FROM carts WHERE customer_id = ${customerId} LIMIT 1 FOR UPDATE`,
+  );
+  return rows.rows.length > 0 ? (rows.rows[0]!.id as string) : null;
+}
+
+/**
+ * lockCart, creating the Cart first if there is none.
+ *
+ * The create is one upsert on the one-cart-per-customer unique index, and
+ * Postgres guarantees an ON CONFLICT DO UPDATE either inserts or updates
+ * (and so row-locks) even under concurrency: when another write created the
+ * Cart first, this waits for it and locks that row; when a checkout deleted
+ * that row meanwhile, it inserts a fresh Cart. (DO NOTHING followed by a
+ * second lockCart could find neither and fail the add.) The update only
+ * touches updated_at.
+ */
+async function lockOrCreateCart(tx: Tx, storeId: string, customerId: string): Promise<string> {
+  const existing = await lockCart(tx, customerId);
+  if (existing !== null) return existing;
+  // store_id is stamped from the transaction's GUC by the trigger (ADR-0001).
+  const upserted = await tx.execute(
+    sql`INSERT INTO carts (store_id, customer_id) VALUES (${storeId}, ${customerId})
+        ON CONFLICT (store_id, customer_id) DO UPDATE SET updated_at = now() RETURNING id`,
+  );
+  return upserted.rows[0]!.id as string;
+}
+
+/** A cart's lines in the order they were first added (created_at, see the writers below). */
+async function readCartLines(tx: Tx, cartId: string): Promise<CartLine[]> {
+  const rows = await tx.execute(
+    sql`SELECT variant_id, quantity FROM cart_items WHERE cart_id = ${cartId} ORDER BY created_at, id`,
+  );
+  return (rows.rows as Array<{ variant_id: string; quantity: number }>).map((r) => ({
+    variantId: r.variant_id,
+    quantity: r.quantity,
+  }));
+}
+
+/**
+ * Replace a cart's items with `lines`, one row per line in order: each row
+ * gets its own clock_timestamp() as created_at (now() is the same for a whole
+ * transaction), so readCartLines returns them in this order.
+ */
+async function writeCartLines(tx: Tx, storeId: string, cartId: string, lines: CartLine[]): Promise<void> {
+  await tx.delete(schema.cartItems).where(eq(schema.cartItems.cartId, cartId));
+  for (const line of lines) {
+    await tx.execute(
+      sql`INSERT INTO cart_items (store_id, cart_id, variant_id, quantity, created_at)
+          VALUES (${storeId}, ${cartId}, ${line.variantId}, ${line.quantity}, clock_timestamp())`,
+    );
+  }
+}
+
+/**
+ * Set one Variant's line in a cart to `quantity`, or remove it (null). The
+ * line keeps its place (the created_at of its earliest row); a new line goes
+ * last. Rows for the Variant are collapsed into one, so a duplicate left by
+ * older code does not survive a change to it.
+ */
+async function writeCartLine(
+  tx: Tx,
+  storeId: string,
+  cartId: string,
+  variantId: string,
+  quantity: number | null,
+): Promise<void> {
+  if (quantity === null) {
+    await tx.execute(sql`DELETE FROM cart_items WHERE cart_id = ${cartId} AND variant_id = ${variantId}`);
+    return;
+  }
+  await tx.execute(
+    sql`WITH gone AS (
+          DELETE FROM cart_items WHERE cart_id = ${cartId} AND variant_id = ${variantId} RETURNING created_at
+        )
+        INSERT INTO cart_items (store_id, cart_id, variant_id, quantity, created_at)
+        SELECT ${storeId}, ${cartId}, ${variantId}, ${quantity},
+               coalesce((SELECT min(created_at) FROM gone), clock_timestamp())`,
+  );
+}
+
+/**
+ * Whether `variantId` is a Variant of a PUBLISHED Product in the
+ * transaction's Store. One query; RLS scopes both tables to the Store, so
+ * another Store's Variant is not found, exactly like an unknown id.
+ */
+async function isAvailableVariant(tx: Tx, variantId: string): Promise<boolean> {
+  const rows = await tx.execute(
+    sql`SELECT 1 FROM variants v JOIN products p ON p.id = v.product_id
+        WHERE v.id = ${variantId} AND p.status = 'published' LIMIT 1`,
+  );
+  return rows.rows.length > 0;
+}
+
+/** Price and published state of the given Variants the transaction's Store can see (RLS). */
+async function readCheckoutVariants(tx: Tx, variantIds: string[]): Promise<Map<string, CheckoutVariant>> {
+  const ids = [...new Set(variantIds)];
+  if (ids.length === 0) return new Map();
+  const rows = await tx
+    .select({
+      id: schema.variants.id,
+      priceCents: schema.variants.priceCents,
+      status: schema.products.status,
+    })
+    .from(schema.variants)
+    .innerJoin(schema.products, eq(schema.products.id, schema.variants.productId))
+    .where(inArray(schema.variants.id, ids));
+  return new Map(
+    rows.map((r) => [r.id, { priceCents: r.priceCents, published: r.status === "published" }]),
+  );
+}
+
 /**
  * Get or create a Customer's cart for the given Store. Returns the cart id.
  * One cart per customer per store (enforced by a unique index).
@@ -1076,21 +1254,7 @@ export async function getOrCreateDbCart(
   storeId: string,
   customerId: string,
 ): Promise<string> {
-  return tenantClient(storeId, async (tx) => {
-    // Try to find existing.
-    const existing = await tx.execute(
-      sql`SELECT id FROM carts WHERE customer_id = ${customerId} LIMIT 1`,
-    );
-    if (existing.rows.length > 0) {
-      return existing.rows[0]!.id as string;
-    }
-    // Create new.
-    const [cart] = await tx
-      .insert(schema.carts)
-      .values({ storeId, customerId })
-      .returning();
-    return cart!.id;
-  });
+  return tenantClient(storeId, (tx) => lockOrCreateCart(tx, storeId, customerId));
 }
 
 /**
@@ -1108,23 +1272,13 @@ export async function getDbCart(
     if (cartRows.rows.length === 0) {
       return { storeId, lines: [] };
     }
-    const cartId = cartRows.rows[0]!.id as string;
-
-    const itemRows = await tx.execute(
-      sql`SELECT variant_id, quantity FROM cart_items WHERE cart_id = ${cartId}`,
-    );
-    return {
-      storeId,
-      lines: (itemRows.rows as Array<{ variant_id: string; quantity: number }>).map(
-        (r) => ({ variantId: r.variant_id, quantity: r.quantity }),
-      ),
-    };
+    return { storeId, lines: await readCartLines(tx, cartRows.rows[0]!.id as string) };
   });
 }
 
 /**
- * Save a cart's lines to the database, replacing any existing items.
- * Used after pure line-math operations are applied to a Cart domain object.
+ * Save a cart's lines to the database, replacing any existing items, in one
+ * transaction on one connection (creating the cart if needed).
  */
 export async function saveDbCartLines(
   storeId: string,
@@ -1132,24 +1286,48 @@ export async function saveDbCartLines(
   lines: CartLine[],
 ): Promise<void> {
   await tenantClient(storeId, async (tx) => {
-    const cartId = await getOrCreateDbCart(storeId, customerId);
+    const cartId = await lockOrCreateCart(tx, storeId, customerId);
+    await writeCartLines(tx, storeId, cartId, lines);
+  });
+}
 
-    // Delete existing items.
-    await tx
-      .delete(schema.cartItems)
-      .where(eq(schema.cartItems.cartId, cartId));
+/**
+ * Apply one shopper change to a Customer's Cart, validated, in ONE
+ * transaction on one connection. This is how the storefront changes a Cart.
+ *
+ * - The change is re-parsed (parseCartChange: UUID shape, quantity rule), so
+ *   bad input never reaches SQL.
+ * - add, and set to a quantity above 0, need the Variant to be one of a
+ *   PUBLISHED Product in this Store (one query under RLS); otherwise
+ *   "unavailable", whether the id is unknown, a draft or another Store's.
+ * - The Cart row is locked, then the pure line math applies the change
+ *   (applyCartChange: an add may not take a line above MAX_LINE_QUANTITY), so
+ *   concurrent changes to one Cart are serialized and none is lost.
+ * - A refused change writes nothing. remove and set never create a Cart.
+ */
+export async function changeDbCart(
+  storeId: string,
+  customerId: string,
+  change: CartChange,
+): Promise<CartChangeResult> {
+  const parsed = parseCartChange(change.kind, change.variantId, "quantity" in change ? change.quantity : undefined);
+  if (!parsed.ok) return parsed;
+  const valid = parsed.change;
+  const needsAvailableVariant = valid.kind === "add" || (valid.kind === "set" && valid.quantity > 0);
 
-    // Insert new items.
-    if (lines.length > 0) {
-      await tx.insert(schema.cartItems).values(
-        lines.map((line) => ({
-          storeId,
-          cartId,
-          variantId: line.variantId,
-          quantity: line.quantity,
-        })),
-      );
+  return tenantClient(storeId, async (tx): Promise<CartChangeResult> => {
+    if (needsAvailableVariant && !(await isAvailableVariant(tx, valid.variantId))) {
+      return { ok: false, reason: "unavailable" };
     }
+    const cartId =
+      valid.kind === "add" ? await lockOrCreateCart(tx, storeId, customerId) : await lockCart(tx, customerId);
+    if (cartId === null) return { ok: true, cart: { storeId, lines: [] } };
+
+    const result = applyCartChange({ storeId, lines: await readCartLines(tx, cartId) }, valid);
+    if (!result.ok) return result;
+    const line = result.cart.lines.find((l) => l.variantId === valid.variantId);
+    await writeCartLine(tx, storeId, cartId, valid.variantId, line?.quantity ?? null);
+    return result;
   });
 }
 
@@ -1177,9 +1355,14 @@ export async function deleteDbCart(
 /**
  * Convert a Customer's Cart into an Order.
  *
- * 1. Loads the cart + live variant prices.
- * 2. Creates an Order in payment=pending, fulfillment=unfulfilled.
- * 3. Creates Order Lines with snapshotted unit prices (frozen at checkout).
+ * 1. Locks the Cart row: a second checkout of the same Cart waits here, then
+ *    finds it consumed ("empty_cart"), so one Cart makes at most one Order.
+ * 2. Re-validates every line against the live catalog (priceCartForCheckout):
+ *    a Variant of a PUBLISHED Product in this Store (RLS), at a whole quantity
+ *    from 1 to MAX_LINE_QUANTITY. Any invalid line refuses the WHOLE checkout
+ *    with a CheckoutError and writes nothing; no line is dropped silently.
+ * 3. Creates an Order in payment=pending, fulfillment=unfulfilled, with Order
+ *    Lines at snapshotted unit prices (frozen at checkout).
  * 4. Consumes the Cart (deletes it).
  *
  * Inventory is NOT decremented here — that happens in the payment transaction.
@@ -1189,48 +1372,18 @@ export async function checkout(
   customerId: string,
 ): Promise<{ orderId: string; totalCents: number }> {
   return tenantClient(storeId, async (tx) => {
-    // 1. Load cart + prices.
-    const cartRows = await tx.execute(
-      sql`SELECT id FROM carts WHERE customer_id = ${customerId} LIMIT 1`,
+    const cartId = await lockCart(tx, customerId);
+    if (cartId === null) throw new CheckoutError("empty_cart");
+    const lines = await readCartLines(tx, cartId);
+
+    const priced = priceCartForCheckout(
+      lines,
+      await readCheckoutVariants(tx, lines.map((l) => l.variantId)),
     );
-    if (cartRows.rows.length === 0) {
-      throw new Error("Cannot checkout: cart is empty or does not exist");
-    }
-    const cartId = cartRows.rows[0]!.id as string;
-
-    const itemRows = await tx.execute(
-      sql`SELECT variant_id, quantity FROM cart_items WHERE cart_id = ${cartId}`,
-    );
-    const lines = itemRows.rows as Array<{ variant_id: string; quantity: number }>;
-    if (lines.length === 0) {
-      throw new Error("Cannot checkout: cart has no items");
+    if (!priced.ok) {
+      throw new CheckoutError(priced.reason, priced.reason === "invalid_lines" ? priced.problems : []);
     }
 
-    // Snapshot live prices for each variant.
-    let totalCents = 0;
-    const pricedLines: Array<{
-      variantId: string;
-      quantity: number;
-      unitPriceCents: number;
-    }> = [];
-
-    for (const line of lines) {
-      const priceRows = await tx.execute(
-        sql`SELECT price_cents FROM variants WHERE id = ${line.variant_id} LIMIT 1`,
-      );
-      if (priceRows.rows.length === 0) {
-        throw new Error(`Variant ${line.variant_id} not found`);
-      }
-      const unitPriceCents = priceRows.rows[0]!.price_cents as number;
-      totalCents += unitPriceCents * line.quantity;
-      pricedLines.push({
-        variantId: line.variant_id,
-        quantity: line.quantity,
-        unitPriceCents,
-      });
-    }
-
-    // 2. Create the Order (pending/unfulfilled).
     const [order] = await tx
       .insert(schema.orders)
       .values({
@@ -1238,31 +1391,38 @@ export async function checkout(
         customerId,
         paymentStatus: "pending",
         fulfillmentStatus: "unfulfilled",
-        totalCents,
+        totalCents: priced.totalCents,
       })
       .returning();
 
-    // 3. Create Order Lines with snapshotted prices.
-    for (const line of pricedLines) {
+    for (const line of priced.lines) {
       await tx.insert(schema.orderLines).values({
         storeId,
         orderId: order!.id,
         variantId: line.variantId,
         quantity: line.quantity,
         unitPriceCents: line.unitPriceCents,
+        // Its own timestamp (now() is the transaction's), so the lines read
+        // back in Cart order (getStorefrontOrder orders by created_at).
+        createdAt: sql`clock_timestamp()`,
       });
     }
 
-    // 4. Consume the cart (delete it — cascade removes cart_items).
     await tx.delete(schema.carts).where(eq(schema.carts.id, cartId));
 
-    return { orderId: order!.id, totalCents };
+    return { orderId: order!.id, totalCents: priced.totalCents };
   });
 }
 
 /**
  * Load an Order by id (with its lines), scoped to the Current Store via RLS.
- * Returns null if the Order doesn't exist or belongs to another Store.
+ * Returns null if the Order doesn't exist, belongs to another Store, or the
+ * id is not a UUID.
+ *
+ * Store-scoped only: it returns ANY Order of the Store to whoever asks. It is
+ * for Merchant and payment code that has already authorized the Store. The
+ * storefront must use getStorefrontOrder, which also requires the cart token
+ * that placed the Order.
  */
 export async function getOrder(
   storeId: string,
@@ -1278,6 +1438,7 @@ export async function getOrder(
     unitPriceCents: number;
   }>;
 } | null> {
+  if (!isUuid(orderId)) return null;
   return tenantClient(storeId, async (tx) => {
     const orderRows = await tx.execute(
       sql`SELECT id, payment_status, fulfillment_status, total_cents FROM orders WHERE id = ${orderId} LIMIT 1`,
@@ -1310,6 +1471,83 @@ export async function getOrder(
       fulfillmentStatus: o.fulfillment_status,
       totalCents: o.total_cents,
       lines,
+    };
+  });
+}
+
+/** An Order as the shopper who placed it sees it on the storefront. */
+export type StorefrontOrder = {
+  id: string;
+  paymentStatus: string;
+  fulfillmentStatus: string;
+  totalCents: number;
+  /** Titles, not Variant ids; null when the Variant has since been deleted. */
+  lines: Array<{
+    productTitle: string | null;
+    variantTitle: string | null;
+    quantity: number;
+    unitPriceCents: number;
+  }>;
+};
+
+/**
+ * Load an Order for the storefront, only for the cart token that placed it.
+ *
+ * Until checkout has Customer sign-in or a signed Order-access token, an
+ * Order's customer_id is the anonymous cart token (the httpOnly
+ * shp0_cart_token cookie) of the Cart it came from, and that token is the
+ * shopper's proof. The id and the token are matched in ONE query (under RLS,
+ * so the Order must also be in `storeId`): no token, another shopper's token,
+ * a malformed id or token, another Store's Order and a nonexistent Order all
+ * return null, indistinguishably. The Order id alone (it is in URLs, history
+ * and referrers) is not enough.
+ */
+export async function getStorefrontOrder(
+  storeId: string,
+  orderId: string,
+  cartToken: string | null | undefined,
+): Promise<StorefrontOrder | null> {
+  if (!isUuid(orderId) || !isUuid(cartToken)) return null;
+  return tenantClient(storeId, async (tx) => {
+    const orderRows = await tx.execute(
+      sql`SELECT id, payment_status, fulfillment_status, total_cents FROM orders
+          WHERE id = ${orderId} AND customer_id = ${cartToken} LIMIT 1`,
+    );
+    if (orderRows.rows.length === 0) return null;
+    const o = orderRows.rows[0] as {
+      id: string;
+      payment_status: string;
+      fulfillment_status: string;
+      total_cents: string | number;
+    };
+
+    const lineRows = await tx.execute(
+      sql`SELECT p.title AS product_title, v.title AS variant_title, ol.quantity, ol.unit_price_cents
+          FROM order_lines ol
+          LEFT JOIN variants v ON v.id = ol.variant_id
+          LEFT JOIN products p ON p.id = v.product_id
+          WHERE ol.order_id = ${o.id}
+          ORDER BY ol.created_at, ol.id`,
+    );
+    return {
+      id: o.id,
+      paymentStatus: o.payment_status,
+      fulfillmentStatus: o.fulfillment_status,
+      // bigint columns arrive as strings from raw queries.
+      totalCents: Number(o.total_cents),
+      lines: (
+        lineRows.rows as Array<{
+          product_title: string | null;
+          variant_title: string | null;
+          quantity: number;
+          unit_price_cents: string | number;
+        }>
+      ).map((r) => ({
+        productTitle: r.product_title,
+        variantTitle: r.variant_title,
+        quantity: r.quantity,
+        unitPriceCents: Number(r.unit_price_cents),
+      })),
     };
   });
 }
@@ -1501,10 +1739,14 @@ export async function getStoreIdByConnectAccount(
 /**
  * Load an Order with its lines in the shape needed by buildCheckoutSessionParams.
  * Includes product titles for the Stripe line item names.
+ *
+ * Only for the cart token that placed the Order, matched in the query like
+ * getStorefrontOrder: anyone else gets null, as for a nonexistent Order.
  */
 export async function getOrderForCheckout(
   storeId: string,
   orderId: string,
+  cartToken: string | null | undefined,
 ): Promise<{
   id: string;
   paymentStatus: string;
@@ -1516,9 +1758,11 @@ export async function getOrderForCheckout(
     unitPriceCents: number;
   }>;
 } | null> {
+  if (!isUuid(orderId) || !isUuid(cartToken)) return null;
   return tenantClient(storeId, async (tx) => {
     const orderRows = await tx.execute(
-      sql`SELECT id, payment_status, total_cents FROM orders WHERE id = ${orderId} LIMIT 1`,
+      sql`SELECT id, payment_status, total_cents FROM orders
+          WHERE id = ${orderId} AND customer_id = ${cartToken} LIMIT 1`,
     );
     if (orderRows.rows.length === 0) return null;
     const o = orderRows.rows[0] as {

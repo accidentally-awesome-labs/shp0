@@ -57,6 +57,8 @@ describe("Payment transaction — markOrderPaid (Issue #10)", () => {
       title: "Gadget",
       description: "Test product",
       slug: "gadget",
+      // Checkout sells only published Products.
+      status: "published",
       variants: [
         { sku: "G-1", title: "Red", priceCents: 1000, inventory: 5 },
         { sku: "G-2", title: "Blue", priceCents: 2000, inventory: 2 },

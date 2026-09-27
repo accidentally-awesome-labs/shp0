@@ -136,19 +136,14 @@ describe("Customer identity (Issue #13)", () => {
   it("lists orders for a customer", async () => {
     const customers = await listCustomers(storeAId);
     const customerId = customers[0]!.id;
-    await createProduct(storeAId, {
-      title: "Item", description: "", slug: "item",
+    // Checkout sells only published Products.
+    const product = await createProduct(storeAId, {
+      title: "Item", description: "", slug: "item", status: "published",
       variants: [{ sku: "I-1", title: "Default", priceCents: 1000, inventory: 10 }],
     });
     await getOrCreateDbCart(storeAId, customerId);
-    // Load the variant id via platformClient (product is draft, getProductBySlug filters published).
-    const { platformClient } = await import("../src/index");
-    const { variants } = await import("../src/schema");
-    const variantRows = await platformClient(async (tx) =>
-      tx.select({ id: variants.id }).from(variants).limit(1),
-    );
     await saveDbCartLines(storeAId, customerId, [
-      { variantId: variantRows[0]!.id, quantity: 1 },
+      { variantId: product.variants[0]!.id, quantity: 1 },
     ]);
     await checkout(storeAId, customerId);
     const orders = await listCustomerOrders(storeAId, customerId);
