@@ -5,7 +5,8 @@ import { isUuid } from "@shp0/db";
 
 /**
  * The anonymous cart token: a random UUID in an httpOnly, SameSite=Lax,
- * host-only cookie, minted by the first cart action on a storefront host.
+ * host-only cookie, minted when a shopper first adds to a Cart on a
+ * storefront host.
  *
  * It keys the shopper's Cart (carts.customer_id) and becomes the
  * customer_id of every Order checked out from it, so it is also the proof
@@ -27,18 +28,21 @@ export async function readCartToken(): Promise<string | null> {
   return isUuid(value) ? value : null;
 }
 
+/** A new cart token (not yet set: see setCartTokenCookie). */
+export function newCartToken(): string {
+  return randomUUID();
+}
+
 /**
- * The request's cart token, minting and setting one if it has none. Only a
- * server action or route handler can set cookies, so pages use readCartToken.
+ * Set the cart-token cookie. Only a server action or route handler can set
+ * cookies, so pages use readCartToken. Setting a cookie in a server action
+ * makes Next re-render the current page in the action's response, so set it
+ * only when something was stored under the token.
  */
-export async function getOrCreateCartToken(): Promise<string> {
-  const existing = await readCartToken();
-  if (existing !== null) return existing;
-  const token = randomUUID();
+export async function setCartTokenCookie(token: string): Promise<void> {
   (await cookies()).set(CART_TOKEN_COOKIE, token, {
     httpOnly: true,
     sameSite: "lax",
     maxAge: CART_TOKEN_MAX_AGE_SECONDS,
   });
-  return token;
 }

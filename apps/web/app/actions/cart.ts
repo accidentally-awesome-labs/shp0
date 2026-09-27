@@ -1,6 +1,6 @@
 "use server";
 
-import { getOrCreateCartToken } from "@/lib/cart-token";
+import { newCartToken, readCartToken, setCartTokenCookie } from "@/lib/cart-token";
 import { resolveStorefrontStore } from "@/lib/current-store";
 import {
   cartChangeRejectionMessage,
@@ -18,10 +18,14 @@ import {
  *
  * Every export is callable over HTTP with ANY arguments (any JSON value), so
  * the arguments are parsed first (parseCartChange: a UUID Variant id and a
- * whole quantity from 1 to MAX_LINE_QUANTITY, or 0 to remove), before a
- * cookie is set or a query runs. changeDbCart then accepts only a Variant of
- * a published Product of this Store and writes the change in one
- * transaction.
+ * whole quantity from 1 to MAX_LINE_QUANTITY, or 0 to remove), before any
+ * query runs. changeDbCart then accepts only a Variant of a published Product
+ * of this Store and writes the change in one transaction.
+ *
+ * A shopper without a cart token gets one only when an add is accepted: a
+ * refused change stores nothing, so it sets no cookie either (a cookie set by
+ * an action makes Next re-render the page in the response, which for an
+ * unpublished Product is a not-found page instead of the message).
  *
  * A refusal is returned, not thrown: production builds replace a thrown
  * error's message with a digest, and the shopper should see why.
@@ -34,9 +38,13 @@ async function applyToCart(parsed: ParsedCartChange): Promise<CartActionResult> 
   if (!parsed.ok) return { ok: false, error: cartChangeRejectionMessage(parsed.reason) };
   const storeId = await resolveStorefrontStore();
   if (!storeId) return { ok: false, error: STORE_UNAVAILABLE };
-  const token = await getOrCreateCartToken();
+  const existing = await readCartToken();
+  const token = existing ?? newCartToken();
   const result = await changeDbCart(storeId, token, parsed.change);
-  return result.ok ? { ok: true } : { ok: false, error: cartChangeRejectionMessage(result.reason) };
+  if (!result.ok) return { ok: false, error: cartChangeRejectionMessage(result.reason) };
+  // Only an add creates a Cart; set and remove without a token change nothing.
+  if (existing === null && parsed.change.kind === "add") await setCartTokenCookie(token);
+  return { ok: true };
 }
 
 export async function addToCart(variantId: string, quantity: number = 1): Promise<CartActionResult> {
@@ -55,5 +63,6 @@ export async function removeCartItem(variantId: string): Promise<CartActionResul
 export async function getCart(): Promise<Cart> {
   const storeId = await resolveStorefrontStore();
   if (!storeId) throw new Error("No store resolved for this request");
-  return getDbCart(storeId, await getOrCreateCartToken());
+  const token = await readCartToken();
+  return token === null ? { storeId, lines: [] } : getDbCart(storeId, token);
 }
