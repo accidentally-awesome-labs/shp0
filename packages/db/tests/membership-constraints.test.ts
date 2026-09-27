@@ -180,8 +180,12 @@ describe("memberships: one Membership per person per Store, valid Role text", ()
     expect(owners.rows).toEqual([{ user_id: users.owner! }]);
   });
 
-  it("the Owner row cannot be renamed out from under the owner-delete trigger", async () => {
+  it("mis-cased owner text can no longer carry the Owner row past the owner-delete trigger", async () => {
     // With free role text, 'owner' -> 'Owner' and then DELETE removed the Owner.
+    // A separate gap remains: the trigger fires only on DELETE, so demoting the
+    // row to a valid Role (and then deleting it), or moving it to another
+    // Store, still leaves a Store with no Owner. See the comment at the
+    // trigger in applySchema().
     await expect(
       pool.query(
         "UPDATE memberships SET role = 'Owner' WHERE user_id = $1 AND store_id = $2 AND role = 'owner'",

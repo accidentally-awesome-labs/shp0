@@ -406,8 +406,17 @@ export async function applySchema(
       CREATE UNIQUE INDEX memberships_one_owner_per_store
         ON memberships(store_id) WHERE role = 'owner';
     `);
-    // Single-Owner invariant part 2: the owner cannot be removed (deleted).
-    // Transfer = UPDATE the row's user_id, not delete.
+    // Single-Owner invariant part 2: the owner row cannot be deleted.
+    // Ownership transfer (not implemented yet) must keep one Membership per
+    // person per Store: to a person with no Membership in the Store, UPDATE
+    // the owner row's user_id; to an existing member, in one transaction,
+    // first demote the owner row to 'admin' or 'staff', then promote the
+    // member's row to 'owner' (the other order trips the index above). An
+    // UPDATE of user_id onto an existing member trips
+    // memberships_user_store_key.
+    // Known gap: this fires only on DELETE, so an UPDATE that demotes the
+    // owner row, or moves it to another Store, can still leave a Store with
+    // no Owner. No application code updates memberships today.
     await client.query(`
       CREATE OR REPLACE FUNCTION memberships_prevent_owner_delete()
       RETURNS trigger LANGUAGE plpgsql AS $func$
