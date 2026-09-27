@@ -32,6 +32,10 @@ _Avoid_: manager, full access
 The lowest Role. May view the catalog, Orders, and Customers, and fulfill Orders; cannot change settings, money, or Memberships.
 _Avoid_: employee, limited user, agent
 
+**Operator**:
+A person who runs the platform itself rather than a Store. An Operator can see every Store and suspend, reinstate, or terminate any of them from the platform admin (`/admin`). Being an Operator is not a Role and comes from no Membership: it is granted to a Merchant account by listing its user id in the `SHP0_OPERATOR_USER_IDS` environment variable (comma-separated better-auth user ids, never emails). With the variable unset or empty there are no Operators and the platform admin is locked (fail closed).
+_Avoid_: admin (that is a Role), super admin, platform owner
+
 **Customer**:
 A person who buys from one Store. A Customer's account, cart, orders, and addresses belong to that single Store and exist only within it.
 _Avoid_: shopper (informal only; use Customer in formal language), buyer, user (too generic), member (collides with Membership)
@@ -126,6 +130,7 @@ _Avoid_: locale, money format
 - A Store has many Customers; each Customer belongs to exactly one Store.
 - A Customer and a Merchant are distinct identities. The same human may be a Merchant on one Store and a Customer on another, with no relationship between those two identities.
 - Each Store is independently isolated and independently billed.
+- An Operator acts across all Stores without holding a Membership in any of them. Operator access is granted per Merchant user id by configuration and is never inferred from a Role.
 - Each request resolves to at most one Current Store. A storefront request derives it from the host; a dashboard request derives it from the Merchant's selection, authorized by a Membership.
 - A Store is addressable by its Subdomain by default, and may have zero or more Custom Domains. A Custom Domain is served only after DNS-proven ownership and is re-verified periodically; a failing Custom Domain stops being served, and the host-to-store cache is invalidated whenever a domain is added, removed, or fails verification.
 - A Store has many Products. A Product has one or more Variants. A Variant is the single purchasable unit: anything that can be priced, stocked, added to a cart, or ordered is a Variant.
@@ -148,4 +153,5 @@ _Avoid_: locale, money format
 - _Resolved_ — Collection model: a Collection groups Products and is one of two types — Manual (explicit membership) or Automated (membership derived from rules such as tag or price range).
 - _Resolved_ — Discounts and promotions: a Discount is a unified, declarative Trigger + Reward + Conditions entity (so a code-based and an automatic/BOGO discount are the same concept, not two). Discounts stack from day one under a fixed precedence (line → order → shipping; percent before fixed; never-negative floor) shown via a merchant preview, not configurable ordering. Reward types include amount off (order/line/shipping), free item (an Order Line at unit price 0 that decrements inventory), and free shipping. Percentage reductions round half-up on minor units. Usage limits are enforced under a row-lock at redemption.
 - _Resolved_ — Custom Domain verification: a Custom Domain is served only after DNS-proven ownership (CNAME for subdomains, TXT/ALIAS for apex), and is re-verified periodically; a domain that fails re-verification stops being served. Vercel is orchestrated for serving and TLS. Recorded in ADR-0005.
+- _Implemented, pending decision #73_ — Operator access (Issue #52, as proposed in decision #73; mark it _Resolved_ once #73 is accepted): Operators are an allowlist of Merchant user ids in `SHP0_OPERATOR_USER_IDS` (comma-separated; whitespace and empty entries ignored), never emails, because Merchant emails are not verified and an email allowlist would make whoever signs up with that address first an Operator. Unset, empty, or separators only means nobody is an Operator and the platform admin is locked (fail closed); there is no wildcard. Every Operator server action checks this itself, and CI checks that they do (`scripts/ci/operator-guard.mjs`). A signed-out visitor to `/admin` is sent to sign in; a signed-in non-Operator gets a not-found page.
 - _Resolved_ — Platform billing: a Store holds one Subscription to a Tier at a time. Tiers define a monthly price, a Commission rate that decreases at higher Tiers, and included Usage limits (products, orders, bandwidth, staff seats). Commission is collected at payment time as the Stripe Connect application fee. Usage overages are charged (not blocking) except on the Free Tier, which hard-caps.
