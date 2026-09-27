@@ -173,5 +173,67 @@ describe("Collections — manual + automated (Issue #11)", () => {
     expect(members).toHaveLength(1);
     expect(members[0]!.title).toBe("Fresh Item");
   });
+
+  // ── Store scoping of the ids a Merchant sends ──────────────────────
+  // Foreign-key checks bypass RLS, so a plain INSERT of (collection_id,
+  // product_id) under Store A's tenant client accepted Store B's ids, and
+  // "ok" versus a foreign-key error told the caller whether an id exists in
+  // some other Store. Only ids visible in the calling Store may be linked.
+  describe("addCollectionMembers only links the calling Store's own ids", () => {
+    let manualA: string;
+    let productA: string;
+    let manualB: string;
+    let productB: string;
+
+    async function linkCount(column: "collection_id" | "product_id", id: string): Promise<number> {
+      const rows = await drizzle(pool).execute(
+        column === "collection_id"
+          ? sql`SELECT count(*)::int AS n FROM collection_products WHERE collection_id = ${id}`
+          : sql`SELECT count(*)::int AS n FROM collection_products WHERE product_id = ${id}`,
+      );
+      return (rows.rows[0] as { n: number }).n;
+    }
+
+    beforeAll(async () => {
+      manualA = (await createCollection(storeAId, { name: "Scoped A", slug: "scoped-a", type: "manual" })).id;
+      productA = (
+        await createProduct(storeAId, {
+          title: "A Only", description: "", slug: "a-only",
+          variants: [{ sku: "AO-1", title: "Default", priceCents: 1000, inventory: 1 }],
+        })
+      ).id;
+      manualB = (await createCollection(storeBId, { name: "Scoped B", slug: "scoped-b", type: "manual" })).id;
+      productB = (
+        await createProduct(storeBId, {
+          title: "B Only", description: "", slug: "b-only",
+          variants: [{ sku: "BO-1", title: "Default", priceCents: 1000, inventory: 1 }],
+        })
+      ).id;
+    });
+
+    it("does not link another Store's product into this Store's collection", async () => {
+      await addCollectionMembers(storeAId, manualA, [productB]);
+      expect(await linkCount("product_id", productB)).toBe(0);
+      expect(await listCollectionMembers(storeAId, manualA)).toEqual([]);
+    });
+
+    it("does not link this Store's product into another Store's collection", async () => {
+      await addCollectionMembers(storeAId, manualB, [productA]);
+      expect(await linkCount("collection_id", manualB)).toBe(0);
+    });
+
+    it("answers an unknown id exactly like another Store's id (no existence oracle)", async () => {
+      await expect(addCollectionMembers(storeAId, manualA, [randomUUID()])).resolves.toBeUndefined();
+      await expect(addCollectionMembers(storeAId, randomUUID(), [productA])).resolves.toBeUndefined();
+      expect(await linkCount("collection_id", manualA)).toBe(0);
+    });
+
+    it("still links the calling Store's own product into its own collection", async () => {
+      await addCollectionMembers(storeAId, manualA, [productA, productB]);
+      const members = await listCollectionMembers(storeAId, manualA);
+      expect(members.map((m) => m.id)).toEqual([productA]);
+      expect(await linkCount("product_id", productB)).toBe(0);
+    });
+  });
 });
 
