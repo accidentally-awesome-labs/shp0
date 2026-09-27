@@ -2803,15 +2803,23 @@ export async function getPlatformAnalytics(): Promise<{
 /**
  * Suspend, reinstate, or terminate a Store (operator action).
  * Uses the pure state machine to validate the transition, then updates the DB.
+ *
+ * The Store row is locked before its status is read, so two concurrent
+ * changes run one after the other and the second is validated against the
+ * first one's result: a terminated Store is never reinstated, and an active
+ * Store is never terminated without being suspended first. The lock is FOR
+ * NO KEY UPDATE, the one the UPDATE takes anyway: status is not a key, so
+ * foreign-key checks on the Store (new Memberships, payment accounts) do not
+ * wait for it.
  */
 export async function applyStoreStatusAction(
   storeId: string,
   event: StoreEvent,
 ): Promise<{ ok: true } | { ok: false; reason: "invalid_transition" }> {
   return platformClient(async (tx) => {
-    // Read current status.
+    // Read current status, holding the row lock until COMMIT.
     const rows = await tx.execute(
-      sql`SELECT status FROM stores WHERE id = ${storeId} LIMIT 1`,
+      sql`SELECT status FROM stores WHERE id = ${storeId} FOR NO KEY UPDATE`,
     );
     if (rows.rows.length === 0) {
       throw new Error(`Store ${storeId} not found`);
@@ -2946,6 +2954,11 @@ export async function resolveStoreByHost(host: string): Promise<string | null> {
  * Scoped by BOTH store id and domain id: a domain that belongs to another
  * Store is reported exactly like one that does not exist ("not_found"), and
  * is left unchanged.
+ *
+ * The domain row is locked (FOR NO KEY UPDATE, as in applyStoreStatusAction)
+ * before its status is read, so two concurrent events run one after the
+ * other and the second is validated against the first one's result: a domain
+ * that has just failed is not verified again without a retry.
  */
 export async function applyDomainVerification(
   storeId: string,
@@ -2959,7 +2972,7 @@ export async function applyDomainVerification(
 
   return platformClient(async (tx) => {
     const rows = await tx.execute(
-      sql`SELECT verification_status FROM custom_domains WHERE id = ${domainId} AND store_id = ${storeId} LIMIT 1`,
+      sql`SELECT verification_status FROM custom_domains WHERE id = ${domainId} AND store_id = ${storeId} FOR NO KEY UPDATE`,
     );
     if (rows.rows.length === 0) return { ok: false, reason: "not_found" } as const;
     const current = rows.rows[0]!.verification_status as DomainVerificationStatus;
