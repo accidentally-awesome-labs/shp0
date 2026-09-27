@@ -142,7 +142,7 @@ async function snapshot(pool: Pool, schemaName: string = SCHEMA) {
       WHERE n.nspname = $1 AND NOT t.tgisinternal
       ORDER BY c.relname, t.tgname`),
     functions: await q(`
-      SELECT p.proname, p.prosrc
+      SELECT p.proname, p.prosrc, p.proconfig
       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
       WHERE n.nspname = $1
       ORDER BY p.proname`),
@@ -212,12 +212,45 @@ describe("applySchema() bootstraps an empty database", () => {
         def: "TRIGGER DEFERRABLE INITIALLY DEFERRED",
       },
     ]);
+    // Its function takes neither search_path nor row-level security from
+    // the committing session.
+    expect(
+      first.functions
+        .filter((f) => f.proname === "memberships_check_exactly_one_owner")
+        .map((f) => f.proconfig),
+    ).toEqual([["search_path=pg_catalog, pg_temp", "row_security=off"]]);
 
     // Idempotent: applying again to the bootstrapped schema succeeds and
     // leaves every definition exactly as it was.
     await applySchema(SCOPED_URL);
     const second = await snapshot(scoped);
     expect(second).toEqual(first);
+  });
+
+  it("the COMMIT-time Owner check counts the Owner rows of its own schema, whatever the session's search_path", async () => {
+    await applySchema(SCOPED_URL);
+    const storeId = randomUUID();
+    await scoped.query(`INSERT INTO "user" (id, name, email) VALUES ('owner', 'Owner', 'owner@bootstrap.test')`);
+    await scoped.query(
+      `INSERT INTO stores (id, store_id, name, subdomain) VALUES ($1, $1, 'Scoped', 'scoped')`,
+      [storeId],
+    );
+    await scoped.query(`INSERT INTO memberships (user_id, store_id, role) VALUES ('owner', $1, 'owner')`, [
+      storeId,
+    ]);
+
+    // `admin` has the default search_path, where `stores` is public.stores:
+    // that table has no row for this Store.
+    await expect(
+      admin.query(`UPDATE "${SCHEMA}".memberships SET role = 'admin' WHERE store_id = $1`, [storeId]),
+    ).rejects.toMatchObject({
+      code: "23000",
+      constraint: "memberships_exactly_one_owner",
+      schema: SCHEMA,
+      table: "memberships",
+    });
+    const owners = await scoped.query(`SELECT user_id FROM memberships WHERE role = 'owner'`);
+    expect(owners.rows).toEqual([{ user_id: "owner" }]);
   });
 });
 

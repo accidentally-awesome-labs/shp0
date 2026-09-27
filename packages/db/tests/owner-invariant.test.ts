@@ -446,6 +446,89 @@ describe("memberships: a Store keeps exactly one Owner", () => {
   });
 
   /**
+   * The check must count the Owner rows of the real Store, whatever the
+   * committing session's search_path or row-level security would show it:
+   * a check that cannot see the Store skips it, and one that counts some
+   * other table's rows can be satisfied by them.
+   */
+  describe("the check reads memberships' own tables, whatever the session sees", () => {
+    const DECOY = `owner_invariant_decoy_${randomUUID().replace(/-/g, "")}`;
+
+    beforeAll(async () => {
+      await pool.query(`
+        CREATE SCHEMA "${DECOY}";
+        CREATE TABLE "${DECOY}".stores (id uuid);
+        CREATE TABLE "${DECOY}".memberships (store_id uuid, role text)`);
+    });
+
+    afterAll(async () => {
+      await pool?.query(`DROP SCHEMA IF EXISTS "${DECOY}" CASCADE`);
+    });
+
+    it("a temporary table named stores does not hide the Store", async () => {
+      const { storeId } = await newStore();
+      const before = await membershipsOf(storeId);
+
+      // pg_temp comes before public in a session's search_path unless the
+      // path lists it, so an unqualified `stores` would find this empty table.
+      const { commitError } = await transaction([
+        [`CREATE TEMP TABLE stores (id uuid) ON COMMIT DROP`],
+        demoteOwner(storeId),
+      ]);
+
+      expect(commitError).toMatchObject(ownerRefusal(storeId));
+      expect(await membershipsOf(storeId)).toEqual(before);
+    });
+
+    it("another schema's stores and memberships, first on the search_path, do not stand in for them", async () => {
+      const { storeId } = await newStore();
+      const before = await membershipsOf(storeId);
+
+      // The decoy has the Store, and an Owner row for it.
+      const { rowCounts, commitError } = await transaction([
+        [`SET LOCAL search_path = "${DECOY}", public`],
+        [`INSERT INTO "${DECOY}".stores (id) VALUES ($1)`, [storeId]],
+        [`INSERT INTO "${DECOY}".memberships (store_id, role) VALUES ($1, 'owner')`, [storeId]],
+        [`UPDATE public.memberships SET role = 'admin' WHERE store_id = $1 AND role = 'owner'`, [storeId]],
+      ]);
+
+      expect(rowCounts.slice(1)).toEqual([1, 1, 1]);
+      expect(commitError).toMatchObject(ownerRefusal(storeId));
+      expect(await membershipsOf(storeId)).toEqual(before);
+    });
+
+    it("a Store that row-level security hides from the session is an error, not a skipped check", async () => {
+      const { storeId } = await newStore();
+      const before = await membershipsOf(storeId);
+      const forced = async () =>
+        (
+          await pool.query<{ relforcerowsecurity: boolean }>(
+            `SELECT relforcerowsecurity FROM pg_class WHERE oid = 'stores'::regclass`,
+          )
+        ).rows[0]!.relforcerowsecurity;
+
+      try {
+        // FORCE makes RLS apply to cloud_admin, the owner of stores, and no
+        // policy grants it a row: the Store is invisible at COMMIT.
+        const { commitError } = await transaction([
+          [`ALTER TABLE stores FORCE ROW LEVEL SECURITY`],
+          demoteOwner(storeId),
+        ]);
+
+        expect(commitError).toMatchObject({
+          code: "42501",
+          message: 'query would be affected by row-level security policy for table "stores"',
+        });
+        expect(await forced()).toBe(false);
+      } finally {
+        // Only a check that skipped the hidden Store lets that ALTER commit.
+        if (await forced()) await pool.query(`ALTER TABLE stores NO FORCE ROW LEVEL SECURITY`);
+      }
+      expect(await membershipsOf(storeId)).toEqual(before);
+    });
+  });
+
+  /**
    * Two real connections changing the same Store's Owner at once, under
    * READ COMMITTED (the default). Session B's statement is sent while
    * session A holds its locks, and the test waits until the server reports
