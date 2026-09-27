@@ -115,6 +115,11 @@ describe("memberships: a Store keeps exactly one Owner", () => {
     return rows[0]?.role ?? null;
   }
 
+  async function userExists(userId: string): Promise<boolean> {
+    const { rows } = await pool.query(`SELECT 1 FROM "user" WHERE id = $1`, [userId]);
+    return rows.length === 1;
+  }
+
   /**
    * Run the statements in one transaction, then COMMIT. Resolves with the
    * rows each statement changed and the COMMIT's error (null when it
@@ -158,6 +163,8 @@ describe("memberships: a Store keeps exactly one Owner", () => {
     `DELETE FROM memberships WHERE store_id = $1 AND user_id = $2`,
     [storeId, userId],
   ];
+  /** Closing a person's account: the cascade deletes each of their Memberships. */
+  const deleteUser = (userId: string): Statement => [`DELETE FROM "user" WHERE id = $1`, [userId]];
 
   beforeAll(async () => {
     await applySchema();
@@ -236,6 +243,19 @@ describe("memberships: a Store keeps exactly one Owner", () => {
       expect(await membershipsOf(elsewhere)).toEqual([]);
     });
 
+    it("demoting the Owner row, then deleting the Owner's user, in one transaction", async () => {
+      const { storeId, owner } = await newStore();
+      const before = await membershipsOf(storeId);
+
+      // The cascade deletes an 'admin' row by then, which memberships_no_delete_owner lets go.
+      const { rowCounts, commitError } = await transaction([demoteOwner(storeId), deleteUser(owner)]);
+
+      expect(rowCounts).toEqual([1, 1]);
+      expect(commitError).toMatchObject(ownerRefusal(storeId));
+      expect(await membershipsOf(storeId)).toEqual(before);
+      expect(await userExists(owner)).toBe(true);
+    });
+
     it("deleting the Owner row outright is still refused at once, by memberships_no_delete_owner", async () => {
       const { storeId, owner } = await newStore();
       await expect(pool.query(...remove(storeId, owner))).rejects.toMatchObject({
@@ -243,6 +263,17 @@ describe("memberships: a Store keeps exactly one Owner", () => {
         message: "Cannot delete an owner Membership. Transfer ownership first.",
       });
       expect(await ownersOf(storeId)).toEqual([owner]);
+    });
+
+    it("deleting the Owner's user (closing their account) is refused at once too: the cascade reaches the Owner row", async () => {
+      const { storeId, owner } = await newStore();
+      const before = await membershipsOf(storeId);
+      await expect(pool.query(...deleteUser(owner))).rejects.toMatchObject({
+        code: "P0001",
+        message: "Cannot delete an owner Membership. Transfer ownership first.",
+      });
+      expect(await membershipsOf(storeId)).toEqual(before);
+      expect(await userExists(owner)).toBe(true);
     });
   });
 
@@ -333,6 +364,19 @@ describe("memberships: a Store keeps exactly one Owner", () => {
       expect(await ownersOf(storeId)).toEqual([admin]);
     });
 
+    it("after a transfer the old Owner can close their account", async () => {
+      const { storeId, owner, admin } = await newStore();
+      expect((await transaction([demoteOwner(storeId), promote(storeId, admin)])).commitError).toBeNull();
+
+      const { rowCounts, commitError } = await transaction([deleteUser(owner)]);
+
+      expect(rowCounts).toEqual([1]);
+      expect(commitError).toBeNull();
+      expect(await userExists(owner)).toBe(false);
+      expect(await roleOf(owner, storeId)).toBeNull();
+      expect(await ownersOf(storeId)).toEqual([admin]);
+    });
+
     it("demoting the Owner and promoting them back in one transaction commits", async () => {
       const { storeId, owner } = await newStore();
       const { commitError } = await transaction([demoteOwner(storeId), promote(storeId, owner)]);
@@ -364,6 +408,40 @@ describe("memberships: a Store keeps exactly one Owner", () => {
         message: "Cannot delete an owner Membership. Transfer ownership first.",
       });
       expect(await ownersOf(storeId)).toEqual([owner]);
+    });
+
+    it("why memberships_no_delete_owner stays: without it, the COMMIT-time check refuses deleting the Owner's user but lets a Store deletion take the Owner row", async () => {
+      const { storeId, owner } = await newStore();
+      const before = await membershipsOf(storeId);
+      // One connection, one transaction that is always rolled back: the
+      // older trigger is disabled only inside it, and SET CONSTRAINTS runs
+      // the COMMIT-time check after each statement instead of at COMMIT.
+      const client = new Client({ connectionString: PLATFORM_URL });
+      await client.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query("ALTER TABLE memberships DISABLE TRIGGER memberships_no_delete_owner");
+        await client.query("SET CONSTRAINTS memberships_exactly_one_owner IMMEDIATE");
+
+        await client.query("SAVEPOINT close_account");
+        await expect(client.query(...deleteUser(owner))).rejects.toMatchObject(ownerRefusal(storeId));
+        await client.query("ROLLBACK TO SAVEPOINT close_account");
+
+        // The check skips a Store that no longer exists, so nothing else
+        // stops the cascade from deleting the Owner row with the Store.
+        expect((await client.query(`DELETE FROM stores WHERE id = $1`, [storeId])).rowCount).toBe(1);
+        const left = await client.query(`SELECT 1 FROM memberships WHERE store_id = $1`, [storeId]);
+        expect(left.rowCount).toBe(0);
+      } finally {
+        await client.query("ROLLBACK").catch(() => undefined);
+        await client.end();
+      }
+      expect(await membershipsOf(storeId)).toEqual(before);
+      const { rows } = await pool.query<{ tgenabled: string }>(
+        `SELECT tgenabled FROM pg_trigger
+         WHERE tgrelid = 'memberships'::regclass AND tgname = 'memberships_no_delete_owner'`,
+      );
+      expect(rows).toEqual([{ tgenabled: "O" }]);
     });
   });
 
