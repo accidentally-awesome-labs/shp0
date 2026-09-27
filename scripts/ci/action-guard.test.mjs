@@ -629,12 +629,12 @@ export async function GET(_request: Request, { params }: { params: Promise<{ sto
       ["apps/web/app/(.)dashboard/[storeId]/modal/page.tsx", "page-gate-first"],
       ["apps/web/app/(shell)/dashboard/[storeId]/grouped/page.tsx", "page-gate-first"],
       ["apps/web/app/dashboard/(settings)/[storeId]/settings/page.tsx", "page-gate-first"],
-      ["apps/web/app/dashboard/[store]/page.tsx", "page-gate-first"],
       ["apps/web/app/dashboard/[storeId]/@panel/default.tsx", "page-gate-first"],
       ["apps/web/app/dashboard/[storeId]/customers/export/route.ts", "dashboard-route-handler"],
       ["apps/web/app/dashboard/[storeId]/layout.tsx", "page-gate-first"],
       ["apps/web/app/dashboard/[storeId]/opengraph-image.tsx", "dashboard-route-handler"],
       ["apps/web/app/dashboard/[storeId]/things/template.tsx", "page-gate-first"],
+      ["apps/web/app/dashboard/[store]/page.tsx", "page-gate-first"],
     ],
   );
   assert.deepEqual(result.pages, [["apps/web/app/dashboard/[storeId]/other/layout.tsx", "store.view"]]);

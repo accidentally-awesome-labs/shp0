@@ -9,8 +9,9 @@
 // first-statement rule to every action module:
 //
 //  1. A module-level "use server" directive appears only in files under
-//     apps/web/app/actions/, and no function anywhere in apps/web has an
-//     inline "use server" directive, so every action is in a file checked here.
+//     apps/web/app/actions/, and no function anywhere in the repo (apps/ and
+//     packages/ alike: Next compiles workspace packages too) has an inline
+//     "use server" directive, so every action is in a file checked here.
 //  2. Each runtime export of those modules is an async function declaration
 //     whose first statement awaits an approved guard (optionally binding the
 //     result), imported under its own name from its own module and not
@@ -19,19 +20,30 @@
 //         from "@/lib/current-store": Membership plus a Role at or above the
 //         capability's minimum (packages/db/src/roles.ts);
 //       await requireOperator()   from "@/lib/operator".
-//     The Store parameter is not reassigned or shadowed afterwards.
+//     The Store parameter is not reassigned or shadowed afterwards, no other
+//     parameter is named like a Store id, and the body never reads
+//     `arguments`, so the authorized Store id is the only one it can use.
+//     Parameter defaults run before the first statement, so on every export
+//     they are literals only.
 //  3. The only exceptions are PUBLIC_ACTIONS below: storefront and
 //     session-scoped actions, each with its reason. An entry that no longer
 //     names an export fails, and an allowlisted action may not take a Store id.
-//  4. Every page under apps/web/app/dashboard/[storeId]/ is a server component
+//  4. Below a Store dashboard segment (apps/web/app/**/dashboard/[<param>]/,
+//     route groups, parallel-route slots and intercepting markers ignored),
+//     every page, layout, template and default file is a server component
 //     whose first statements are
 //       const { storeId } = await params;
 //       const access = await authorizeStorePage(storeId, "<capability>");
-//     so it gates before it fetches anything, and exports no other function.
+//     so it gates before it fetches anything, and it exports nothing else
+//     that runs (literal route segment config and types only). Route handlers
+//     and metadata image/sitemap routes are not allowed there: this guard
+//     cannot check them, so serve Store data from a gated page or a guarded
+//     action instead.
 //
 // It parses TypeScript with the compiler apps/web already depends on. It
-// cannot tell whether a capability fits an action: that is review, and the
-// capability literal must type-check as a Capability.
+// cannot tell whether a capability fits an action: that is review (the files
+// that choose capabilities are code-owned), and the capability literal must
+// type-check as a Capability.
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -41,8 +53,52 @@ import { fileURLToPath } from "node:url";
 const ts = createRequire(new URL("../../apps/web/package.json", import.meta.url))("typescript");
 
 export const ACTIONS_DIR = "apps/web/app/actions/";
-const DASHBOARD_STORE_PAGE = /^apps\/web\/app\/dashboard\/\[storeId\]\/(?:.+\/)?page\.[cm]?[jt]sx?$/;
+const APP_DIR = "apps/web/app/";
 const CODE = /\.[cm]?[jt]sx?$/;
+
+/** Route files that render under a segment and receive its params: gated like a page. */
+const GATED_ROUTE_FILES = new Set(["page", "layout", "template", "default"]);
+/** Route files that answer HTTP requests themselves: not allowed under a Store segment. */
+const HANDLER_ROUTE_FILES = new Set(["route", "opengraph-image", "twitter-image", "icon", "apple-icon", "sitemap"]);
+
+/**
+ * For a file below a Store dashboard segment (dashboard/ followed by a dynamic
+ * segment, anywhere under apps/web/app/), its route file kind ("page",
+ * "route", ...); otherwise null. Route groups "(x)" and parallel-route slots
+ * "@x" do not appear in URLs, and intercepting markers "(.)" / "(..)" prefix
+ * a real segment, so they are ignored.
+ */
+export function storeRouteFileKind(file) {
+  if (!file.startsWith(APP_DIR)) return null;
+  const parts = file.slice(APP_DIR.length).split("/");
+  const base = parts.pop();
+  const segments = parts
+    .map((s) => s.replace(/^(?:\(\.{1,3}\))+/, ""))
+    .filter((s) => s !== "" && !/^\(.*\)$/.test(s) && !s.startsWith("@"));
+  const underStore = segments.some(
+    (s, i) => s === "dashboard" && i + 1 < segments.length && /^\[.+\]$/.test(segments[i + 1]),
+  );
+  if (!underStore) return null;
+  const kind = /^(.+)\.[cm]?[jt]sx?$/.exec(base)?.[1];
+  return kind !== undefined && (GATED_ROUTE_FILES.has(kind) || HANDLER_ROUTE_FILES.has(kind)) ? kind : null;
+}
+
+/**
+ * Next.js route segment config exports a Store dashboard page may declare,
+ * with a literal value (next/dist/build/segment-config/app).
+ */
+const SEGMENT_CONFIG = new Set([
+  "revalidate",
+  "dynamicParams",
+  "dynamic",
+  "fetchCache",
+  "instant",
+  "prefetch",
+  "unstable_dynamicStaleTime",
+  "preferredRegion",
+  "runtime",
+  "maxDuration",
+]);
 
 /** Approved first-statement guards for a server action, and their modules. */
 const GUARDS = new Map([
@@ -303,6 +359,74 @@ function reassignments(body, name) {
   return found;
 }
 
+/** A string, number, boolean, null or undefined literal (a negative number too). */
+function isPrimitiveLiteral(node) {
+  if (isStringLiteralLike(node) || ts.isNumericLiteral(node) || ts.isBigIntLiteral(node)) return true;
+  if (
+    node.kind === ts.SyntaxKind.TrueKeyword ||
+    node.kind === ts.SyntaxKind.FalseKeyword ||
+    node.kind === ts.SyntaxKind.NullKeyword
+  ) {
+    return true;
+  }
+  if (ts.isIdentifier(node) && node.text === "undefined") return true;
+  return (
+    ts.isPrefixUnaryExpression(node) &&
+    node.operator === ts.SyntaxKind.MinusToken &&
+    (ts.isNumericLiteral(node.operand) || ts.isBigIntLiteral(node.operand))
+  );
+}
+
+/** A primitive literal, `[]` or `{}`, possibly with `as` / `satisfies` / parentheses. */
+function isLiteralDefault(node) {
+  if (ts.isAsExpression(node) || ts.isSatisfiesExpression(node) || ts.isParenthesizedExpression(node)) {
+    return isLiteralDefault(node.expression);
+  }
+  if (ts.isArrayLiteralExpression(node)) return node.elements.length === 0;
+  if (ts.isObjectLiteralExpression(node)) return node.properties.length === 0;
+  return isPrimitiveLiteral(node);
+}
+
+/**
+ * Parts of a parameter list that run before the function body: defaults that
+ * are not literals, and computed keys in destructuring patterns.
+ */
+function parameterCode(parameters) {
+  const found = [];
+  const visit = (node) => {
+    if (ts.isTypeNode(node)) return; // types do not run
+    if ((ts.isParameter(node) || ts.isBindingElement(node)) && node.initializer) {
+      if (!isLiteralDefault(node.initializer)) found.push(node);
+    } else if (ts.isComputedPropertyName(node)) {
+      found.push(node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  for (const parameter of parameters) visit(parameter);
+  return found;
+}
+
+/** Reads of the `arguments` object in `body` (not a property named "arguments"). */
+function argumentsReads(body) {
+  const found = [];
+  const visit = (node) => {
+    if (
+      ts.isIdentifier(node) &&
+      node.text === "arguments" &&
+      !(ts.isPropertyAccessExpression(node.parent) && node.parent.name === node) &&
+      !(ts.isPropertyAssignment(node.parent) && node.parent.name === node) &&
+      !(ts.isPropertySignature(node.parent) && node.parent.name === node)
+    ) {
+      found.push(node);
+    }
+    ts.forEachChild(node, visit);
+  };
+  ts.forEachChild(body, visit);
+  return found;
+}
+
+const STORE_ID_NAME = /storeid/i;
+
 const byLine = (a, b) => a.line - b.line;
 
 /**
@@ -348,11 +472,30 @@ export function checkActionsModule(file, source, allowlist = PUBLIC_ACTIONS) {
     const name = statement.name?.text ?? "default";
     exported.push(name);
 
+    // Both run before (or around) any guard, whatever the export's kind.
+    for (const node of parameterCode(statement.parameters)) {
+      report(
+        node,
+        "param-default",
+        `${name}(): parameter defaults and computed destructuring keys run before the first statement ` +
+          "(and a caller controls whether they run): use literal defaults only",
+        name,
+      );
+    }
+    for (const node of argumentsReads(statement.body)) {
+      report(
+        node,
+        "arguments-used",
+        `${name}(): do not read \`arguments\`: use named parameters, so the authorized Store id is the only one`,
+        name,
+      );
+    }
+
     if (allowlist.has(`${file}#${name}`)) {
       publicActions.push(name);
       const storeParam = statement.parameters
         .flatMap((p) => boundNames(p.name))
-        .find((n) => /storeid/i.test(n));
+        .find((n) => STORE_ID_NAME.test(n));
       if (storeParam !== undefined) {
         report(
           statement,
@@ -417,7 +560,21 @@ export function checkActionsModule(file, source, allowlist = PUBLIC_ACTIONS) {
         name,
       );
     }
-    if (changed.length === 0) guarded.push({ name, guard, capability: args[1].text });
+    // Another parameter named like a Store id could carry an unauthorized one.
+    const otherStoreIds = statement.parameters
+      .slice(1)
+      .filter((p) => boundNames(p.name).some((n) => STORE_ID_NAME.test(n)));
+    for (const node of otherStoreIds) {
+      report(
+        node,
+        "extra-store-param",
+        `${name}(): only its first parameter, "${storeParam}", is authorized; take no other Store id`,
+        name,
+      );
+    }
+    if (changed.length === 0 && otherStoreIds.length === 0) {
+      guarded.push({ name, guard, capability: args[1].text });
+    }
   }
 
   return { violations: violations.sort(byLine), guarded, public: publicActions, exports: exported };
@@ -448,27 +605,42 @@ export function checkDashboardPage(file, source) {
   }
 
   const imports = approvedImports(sourceFile, new Map([[PAGE_GUARD, PAGE_GUARD_MODULE]]));
+  const onlyPage =
+    "a Store dashboard page exports nothing that runs but the page itself (generateMetadata and the like " +
+    "would run ungated) and literal route segment config (`export const instant = false;`)";
   let page = null;
   for (const statement of sourceFile.statements) {
     if (ts.isExportAssignment(statement)) {
       report(statement, "page-gate-first", gateShape);
       continue;
     }
+    if (ts.isExportDeclaration(statement)) {
+      // export { a }, export { a } from "./m", export * from "./m": only types may pass.
+      const typesOnly =
+        statement.isTypeOnly ||
+        (statement.exportClause !== undefined &&
+          ts.isNamedExports(statement.exportClause) &&
+          statement.exportClause.elements.every((e) => e.isTypeOnly));
+      if (!typesOnly) report(statement, "page-export", onlyPage);
+      continue;
+    }
     if (!hasModifier(statement, ts.SyntaxKind.ExportKeyword)) continue;
+    if (ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement)) continue;
     if (ts.isFunctionDeclaration(statement) && hasModifier(statement, ts.SyntaxKind.DefaultKeyword)) {
       page = statement;
-    } else if (ts.isFunctionDeclaration(statement)) {
-      report(statement, "page-export", "a Store dashboard page exports no function but the page itself");
-    } else if (
-      ts.isVariableStatement(statement) &&
-      statement.declarationList.declarations.some(
-        (d) =>
-          d.initializer &&
-          (ts.isArrowFunction(d.initializer) || ts.isFunctionExpression(d.initializer)),
-      )
-    ) {
-      report(statement, "page-export", "a Store dashboard page exports no function but the page itself");
+      continue;
     }
+    const segmentConfig =
+      ts.isVariableStatement(statement) &&
+      (statement.declarationList.flags & ts.NodeFlags.Const) !== 0 &&
+      statement.declarationList.declarations.every(
+        (d) =>
+          ts.isIdentifier(d.name) &&
+          SEGMENT_CONFIG.has(d.name.text) &&
+          d.initializer !== undefined &&
+          isPrimitiveLiteral(d.initializer),
+      );
+    if (!segmentConfig) report(statement, "page-export", onlyPage);
   }
   if (page === null) {
     if (!violations.some((v) => v.rule === "page-gate-first")) {
@@ -529,7 +701,7 @@ export function checkRepo(files, readFile, allowlist = PUBLIC_ACTIONS) {
   const exported = new Set();
 
   for (const file of files) {
-    if (!file.startsWith("apps/web/") || !CODE.test(file)) continue;
+    if (!CODE.test(file)) continue;
     const source = readFile(file);
     if (source === null) continue;
     const sourceFile = parse(file, source);
@@ -561,7 +733,17 @@ export function checkRepo(files, readFile, allowlist = PUBLIC_ACTIONS) {
       for (const name of result.exports) exported.add(`${file}#${name}`);
     }
 
-    if (DASHBOARD_STORE_PAGE.test(file)) {
+    const routeKind = storeRouteFileKind(file);
+    if (routeKind !== null && HANDLER_ROUTE_FILES.has(routeKind)) {
+      violations.push({
+        file,
+        line: 1,
+        rule: "dashboard-route-handler",
+        why:
+          `a ${routeKind} file under a Store dashboard segment answers HTTP requests without a check this guard ` +
+          "can verify: serve Store data from a gated page or a guarded server action",
+      });
+    } else if (routeKind !== null) {
       const result = checkDashboardPage(file, source);
       violations.push(...result.violations);
       if (result.capability !== null) pages.push([file, result.capability]);
@@ -583,7 +765,8 @@ export function checkRepo(files, readFile, allowlist = PUBLIC_ACTIONS) {
 }
 
 function main() {
-  const files = execFileSync("git", ["ls-files", "-z", "--", "apps/web"], { encoding: "utf8" })
+  // Every tracked file: a "use server" module in packages/ is a live action too.
+  const files = execFileSync("git", ["ls-files", "-z"], { encoding: "utf8" })
     .split("\0")
     .filter(Boolean);
   const readFile = (file) => {
