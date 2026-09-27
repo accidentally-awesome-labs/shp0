@@ -56,6 +56,35 @@ const MEMBERSHIP_CONSTRAINTS = [
   { conname: "memberships_user_store_key", def: "UNIQUE (user_id, store_id)" },
 ];
 
+/**
+ * The single-Owner triggers on memberships, by name and definition (the
+ * table's schema written as <schema>): the owner-delete trigger, and the
+ * constraint trigger that checks at COMMIT that a Store whose Owner row
+ * changed still has exactly one Owner.
+ */
+const OWNER_TRIGGERS = [
+  {
+    tgname: "memberships_exactly_one_owner",
+    def:
+      "CREATE CONSTRAINT TRIGGER memberships_exactly_one_owner AFTER DELETE OR UPDATE ON <schema>.memberships " +
+      "DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN ((old.role = 'owner'::text)) " +
+      "EXECUTE FUNCTION memberships_check_exactly_one_owner()",
+  },
+  {
+    tgname: "memberships_no_delete_owner",
+    def:
+      "CREATE TRIGGER memberships_no_delete_owner BEFORE DELETE ON <schema>.memberships " +
+      "FOR EACH ROW EXECUTE FUNCTION memberships_prevent_owner_delete()",
+  },
+];
+
+/** memberships' triggers, by name and definition, from a snapshot of `schemaName`. */
+function membershipTriggers(snap: Awaited<ReturnType<typeof snapshot>>, schemaName: string) {
+  return withoutSchemaName(snap, schemaName)
+    .triggers.filter((t) => t.relname === "memberships")
+    .map((t) => ({ tgname: t.tgname, def: t.def }));
+}
+
 function membershipConstraints(constraints: Array<Record<string, unknown>>) {
   return constraints
     .filter(
@@ -113,7 +142,7 @@ async function snapshot(pool: Pool, schemaName: string = SCHEMA) {
       WHERE n.nspname = $1 AND NOT t.tgisinternal
       ORDER BY c.relname, t.tgname`),
     functions: await q(`
-      SELECT p.proname, p.prosrc
+      SELECT p.proname, p.prosrc, p.proconfig
       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
       WHERE n.nspname = $1
       ORDER BY p.proname`),
@@ -171,23 +200,71 @@ describe("applySchema() bootstraps an empty database", () => {
     // One Membership per person per Store, and only the three Roles.
     expect(membershipConstraints(first.constraints)).toEqual(MEMBERSHIP_CONSTRAINTS);
 
+    // Exactly one Owner per Store: the owner row cannot be deleted, and a
+    // transaction that leaves a Store without its Owner is refused at COMMIT.
+    expect(membershipTriggers(first, SCHEMA)).toEqual(OWNER_TRIGGERS);
+    expect(
+      first.constraints.filter((c) => c.relname === "memberships" && c.conname === "memberships_exactly_one_owner"),
+    ).toEqual([
+      {
+        relname: "memberships",
+        conname: "memberships_exactly_one_owner",
+        def: "TRIGGER DEFERRABLE INITIALLY DEFERRED",
+      },
+    ]);
+    // Its function takes neither search_path nor row-level security from
+    // the committing session.
+    expect(
+      first.functions
+        .filter((f) => f.proname === "memberships_check_exactly_one_owner")
+        .map((f) => f.proconfig),
+    ).toEqual([["search_path=pg_catalog, pg_temp", "row_security=off"]]);
+
     // Idempotent: applying again to the bootstrapped schema succeeds and
     // leaves every definition exactly as it was.
     await applySchema(SCOPED_URL);
     const second = await snapshot(scoped);
     expect(second).toEqual(first);
   });
+
+  it("the COMMIT-time Owner check counts the Owner rows of its own schema, whatever the session's search_path", async () => {
+    await applySchema(SCOPED_URL);
+    const storeId = randomUUID();
+    await scoped.query(`INSERT INTO "user" (id, name, email) VALUES ('owner', 'Owner', 'owner@bootstrap.test')`);
+    await scoped.query(
+      `INSERT INTO stores (id, store_id, name, subdomain) VALUES ($1, $1, 'Scoped', 'scoped')`,
+      [storeId],
+    );
+    await scoped.query(`INSERT INTO memberships (user_id, store_id, role) VALUES ('owner', $1, 'owner')`, [
+      storeId,
+    ]);
+
+    // `admin` has the default search_path, where `stores` is public.stores:
+    // that table has no row for this Store.
+    await expect(
+      admin.query(`UPDATE "${SCHEMA}".memberships SET role = 'admin' WHERE store_id = $1`, [storeId]),
+    ).rejects.toMatchObject({
+      code: "23000",
+      constraint: "memberships_exactly_one_owner",
+      schema: SCHEMA,
+      table: "memberships",
+    });
+    const owners = await scoped.query(`SELECT user_id FROM memberships WHERE role = 'owner'`);
+    expect(owners.rows).toEqual([{ user_id: "owner" }]);
+  });
 });
 
 /**
  * applySchema() over a database that an older applySchema() created, before
- * memberships had its two constraints. Postgres has no ADD CONSTRAINT IF NOT
- * EXISTS, so applySchema() adds each one only when it is missing; when rows
- * already break them it stops with an error and changes no row.
+ * memberships had its two constraints and the exactly-one-Owner trigger.
+ * Postgres has no ADD CONSTRAINT IF NOT EXISTS, so applySchema() adds each
+ * constraint only when it is missing; when rows already break them it stops
+ * with an error and changes no row. The trigger checks only later changes to
+ * an Owner row, so adding it never fails on existing rows.
  *
  * The older database is made by bootstrapping a throwaway schema and dropping
- * the two constraints: they are the only difference in memberships'
- * definition.
+ * the two constraints and the trigger (with its function): they are the only
+ * difference in memberships' definition.
  */
 describe("applySchema() upgrades a database created before the Membership constraints", () => {
   const OLD = `upgrade_${randomUUID().replace(/-/g, "")}`;
@@ -229,7 +306,14 @@ describe("applySchema() upgrades a database created before the Membership constr
       ALTER TABLE memberships
         DROP CONSTRAINT IF EXISTS memberships_user_store_key,
         DROP CONSTRAINT IF EXISTS memberships_role_check`);
-    expect(membershipConstraints((await snapshot(old, OLD)).constraints)).toEqual([]);
+    await old.query(`
+      DROP TRIGGER IF EXISTS memberships_exactly_one_owner ON memberships;
+      DROP FUNCTION IF EXISTS memberships_check_exactly_one_owner()`);
+    const older = await snapshot(old, OLD);
+    expect(membershipConstraints(older.constraints)).toEqual([]);
+    expect(membershipTriggers(older, OLD)).toEqual(
+      OWNER_TRIGGERS.filter((t) => t.tgname === "memberships_no_delete_owner"),
+    );
 
     await old.query(
       `INSERT INTO stores (id, store_id, name, subdomain)
@@ -281,6 +365,7 @@ describe("applySchema() upgrades a database created before the Membership constr
     expect(await allMemberships()).toEqual(before);
     const upgraded = await snapshot(old, OLD);
     expect(membershipConstraints(upgraded.constraints)).toEqual(MEMBERSHIP_CONSTRAINTS);
+    expect(membershipTriggers(upgraded, OLD)).toEqual(OWNER_TRIGGERS);
 
     await applySchema(FRESH_URL);
     expect(withoutSchemaName(upgraded, OLD)).toEqual(

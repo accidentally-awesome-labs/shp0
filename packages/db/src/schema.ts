@@ -371,8 +371,10 @@ export type ProcessedEvent = typeof processedEvents.$inferSelect;
  *
  * applySchema() also holds it to one Membership per person per Store
  * (memberships_user_store_key) and role text of exactly 'owner', 'admin' or
- * 'staff' (memberships_role_check), besides the single-Owner index and the
- * owner-delete trigger.
+ * 'staff' (memberships_role_check), besides the single-Owner index, the
+ * owner-delete trigger, and the COMMIT-time check that a Store whose Owner
+ * row a transaction changed still has exactly one Owner
+ * (memberships_exactly_one_owner).
  */
 export const memberships = pgTable("memberships", {
   id: uuid("id").primaryKey().defaultRandom(),

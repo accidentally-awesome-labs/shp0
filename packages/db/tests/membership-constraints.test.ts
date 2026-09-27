@@ -182,10 +182,9 @@ describe("memberships: one Membership per person per Store, valid Role text", ()
 
   it("mis-cased owner text can no longer carry the Owner row past the owner-delete trigger", async () => {
     // With free role text, 'owner' -> 'Owner' and then DELETE removed the Owner.
-    // A separate gap remains: the trigger fires only on DELETE, so demoting the
-    // row to a valid Role (and then deleting it), or moving it to another
-    // Store, still leaves a Store with no Owner. See the comment at the
-    // trigger in applySchema().
+    // Demoting the row to a valid Role (and then deleting it), or moving it
+    // to another Store, is refused at COMMIT by memberships_exactly_one_owner
+    // (owner-invariant.test.ts).
     await expect(
       pool.query(
         "UPDATE memberships SET role = 'Owner' WHERE user_id = $1 AND store_id = $2 AND role = 'owner'",
