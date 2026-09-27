@@ -12,9 +12,11 @@
 /packages/db/src/payments.ts           @salarsayyad
 /packages/db/src/billing.ts            @salarsayyad
 /packages/db/src/customer-auth.ts      @salarsayyad
+/packages/db/src/roles.ts              @salarsayyad
 /packages/db/drizzle.config.ts         @salarsayyad
 /packages/auth/                        @salarsayyad
 /apps/web/proxy.ts                     @salarsayyad
+/apps/web/app/(auth)/sign-in/page.tsx  @salarsayyad
 /apps/web/lib/auth.ts                  @salarsayyad
 /apps/web/lib/current-store.ts         @salarsayyad
 /apps/web/lib/operator.ts              @salarsayyad
