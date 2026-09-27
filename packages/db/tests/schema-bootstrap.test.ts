@@ -351,8 +351,8 @@ describe("applySchema() bootstraps an empty database", () => {
  * CONSTRAINT IF NOT EXISTS, so applySchema() adds each constraint only when
  * it is missing; when rows already break them it stops with an error and
  * changes no row. The two triggers check only later changes (to an Owner
- * row, or a Store inserted from then on), so adding them never fails on
- * existing rows, an ownerless Store included.
+ * row, or a Store inserted or given a new id from then on), so adding them
+ * never fails on existing rows, an ownerless Store included.
  *
  * The older database is made by bootstrapping a throwaway schema and dropping
  * the two constraints and the two COMMIT-time triggers (with their

@@ -6,10 +6,11 @@ import { pgTable, text, timestamp, uuid, boolean, integer, bigint, jsonb } from 
  * tenant table (added in later issues) will carry `store_id` stamped from the
  * per-request GUC instead.
  *
- * The database refuses to commit a transaction that inserts a Store without
- * exactly one Owner Membership (stores_exactly_one_owner_at_creation, a
- * trigger applySchema() creates, checked at COMMIT): create a Store with
- * provisionStore, which inserts both in one transaction.
+ * The database refuses to commit a transaction that inserts a Store, or
+ * gives one a new id, without exactly one Owner Membership
+ * (stores_exactly_one_owner_at_creation, a trigger applySchema() creates,
+ * checked at COMMIT): create a Store with provisionStore, which inserts both
+ * in one transaction.
  */
 export const stores = pgTable("stores", {
   id: uuid("id").primaryKey().defaultRandom(),

@@ -31,8 +31,15 @@ import {
 
 const PLATFORM_URL = "postgresql:///shp0_test?user=cloud_admin";
 
-/** The refusal of a transaction that creates `storeId` without exactly one Owner. */
-function creationRefusal(storeId: string, owners = 0) {
+/**
+ * The refusal of a transaction that creates `storeId` without exactly one
+ * Owner: by inserting it, or by giving the Store `changedFrom` the id
+ * `storeId`.
+ */
+function creationRefusal(
+  storeId: string,
+  { owners = 0, changedFrom }: { owners?: number; changedFrom?: string } = {},
+) {
   return {
     code: "23000",
     constraint: "stores_exactly_one_owner_at_creation",
@@ -42,6 +49,7 @@ function creationRefusal(storeId: string, owners = 0) {
         `^Store ${storeId} must have exactly one Owner when it is created; this transaction creates it with ${owners}\\.$`,
       ),
     ),
+    detail: changedFrom ? `This transaction changed its id from ${changedFrom}.` : "This transaction inserted it.",
   };
 }
 
@@ -398,10 +406,7 @@ describe("Store creation: atomic, and never without its Owner", () => {
 
         const { commitError } = await transaction([insertStore(storeId), changeStoreId(storeId, newId)]);
 
-        expect(commitError).toMatchObject({
-          ...creationRefusal(newId),
-          detail: `This transaction changed its id from ${storeId}.`,
-        });
+        expect(commitError).toMatchObject(creationRefusal(newId, { changedFrom: storeId }));
         expect(await storeExists(storeId)).toBe(false);
         expect(await storeExists(newId)).toBe(false);
       });
@@ -416,7 +421,7 @@ describe("Store creation: atomic, and never without its Owner", () => {
             );
             await tx.execute(sql`UPDATE stores SET id = ${newId}, store_id = ${newId} WHERE id = ${storeId}`);
           }),
-        ).rejects.toMatchObject(creationRefusal(newId));
+        ).rejects.toMatchObject(creationRefusal(newId, { changedFrom: storeId }));
         expect(await storeExists(storeId)).toBe(false);
         expect(await storeExists(newId)).toBe(false);
       });
@@ -442,7 +447,7 @@ describe("Store creation: atomic, and never without its Owner", () => {
         const newId = randomUUID();
 
         const { commitError } = await transaction([changeStoreId(storeId, newId)]);
-        expect(commitError).toMatchObject(creationRefusal(newId));
+        expect(commitError).toMatchObject(creationRefusal(newId, { changedFrom: storeId }));
         expect(await storeExists(storeId)).toBe(true);
         expect(await storeExists(newId)).toBe(false);
 

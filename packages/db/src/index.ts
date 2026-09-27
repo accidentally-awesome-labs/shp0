@@ -600,14 +600,30 @@ export async function applySchema(
     // (SQLSTATE 23000, constraint stores_exactly_one_owner_at_creation)
     // and rolls back whole. After creation, parts 1 to 3 keep the Owner.
     //
-    // It fires only on INSERT, so existing Stores, ownerless ones included,
-    // are never checked and an upgrade cannot fail on them. This read-only
-    // query lists the Stores that do not have exactly one Owner:
+    // A Store with no Membership can still be given another id (memberships'
+    // foreign key refuses that once the Store has any Membership; nothing
+    // in the application changes stores.id). The Store under its new id is
+    // a new Store, so an UPDATE that changes id is checked like an INSERT,
+    // under the new id: a transaction cannot insert a Store and move it to
+    // another id to skip the check. An UPDATE that names id but keeps it is
+    // not checked.
+    //
+    // It checks only an INSERT and a change of id, so existing Stores,
+    // ownerless ones included, are not checked unless their id changes, and
+    // an upgrade cannot fail on them. This read-only query lists the Stores
+    // that do not have exactly one Owner:
     //   SELECT s.id, s.subdomain, count(m.id) AS owners FROM stores s
     //   LEFT JOIN memberships m ON m.store_id = s.id AND m.role = 'owner'
     //   GROUP BY s.id HAVING count(m.id) <> 1;
-    // Nothing updates stores.id; memberships' foreign key refuses that once
-    // the Store has any Membership, and this trigger does not check it.
+    //
+    // Rollout: every Store creation must insert the Store and its Owner's
+    // Membership in one transaction. Code that commits them separately (a
+    // provisionStore on a platformClient without BEGIN, as before this
+    // check existed, or an ad-hoc script in autocommit) has every Store
+    // creation refused once this trigger exists. So the transactional
+    // platformClient ships before this trigger is installed, or with it;
+    // rolling the code back to a non-transactional platformClient needs
+    // DROP TRIGGER stores_exactly_one_owner_at_creation ON stores first.
     //
     // Hardened like part 3: memberships is named through the trigger's own
     // schema (it sits beside stores), search_path is pinned, and
@@ -625,6 +641,9 @@ export async function applySchema(
         store_exists boolean;
         owners integer;
       BEGIN
+        IF TG_OP = 'UPDATE' AND NEW.id IS NOT DISTINCT FROM OLD.id THEN
+          RETURN NULL;
+        END IF;
         EXECUTE format('SELECT EXISTS (SELECT 1 FROM %I.%I WHERE id = $1)', TG_TABLE_SCHEMA, TG_TABLE_NAME)
           INTO store_exists USING NEW.id;
         IF NOT store_exists THEN
@@ -640,6 +659,10 @@ export async function applySchema(
                   CONSTRAINT = TG_NAME,
                   SCHEMA = TG_TABLE_SCHEMA,
                   TABLE = TG_TABLE_NAME,
+                  DETAIL = CASE TG_OP
+                    WHEN 'UPDATE' THEN format('This transaction changed its id from %s.', OLD.id)
+                    ELSE 'This transaction inserted it.'
+                  END,
                   HINT = 'Insert the Store and its Owner''s Membership in one transaction, '
                     || 'as provisionStore does.';
         END IF;
@@ -650,7 +673,7 @@ export async function applySchema(
     await client.query(`
       DROP TRIGGER IF EXISTS stores_exactly_one_owner_at_creation ON stores;
       CREATE CONSTRAINT TRIGGER stores_exactly_one_owner_at_creation
-        AFTER INSERT ON stores
+        AFTER INSERT OR UPDATE OF id ON stores
         DEFERRABLE INITIALLY DEFERRED
         FOR EACH ROW
         EXECUTE FUNCTION stores_check_exactly_one_owner_at_creation();
