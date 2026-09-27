@@ -1141,23 +1141,25 @@ async function lockCart(tx: Tx, customerId: string): Promise<string | null> {
 }
 
 /**
- * lockCart, creating the Cart first if there is none. Two first writes for
- * the same Customer race on the one-cart-per-customer unique index: the loser
- * inserts nothing (ON CONFLICT DO NOTHING waits for the winner to commit) and
- * then locks the winner's row.
+ * lockCart, creating the Cart first if there is none.
+ *
+ * The create is one upsert on the one-cart-per-customer unique index, and
+ * Postgres guarantees an ON CONFLICT DO UPDATE either inserts or updates
+ * (and so row-locks) even under concurrency: when another write created the
+ * Cart first, this waits for it and locks that row; when a checkout deleted
+ * that row meanwhile, it inserts a fresh Cart. (DO NOTHING followed by a
+ * second lockCart could find neither and fail the add.) The update only
+ * touches updated_at.
  */
 async function lockOrCreateCart(tx: Tx, storeId: string, customerId: string): Promise<string> {
   const existing = await lockCart(tx, customerId);
   if (existing !== null) return existing;
   // store_id is stamped from the transaction's GUC by the trigger (ADR-0001).
-  const inserted = await tx.execute(
+  const upserted = await tx.execute(
     sql`INSERT INTO carts (store_id, customer_id) VALUES (${storeId}, ${customerId})
-        ON CONFLICT (store_id, customer_id) DO NOTHING RETURNING id`,
+        ON CONFLICT (store_id, customer_id) DO UPDATE SET updated_at = now() RETURNING id`,
   );
-  if (inserted.rows.length > 0) return inserted.rows[0]!.id as string;
-  const raced = await lockCart(tx, customerId);
-  if (raced === null) throw new Error("Could not create the cart");
-  return raced;
+  return upserted.rows[0]!.id as string;
 }
 
 /** A cart's lines in the order they were first added (created_at, see the writers below). */
