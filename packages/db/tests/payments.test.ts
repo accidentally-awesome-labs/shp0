@@ -53,6 +53,7 @@ describe("Payment fee math (Issue #10)", () => {
         ],
       };
       const params = buildCheckoutSessionParams({
+        storeId: "store-1",
         order,
         commissionBps: 250,
         connectAccountId: "acct_connect123",
@@ -76,26 +77,30 @@ describe("Payment fee math (Issue #10)", () => {
       expect(params.payment_intent_data).toEqual({
         application_fee_amount: 137,
         transfer_data: { destination: "acct_connect123" },
+        metadata: { shp0_store_id: "store-1", shp0_order_id: "order-1" },
       });
       expect(params.mode).toBe("payment");
       expect(params.success_url).toBe("https://store.shp0.dev/order/order-1");
       expect(params.cancel_url).toBe("https://store.shp0.dev/checkout");
     });
 
-    it("includes the order id in metadata for webhook reconciliation", () => {
+    it("names the Store and the Order in the session's and the PaymentIntent's metadata (ADR-0006)", () => {
       const order = {
         id: "order-abc",
         totalCents: 1000,
         lines: [{ variantId: "v1", productTitle: "Item", quantity: 1, unitPriceCents: 1000 }],
       };
       const params = buildCheckoutSessionParams({
+        storeId: "store-abc",
         order,
         commissionBps: 0,
         connectAccountId: "acct_1",
         successUrl: "https://example.com/success",
         cancelUrl: "https://example.com/cancel",
       });
-      expect(params.metadata).toMatchObject({ orderId: "order-abc" });
+      const metadata = { shp0_store_id: "store-abc", shp0_order_id: "order-abc" };
+      expect(params.metadata).toEqual(metadata);
+      expect(params.payment_intent_data.metadata).toEqual(metadata);
     });
   });
 });

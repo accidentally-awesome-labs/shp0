@@ -153,11 +153,18 @@ jobs:
           SQL
 
       # The db suite runs first (its files share the database and run one at a
-      # time); the auth suite runs after it, never concurrently.
+      # time); the auth and payments suites run after it, one at a time, never
+      # concurrently.
       - name: Integration tests (db)
         working-directory: packages/db
         run: pnpm exec vitest run
 
       - name: Integration tests (auth)
         working-directory: packages/auth
+        run: pnpm exec vitest run
+
+      # The Stripe webhook (ADR-0006), against Postgres and a local fake of
+      # the Stripe API: CI cannot reach Stripe, and needs no Stripe keys.
+      - name: Integration tests (payments)
+        working-directory: packages/payments
         run: pnpm exec vitest run

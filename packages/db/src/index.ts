@@ -834,6 +834,52 @@ export async function applySchema(
     `);
     await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON orders, order_lines TO "default";`);
 
+    // ── payments (TENANT table — RLS-protected; ADR-0006) ──
+    // One row per Stripe PaymentIntent the webhook accepted for an Order of
+    // the Store: the Payment that paid it (paid), or one refunded
+    // automatically (refund_due until Stripe has refunded it, then refunded;
+    // refund_failed with Stripe's error code when Stripe refused the refund,
+    // for a person to refund by hand). order_id is NULL when the Order the
+    // payment named was not in the Store.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS payments (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        store_id uuid NOT NULL,
+        order_id uuid REFERENCES orders(id) ON DELETE SET NULL,
+        stripe_account_id text NOT NULL,
+        payment_intent_id text NOT NULL,
+        checkout_session_id text NOT NULL,
+        amount_cents bigint NOT NULL,
+        currency text NOT NULL,
+        status text NOT NULL,
+        refund_reason text,
+        refund_attempts integer NOT NULL DEFAULT 0,
+        stripe_refund_id text,
+        stripe_refund_status text,
+        refund_error text,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        CONSTRAINT payments_payment_intent_key UNIQUE (payment_intent_id),
+        CONSTRAINT payments_status_check CHECK (status IN ('paid', 'refund_due', 'refunded', 'refund_failed')),
+        CONSTRAINT payments_refund_reason_check CHECK (
+          (status = 'paid' AND refund_reason IS NULL)
+          OR (status <> 'paid' AND refund_reason IS NOT NULL
+              AND refund_reason IN ('insufficient_inventory', 'already_paid', 'mismatch', 'order_not_payable'))
+        ),
+        CONSTRAINT payments_refund_error_check CHECK ((status = 'refund_failed') = (refund_error IS NOT NULL))
+      );
+    `);
+    await client.query(`DROP TRIGGER IF EXISTS payments_set_store_id ON payments; CREATE TRIGGER payments_set_store_id BEFORE INSERT ON payments FOR EACH ROW EXECUTE FUNCTION stamp_store_id();`);
+    await client.query(`ALTER TABLE payments ENABLE ROW LEVEL SECURITY;`);
+    await client.query(`
+      DROP POLICY IF EXISTS payments_tenant ON payments;
+      CREATE POLICY payments_tenant ON payments
+        FOR ALL TO "default"
+        USING (current_setting('app.store_id', true) = store_id::text)
+        WITH CHECK (current_setting('app.store_id', true) = store_id::text);
+    `);
+    await client.query(`GRANT SELECT, INSERT, UPDATE ON payments TO "default";`);
+
     // ── collections + collection_products (tenant tables, RLS-protected) ──
     await client.query(`
       CREATE TABLE IF NOT EXISTS collections (
@@ -1919,39 +1965,18 @@ export async function getStorefrontOrder(
 // other wait, but never deadlock.
 // ─────────────────────────────────────────────────────────────────────────
 
-/** How many times markOrderPaid runs its transaction when it loses a deadlock. */
+/** How many times a payment transaction runs when it loses a deadlock. */
 const PAYMENT_ATTEMPTS = 3;
 
 /**
- * Transition an Order to paid and decrement inventory atomically.
- *
- * THE CONCURRENCY FENCE (ADR-0002):
- * 1. Lock the Order row and check it is pending (idempotency).
- * 2. Read the Order's lines, one row per Variant with the total quantity of
- *    its lines, in Variant id order.
- * 3. Lock all those Variants in one statement, in id order (the LOCK ORDER
- *    above; line order is the order the Cart was filled in, and two Orders
- *    locking in opposite orders would deadlock).
- * 4. Check inventory >= total for every Variant.
- *    - If ANY is insufficient → insufficient_inventory. NO decrement happens.
- * 5. Decrement all Variants.
- * 6. Transition payment: pending → paid.
- *
- * All in ONE transaction — if step 4 fails, nothing is committed (no partial
- * decrement). If Postgres aborts the transaction to break a deadlock with some
- * other transaction (40P01), nothing was committed, and the whole transaction
- * runs again, up to PAYMENT_ATTEMPTS times.
- *
- * Returns ok if the transition succeeded, already_paid if the order was
- * already paid (idempotent — safe to call from a replayed webhook).
+ * Runs a payment transaction again when Postgres aborts it to break a
+ * deadlock with some other transaction (40P01). Nothing was committed, so a
+ * new attempt starts from scratch; at most PAYMENT_ATTEMPTS in all.
  */
-export async function markOrderPaid(
-  storeId: string,
-  orderId: string,
-): Promise<{ ok: true } | { ok: false; reason: "already_paid" | "insufficient_inventory" }> {
+async function withDeadlockRetry<T>(run: () => Promise<T>): Promise<T> {
   for (let attempt = 1; ; attempt++) {
     try {
-      return await markOrderPaidOnce(storeId, orderId);
+      return await run();
     } catch (error) {
       if (attempt < PAYMENT_ATTEMPTS && (error as { code?: unknown } | null)?.code === "40P01") continue;
       throw error;
@@ -1959,67 +1984,249 @@ export async function markOrderPaid(
   }
 }
 
-async function markOrderPaidOnce(
+/**
+ * Transition an Order to paid and decrement inventory atomically.
+ *
+ * THE CONCURRENCY FENCE (ADR-0002):
+ * 1. Lock the Order row and check it is pending (idempotency).
+ * 2-5. takeStock: read the lines per Variant in id order, lock the Variants
+ *    in id order, check and decrement their inventory.
+ * 6. Transition payment: pending → paid.
+ *
+ * All in ONE transaction — if the stock check fails, nothing is committed (no
+ * partial decrement). If Postgres aborts the transaction to break a deadlock
+ * with some other transaction (40P01), nothing was committed, and the whole
+ * transaction runs again, up to PAYMENT_ATTEMPTS times.
+ *
+ * Returns ok if the transition succeeded, already_paid if the order was
+ * already paid (idempotent — safe to call from a replayed webhook). Throws
+ * for an Order that is not found, not pending, or has a Variant that no
+ * longer exists. The Stripe webhook uses recordStripePayment instead.
+ */
+export async function markOrderPaid(
   storeId: string,
   orderId: string,
 ): Promise<{ ok: true } | { ok: false; reason: "already_paid" | "insufficient_inventory" }> {
-  return tenantClient(storeId, async (tx) => {
-    // Check current payment status (idempotency).
-    const orderRows = await tx.execute(
-      sql`SELECT payment_status FROM orders WHERE id = ${orderId} FOR UPDATE`,
-    );
-    if (orderRows.rows.length === 0) {
-      throw new Error(`Order ${orderId} not found`);
-    }
-    const currentStatus = orderRows.rows[0]!.payment_status as string;
-    if (currentStatus === "paid") {
-      return { ok: false, reason: "already_paid" };
-    }
-    if (currentStatus !== "pending") {
-      throw new Error(`Order ${orderId} is in unexpected state: ${currentStatus}`);
-    }
-
-    // Load order lines: one row per Variant, its lines' quantities summed, in
-    // id order.
-    const lineRows = await tx.execute(
-      sql`SELECT variant_id, sum(quantity)::int AS quantity FROM order_lines WHERE order_id = ${orderId} GROUP BY variant_id ORDER BY variant_id`,
-    );
-    const lines = lineRows.rows as Array<{ variant_id: string; quantity: number }>;
-
-    // Lock every Variant in id order (rows are locked as they leave the sort),
-    // then check each one. The lock serializes concurrent payments; NO KEY
-    // UPDATE is the lock the decrement takes anyway.
-    const variantRows = await tx.execute(
-      sql`SELECT id, inventory FROM variants WHERE id = ANY(${sql.param(lines.map((line) => line.variant_id))}::uuid[]) ORDER BY id FOR NO KEY UPDATE`,
-    );
-    const inventories = new Map(
-      (variantRows.rows as Array<{ id: string; inventory: number }>).map((row) => [row.id, row.inventory]),
-    );
-    for (const line of lines) {
-      const inventory = inventories.get(line.variant_id);
-      if (inventory === undefined) {
-        throw new Error(`Variant ${line.variant_id} not found`);
-      }
-      if (inventory < line.quantity) {
-        // Insufficient inventory — void this payment attempt.
-        // NO decrement happens (we haven't written any). The transaction rolls back.
-        return { ok: false, reason: "insufficient_inventory" };
-      }
-    }
-
-    // All checks passed — decrement every variant.
-    for (const line of lines) {
-      await tx.execute(
-        sql`UPDATE variants SET inventory = inventory - ${line.quantity} WHERE id = ${line.variant_id}`,
+  return withDeadlockRetry(() =>
+    tenantClient(storeId, async (tx) => {
+      // Check current payment status (idempotency).
+      const orderRows = await tx.execute(
+        sql`SELECT payment_status FROM orders WHERE id = ${orderId} FOR UPDATE`,
       );
-    }
+      if (orderRows.rows.length === 0) {
+        throw new Error(`Order ${orderId} not found`);
+      }
+      const currentStatus = orderRows.rows[0]!.payment_status as string;
+      if (currentStatus === "paid") {
+        return { ok: false, reason: "already_paid" } as const;
+      }
+      if (currentStatus !== "pending") {
+        throw new Error(`Order ${orderId} is in unexpected state: ${currentStatus}`);
+      }
 
-    // Transition payment: pending → paid.
+      const stock = await takeStock(tx, orderId);
+      if (stock.ok === false) {
+        if ("missingVariantId" in stock) throw new Error(`Variant ${stock.missingVariantId} not found`);
+        return { ok: false, reason: "insufficient_inventory" } as const;
+      }
+
+      // Transition payment: pending → paid.
+      await tx.execute(
+        sql`UPDATE orders SET payment_status = 'paid', updated_at = now() WHERE id = ${orderId}`,
+      );
+      return { ok: true } as const;
+    }),
+  );
+}
+
+/**
+ * Check and decrement the stock for one pending Order whose row the caller
+ * has locked, inside the caller's transaction (steps 2-5 of the fence):
+ *
+ * 2. Read the Order's lines, one row per Variant with the total quantity of
+ *    its lines, in Variant id order.
+ * 3. Lock all those Variants in one statement, in id order (the LOCK ORDER
+ *    above; line order is the order the Cart was filled in, and two Orders
+ *    locking in opposite orders would deadlock).
+ * 4. Check inventory >= total for every Variant. If any Variant is gone or
+ *    short, stop: nothing has been written.
+ * 5. Decrement all Variants.
+ */
+async function takeStock(
+  tx: Tx,
+  orderId: string,
+): Promise<{ ok: true } | { ok: false; missingVariantId: string } | { ok: false; insufficient: true }> {
+  const lineRows = await tx.execute(
+    sql`SELECT variant_id, sum(quantity)::int AS quantity FROM order_lines WHERE order_id = ${orderId} GROUP BY variant_id ORDER BY variant_id`,
+  );
+  const lines = lineRows.rows as Array<{ variant_id: string; quantity: number }>;
+
+  // Lock every Variant in id order (rows are locked as they leave the sort),
+  // then check each one. The lock serializes concurrent payments; NO KEY
+  // UPDATE is the lock the decrement takes anyway.
+  const variantRows = await tx.execute(
+    sql`SELECT id, inventory FROM variants WHERE id = ANY(${sql.param(lines.map((line) => line.variant_id))}::uuid[]) ORDER BY id FOR NO KEY UPDATE`,
+  );
+  const inventories = new Map(
+    (variantRows.rows as Array<{ id: string; inventory: number }>).map((row) => [row.id, row.inventory]),
+  );
+  for (const line of lines) {
+    const inventory = inventories.get(line.variant_id);
+    if (inventory === undefined) return { ok: false, missingVariantId: line.variant_id };
+    // Insufficient inventory — NO decrement happens (none has been written).
+    if (inventory < line.quantity) return { ok: false, insufficient: true };
+  }
+
+  // All checks passed — decrement every variant.
+  for (const line of lines) {
     await tx.execute(
-      sql`UPDATE orders SET payment_status = 'paid', updated_at = now() WHERE id = ${orderId}`,
+      sql`UPDATE variants SET inventory = inventory - ${line.quantity} WHERE id = ${line.variant_id}`,
     );
+  }
+  return { ok: true };
+}
 
-    return { ok: true as const };
+/** The Currency every Store charges in until a Store's Currency is stored (ADR-0004). */
+export const STORE_CURRENCY = "usd";
+
+/** Why a Payment is refunded automatically (ADR-0006). */
+export type RefundReason = "insufficient_inventory" | "already_paid" | "mismatch" | "order_not_payable";
+
+/**
+ * Record a Stripe payment the webhook accepted for an Order of the Store, and
+ * pay the Order with it when it can (ADR-0006, the payment transaction of
+ * ADR-0002). One transaction, retried on a deadlock like markOrderPaid:
+ *
+ * 1. Claim the PaymentIntent: insert its Payment row, or find the row a
+ *    previous delivery wrote (a concurrent delivery of the same payment waits
+ *    on the unique key, then finds it). A PaymentIntent that already has a
+ *    Payment is never applied or refunded a second time: `paid`, `refunded`
+ *    and `refund_failed` need nothing, and a Payment still `refund_due` is
+ *    tried again, as a new attempt (refund_attempts).
+ * 2. Lock the Order row (in this Store, under RLS). The Payment is refunded
+ *    when the Order is not there or not pending (order_not_payable), already
+ *    paid (already_paid: by another PaymentIntent, since this one is new), or
+ *    when the amount or currency is not the Order's (mismatch).
+ * 3. Take the stock (takeStock). A Variant gone or short refunds the Payment
+ *    (insufficient_inventory) and leaves the Order pending (ADR-0002 point 4).
+ * 4. Otherwise the Order becomes paid, and the Payment `paid`.
+ *
+ * A Payment to refund is recorded `refund_due`, with its reason, in the same
+ * transaction, before any refund is requested. Returns what the caller must
+ * do next: nothing, or refund the PaymentIntent in full (this attempt's
+ * number, for the request's idempotency key) and then call
+ * markPaymentRefunded (or markPaymentRefundFailed if Stripe refuses).
+ */
+export async function recordStripePayment(
+  storeId: string,
+  payment: {
+    orderId: string;
+    stripeAccountId: string;
+    paymentIntentId: string;
+    checkoutSessionId: string;
+    amountCents: number;
+    currency: string;
+  },
+): Promise<{ action: "none" } | { action: "refund"; reason: RefundReason; attempt: number }> {
+  if (!isUuid(storeId) || !isUuid(payment.orderId)) {
+    throw new Error("recordStripePayment needs a Store id and an Order id");
+  }
+  return withDeadlockRetry(() =>
+    tenantClient(storeId, async (tx) => {
+      // 1. Claim the PaymentIntent.
+      const claimed = await tx.execute(
+        sql`INSERT INTO payments (stripe_account_id, payment_intent_id, checkout_session_id, amount_cents, currency, status, refund_reason)
+            VALUES (${payment.stripeAccountId}, ${payment.paymentIntentId}, ${payment.checkoutSessionId},
+                    ${payment.amountCents}, ${payment.currency}, 'refund_due', 'order_not_payable')
+            ON CONFLICT (payment_intent_id) DO NOTHING
+            RETURNING id`,
+      );
+      if (claimed.rows.length === 0) {
+        const existing = await tx.execute(
+          sql`UPDATE payments SET refund_attempts = refund_attempts + 1, updated_at = now()
+              WHERE payment_intent_id = ${payment.paymentIntentId} AND status = 'refund_due'
+              RETURNING refund_reason, refund_attempts`,
+        );
+        // Nothing to do unless the Payment is still due a refund: `paid`,
+        // `refunded` and `refund_failed` are final here. (A row of another
+        // Store is not visible under RLS; its PaymentIntent is not this
+        // Store's to act on.)
+        const row = existing.rows[0] as { refund_reason: RefundReason; refund_attempts: number } | undefined;
+        if (!row) return { action: "none" } as const;
+        return { action: "refund", reason: row.refund_reason, attempt: row.refund_attempts } as const;
+      }
+
+      const refund = async (reason: RefundReason, orderId: string | null) => {
+        await tx.execute(
+          sql`UPDATE payments SET refund_reason = ${reason}, order_id = ${orderId}, refund_attempts = 1, updated_at = now()
+              WHERE payment_intent_id = ${payment.paymentIntentId}`,
+        );
+        return { action: "refund", reason, attempt: 1 } as const;
+      };
+
+      // 2. Lock the Order and check it can take this payment.
+      const orderRows = await tx.execute(
+        sql`SELECT payment_status, total_cents::bigint AS total_cents FROM orders WHERE id = ${payment.orderId} FOR UPDATE`,
+      );
+      const order = orderRows.rows[0] as { payment_status: string; total_cents: string | number } | undefined;
+      if (!order) return refund("order_not_payable", null);
+      if (order.payment_status === "paid") return refund("already_paid", payment.orderId);
+      if (order.payment_status !== "pending") return refund("order_not_payable", payment.orderId);
+      if (Number(order.total_cents) !== payment.amountCents || payment.currency !== STORE_CURRENCY) {
+        return refund("mismatch", payment.orderId);
+      }
+
+      // 3. Take the stock.
+      const stock = await takeStock(tx, payment.orderId);
+      if (!stock.ok) return refund("insufficient_inventory", payment.orderId);
+
+      // 4. Pay the Order with this Payment.
+      await tx.execute(
+        sql`UPDATE orders SET payment_status = 'paid', updated_at = now() WHERE id = ${payment.orderId}`,
+      );
+      await tx.execute(
+        sql`UPDATE payments SET status = 'paid', refund_reason = NULL, order_id = ${payment.orderId}, updated_at = now()
+            WHERE payment_intent_id = ${payment.paymentIntentId}`,
+      );
+      return { action: "none" } as const;
+    }),
+  );
+}
+
+/**
+ * Record that Stripe created the refund of a Payment due one, with the
+ * Refund's id and status (`succeeded`, or `pending` until the money is back).
+ * Both are null when Stripe answered that the charge was already refunded.
+ */
+export async function markPaymentRefunded(
+  storeId: string,
+  paymentIntentId: string,
+  refund: { id: string; status: string | null } | null,
+): Promise<void> {
+  await tenantClient(storeId, async (tx) => {
+    await tx.execute(
+      sql`UPDATE payments SET status = 'refunded', stripe_refund_id = ${refund?.id ?? null},
+            stripe_refund_status = ${refund?.status ?? null}, updated_at = now()
+          WHERE payment_intent_id = ${paymentIntentId} AND status = 'refund_due'`,
+    );
+  });
+}
+
+/**
+ * Record that Stripe refused, for good, to refund a Payment due a refund (for
+ * example a disputed charge, or no access to the account), with Stripe's
+ * error code. A Store Admin or an Operator must refund it by hand (ADR-0006).
+ */
+export async function markPaymentRefundFailed(
+  storeId: string,
+  paymentIntentId: string,
+  errorCode: string,
+): Promise<void> {
+  await tenantClient(storeId, async (tx) => {
+    await tx.execute(
+      sql`UPDATE payments SET status = 'refund_failed', refund_error = ${errorCode}, updated_at = now()
+          WHERE payment_intent_id = ${paymentIntentId} AND status = 'refund_due'`,
+    );
   });
 }
 
