@@ -30,12 +30,36 @@ export type RecordedRequest = {
 
 export type FakeReply = { status: number; body: unknown } | { dropConnection: true };
 
+/**
+ * A Checkout Session the fake created, which tests may move along (complete,
+ * paid, expired) the way a Customer and Stripe would.
+ */
+export type FakeSession = {
+  id: string;
+  account: string | undefined;
+  url: string;
+  status: "open" | "complete" | "expired";
+  payment_status: "paid" | "unpaid" | "no_payment_required";
+  amount_total: number;
+  currency: string;
+  metadata: Record<string, string>;
+  /** The PaymentIntent, once the Customer has paid or tried to. */
+  paymentIntent: { id: string; status: string } | null;
+};
+
 export type FakeStripe = {
   stripe: Stripe;
   requests: RecordedRequest[];
+  /** Checkout Sessions created through the fake, by id. */
+  sessions: Map<string, FakeSession>;
   /** Queue a reply for the next request that has no saved result. */
   reply(reply: FakeReply): void;
-  /** Forget requests, queued replies and saved results. */
+  /**
+   * Run `hook` when the next request arrives, before it is answered: for
+   * something that happens while shp0 waits on Stripe.
+   */
+  beforeNextReply(hook: () => Promise<void>): void;
+  /** Forget requests, queued replies, hooks, saved results and sessions. */
   reset(): void;
   close(): Promise<void>;
 };
@@ -58,11 +82,15 @@ export function stripeError(status: number, code: string, message = code): FakeR
 export async function startFakeStripe(): Promise<FakeStripe> {
   const requests: RecordedRequest[] = [];
   const queue: FakeReply[] = [];
+  const hooks: Array<() => Promise<void>> = [];
   const saved = new Map<string, FakeReply>();
+  const sessions = new Map<string, FakeSession>();
   let refunds = 0;
+  let sessionCount = 0;
 
   const server = createServer((req, res) => {
-    void readBody(req).then((body) => {
+    void readBody(req).then(async (body) => {
+      await hooks.shift()?.();
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
       const params = new URLSearchParams(body);
       const stripeAccount = header(req, "stripe-account");
@@ -72,7 +100,7 @@ export async function startFakeStripe(): Promise<FakeStripe> {
       const reply =
         (savedKey === undefined ? undefined : saved.get(savedKey)) ??
         queue.shift() ??
-        defaultReply(req.method ?? "", url.pathname, params);
+        defaultReply(req.method ?? "", url.pathname, params, stripeAccount, url.searchParams);
       if (savedKey !== undefined && !saved.has(savedKey) && !isUnsaved(reply)) saved.set(savedKey, reply);
       requests.push({ method: req.method ?? "", path: url.pathname, params, stripeAccount, idempotencyKey, reply });
 
@@ -89,7 +117,66 @@ export async function startFakeStripe(): Promise<FakeStripe> {
     return "dropConnection" in reply || reply.status === 429 || reply.status === 409;
   }
 
-  function defaultReply(method: string, path: string, params: URLSearchParams): FakeReply {
+  function sessionBody(session: FakeSession, expand: string[]) {
+    return {
+      id: session.id,
+      object: "checkout.session",
+      mode: "payment",
+      url: session.status === "open" ? session.url : null,
+      status: session.status,
+      payment_status: session.payment_status,
+      amount_total: session.amount_total,
+      currency: session.currency,
+      metadata: session.metadata,
+      payment_intent: expand.includes("payment_intent")
+        ? session.paymentIntent && { object: "payment_intent", ...session.paymentIntent }
+        : (session.paymentIntent?.id ?? null),
+    };
+  }
+
+  function defaultReply(
+    method: string,
+    path: string,
+    params: URLSearchParams,
+    account: string | undefined,
+    query: URLSearchParams,
+  ): FakeReply {
+    if (method === "POST" && path === "/v1/checkout/sessions") {
+      sessionCount += 1;
+      const id = `cs_test_fake_${sessionCount}`;
+      let amount = 0;
+      for (let i = 0; params.has(`line_items[${i}][quantity]`); i++) {
+        amount +=
+          Number(params.get(`line_items[${i}][quantity]`)) *
+          Number(params.get(`line_items[${i}][price_data][unit_amount]`));
+      }
+      const metadata: Record<string, string> = {};
+      for (const [key, value] of params) {
+        const match = /^metadata\[(.+)\]$/.exec(key);
+        if (match) metadata[match[1]!] = value;
+      }
+      const session: FakeSession = {
+        id,
+        account,
+        url: `https://checkout.stripe.test/c/pay/${id}`,
+        status: "open",
+        payment_status: "unpaid",
+        amount_total: amount,
+        currency: params.get("line_items[0][price_data][currency]") ?? "usd",
+        metadata,
+        paymentIntent: null,
+      };
+      sessions.set(id, session);
+      return { status: 200, body: sessionBody(session, []) };
+    }
+    const retrieve = /^\/v1\/checkout\/sessions\/([^/]+)$/.exec(path);
+    if (method === "GET" && retrieve) {
+      const session = sessions.get(retrieve[1]!);
+      if (!session || session.account !== account) {
+        return stripeError(404, "resource_missing", `No such checkout.session: '${retrieve[1]}'`);
+      }
+      return { status: 200, body: sessionBody(session, query.getAll("expand[]")) };
+    }
     if (method === "POST" && path === "/v1/refunds") {
       refunds += 1;
       return {
@@ -120,10 +207,16 @@ export async function startFakeStripe(): Promise<FakeStripe> {
     reply: (reply) => {
       queue.push(reply);
     },
+    beforeNextReply: (hook) => {
+      hooks.push(hook);
+    },
+    sessions,
     reset: () => {
       requests.length = 0;
       queue.length = 0;
+      hooks.length = 0;
       saved.clear();
+      sessions.clear();
     },
     close: () => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
   };
