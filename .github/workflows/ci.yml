@@ -85,7 +85,6 @@ jobs:
           tests/discounts.test.ts
           tests/billing.test.ts
           tests/collections.test.ts
-          tests/payments.test.ts
           tests/store-status.test.ts
           tests/domain-verification.test.ts
           tests/hostname.test.ts

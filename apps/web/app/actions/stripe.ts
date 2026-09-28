@@ -1,15 +1,11 @@
 "use server";
 
-import type Stripe from "stripe";
+import { redirect } from "next/navigation";
 
 import { readCartToken } from "@/lib/cart-token";
-import { authorizeStore, resolveStorefrontStore } from "@/lib/current-store";
-import {
-  getPaymentAccount,
-  getStoreCommissionBps,
-  getOrderForCheckout,
-  buildCheckoutSessionParams,
-} from "@shp0/db";
+import { authorizeStore, resolveStorefront } from "@/lib/current-store";
+import { getPaymentAccount, isUuid } from "@shp0/db";
+import { startCheckout, type CheckoutOutcome } from "@shp0/payments";
 import {
   createConnectAccountAndOnboardingLink,
   createOnboardingLink,
@@ -33,43 +29,36 @@ export async function onboardConnectAction(storeId: string): Promise<{ url: stri
   return { url };
 }
 
-// Storefront: pay for an Order of the request host's Store. Only the request
-// carrying the cart token that placed the Order (its own shp0_cart_token
-// cookie) may: getOrderForCheckout matches both in one query, so no token,
-// another shopper's token and a nonexistent Order all read "Order not found".
-export async function createCheckoutSessionAction(orderId: string): Promise<{ url: string }> {
-  const storeId = await resolveStorefrontStore();
-  if (!storeId) throw new Error("No store resolved");
+/**
+ * Storefront Pay (ADR-0006): send the Customer to Stripe Checkout for an
+ * Order of the request host's Store, or back to the Order page, whose
+ * `?checkout=` says why not. Only the request carrying the cart token that
+ * placed the Order (its own shp0_cart_token cookie) gets a session:
+ * startCheckout matches both, so another shopper's token, no token and a
+ * nonexistent Order all read "not_found".
+ *
+ * Stripe's return URLs are on the host that served this request.
+ */
+export async function payOrderAction(orderId: string): Promise<void> {
+  const storefront = await resolveStorefront();
+  if (!storefront || !isUuid(orderId)) redirect("/");
 
-  const order = await getOrderForCheckout(storeId, orderId, await readCartToken());
-  if (!order) throw new Error("Order not found");
-  if (order.paymentStatus !== "pending") {
-    throw new Error("Order is not pending payment");
+  let outcome: CheckoutOutcome | { kind: "failed" };
+  try {
+    outcome = await startCheckout(
+      { stripe: getStripe() },
+      { storeId: storefront.storeId, orderId, cartToken: await readCartToken(), origin: storefront.origin },
+    );
+  } catch (error) {
+    // Nothing was given to the Customer; they can Pay again.
+    console.error(
+      `Pay failed for Order ${orderId} (Store ${storefront.storeId}):`,
+      error instanceof Error ? error.message : String(error),
+    );
+    outcome = { kind: "failed" };
   }
 
-  const account = await getPaymentAccount(storeId);
-  if (!account || !account.chargesEnabled) {
-    throw new Error("Store has not completed Stripe onboarding");
-  }
-
-  const commissionBps = await getStoreCommissionBps(storeId);
-
-  const params = buildCheckoutSessionParams({
-    storeId,
-    order,
-    commissionBps,
-    connectAccountId: account.connectAccountId,
-    successUrl: `${process.env.NEXT_PUBLIC_APP_URL}/order/${order.id}`,
-    cancelUrl: `${process.env.NEXT_PUBLIC_APP_URL}/checkout`,
-  });
-
-  const stripe = getStripe();
-  const session = await stripe.checkout.sessions.create(
-    params as Stripe.Checkout.SessionCreateParams,
-    {
-      stripeAccount: account.connectAccountId,
-    },
-  );
-
-  return { url: session.url! };
+  // redirect() throws, so it stays outside the try.
+  if (outcome.kind === "redirect") redirect(outcome.url);
+  redirect(`/order/${orderId}?checkout=${outcome.kind === "failed" ? "failed" : outcome.reason}`);
 }

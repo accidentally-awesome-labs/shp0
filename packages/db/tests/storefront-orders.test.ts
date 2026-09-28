@@ -102,6 +102,7 @@ describe("Storefront Order access (the placing cart token)", () => {
         fulfillmentStatus: "unfulfilled",
         totalCents: 2000,
         lines: [{ productTitle: "Widget", variantTitle: "Large", quantity: 2, unitPriceCents: 1000 }],
+        payment: null,
       });
     });
 
@@ -176,6 +177,25 @@ describe("Storefront Order access (the placing cart token)", () => {
       expect(await getOrderForCheckout(storeA, orderA1, null)).toBeNull();
       expect(await getOrderForCheckout(storeB, orderA1, tokenA1)).toBeNull();
       expect(await getOrderForCheckout(storeA, "not-a-uuid", tokenA1)).toBeNull();
+    });
+
+    it("keeps a deleted Variant's line, so Pay can refuse it and check the total", async () => {
+      expect(await getOrderForCheckout(storeA, orderWithGoneVariant, tokenA2)).toEqual({
+        id: orderWithGoneVariant,
+        paymentStatus: "pending",
+        totalCents: 300,
+        lines: [
+          {
+            variantId: expect.any(String),
+            productTitle: null,
+            variantTitle: null,
+            quantity: 1,
+            unitPriceCents: 300,
+            inventory: null,
+          },
+        ],
+        checkout: { attempt: 0, sessionId: null, inFlight: false },
+      });
     });
   });
 

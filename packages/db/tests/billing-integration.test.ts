@@ -9,15 +9,14 @@ import {
   closePools,
   provisionStore,
   getStoreTier,
-  getTierCommissionBps,
   setStoreTier,
 } from "../src/index";
 import { TIERS } from "../src/billing";
 
 /**
- * Issue #15 — Tier switching + commission rate application.
+ * Issue #15 — Tier switching. No Tier carries a Commission (ADR-0007).
  */
-describe("Platform billing — tier + commission (Issue #15)", () => {
+describe("Platform billing — tiers (Issue #15)", () => {
   let pool: Pool;
   let storeId: string;
 
@@ -43,32 +42,23 @@ describe("Platform billing — tier + commission (Issue #15)", () => {
   });
 
   it("defaults to the Free tier (no subscription yet)", async () => {
-    const tier = await getStoreTier(storeId);
-    expect(tier.id).toBe("free");
-    expect(tier.commissionBps).toBe(TIERS.free.commissionBps);
+    expect(await getStoreTier(storeId)).toEqual(TIERS.free);
   });
 
-  it("commission rate reflects the Free tier (300 bps = 3.0%)", async () => {
-    const bps = await getTierCommissionBps(storeId);
-    expect(bps).toBe(300);
-  });
-
-  it("upgrades to Pro — commission rate drops to 200 bps", async () => {
+  it("upgrades to Pro, then Scale, and downgrades back to Free", async () => {
     await setStoreTier(storeId, "pro");
-    const tier = await getStoreTier(storeId);
-    expect(tier.id).toBe("pro");
-    expect(tier.commissionBps).toBe(200);
-    expect(await getTierCommissionBps(storeId)).toBe(200);
-  });
-
-  it("upgrades to Scale — commission rate drops to 100 bps", async () => {
+    expect(await getStoreTier(storeId)).toEqual(TIERS.pro);
     await setStoreTier(storeId, "scale");
-    expect(await getTierCommissionBps(storeId)).toBe(100);
+    expect(await getStoreTier(storeId)).toEqual(TIERS.scale);
+    await setStoreTier(storeId, "free");
+    expect(await getStoreTier(storeId)).toEqual(TIERS.free);
   });
 
-  it("downgrades back to Free — commission rate returns to 300 bps", async () => {
-    await setStoreTier(storeId, "free");
-    expect(await getTierCommissionBps(storeId)).toBe(300);
+  it("keeps no Commission rate on a Store (ADR-0007)", async () => {
+    const { rows } = await pool.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_name = 'stores' AND column_name = 'commission_bps'`,
+    );
+    expect(rows).toEqual([]);
   });
 
   // A tier id reaches setStoreTier from a form field. An unknown one used to

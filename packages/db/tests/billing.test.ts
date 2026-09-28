@@ -47,10 +47,11 @@ describe("Usage policy evaluator (Issue #15)", () => {
     }
   });
 
-  // ── Cycle 4: commission rate decreases at higher tiers ──
-  it("commission rate decreases at higher tiers (Free > Pro > Scale)", () => {
-    expect(TIERS.free.commissionBps).toBeGreaterThan(TIERS.pro.commissionBps);
-    expect(TIERS.pro.commissionBps).toBeGreaterThan(TIERS.scale.commissionBps);
+  // ── Cycle 4: no Commission on any tier (ADR-0007) ──
+  it("no tier carries a Commission rate", () => {
+    for (const tier of Object.values(TIERS)) {
+      expect(Object.keys(tier).filter((key) => /commission/i.test(key))).toEqual([]);
+    }
   });
 
   // ── Cycle 5: order limits — Free hard-caps, Pro overages ──

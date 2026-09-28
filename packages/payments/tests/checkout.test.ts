@@ -2,9 +2,9 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { randomUUID } from "node:crypto";
 import { Pool, type PoolClient } from "pg";
 
-import { applySchema, closePools, provisionStore, upsertPaymentAccount } from "@shp0/db";
+import { applySchema, closePools, getStorefrontOrder, provisionStore, upsertPaymentAccount } from "@shp0/db";
 
-import { getCheckoutAvailability, startCheckout, type CheckoutOutcome } from "../src/index";
+import { getCheckoutAvailability, handleStripeWebhook, startCheckout, type CheckoutOutcome } from "../src/index";
 import { startFakeStripe, stripeError, type FakeStripe, type RecordedRequest } from "./fake-stripe";
 
 /**
@@ -435,6 +435,72 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
         expect(await pay(order, store)).toEqual({ kind: "blocked", reason: "payments_not_set_up" });
       }
       expect(fake.requests).toEqual([]);
+    });
+  });
+
+  describe("paying the session", () => {
+    it("pays the Order through the webhook, which accepts the session Pay created", async () => {
+      const order = await newOrder({ lines: [{ quantity: 2, inventory: 5 }] });
+      const session = sessionOf(await pay(order));
+      const paymentIntent = `pi_${randomUUID().replaceAll("-", "")}`;
+      const payload = JSON.stringify({
+        id: `evt_${randomUUID().replaceAll("-", "")}`,
+        object: "event",
+        type: "checkout.session.completed",
+        account,
+        livemode: false,
+        data: {
+          object: {
+            id: session.id,
+            object: "checkout.session",
+            status: "complete",
+            payment_status: "paid",
+            amount_total: session.amount_total,
+            currency: session.currency,
+            metadata: session.metadata,
+            payment_intent: paymentIntent,
+          },
+        },
+      });
+      const secret = "whsec_test_checkout";
+      const response = await handleStripeWebhook(
+        payload,
+        fake.stripe.webhooks.generateTestHeaderString({ payload, secret }),
+        { stripe: fake.stripe, webhookSecret: secret, livemode: false },
+      );
+
+      expect(response).toEqual({ status: 200, body: { received: true } });
+      expect(await getStorefrontOrder(storeId, order.orderId, order.token)).toMatchObject({
+        paymentStatus: "paid",
+        payment: { status: "paid", refundReason: null },
+      });
+      const { rows } = await pool.query(`SELECT inventory FROM variants WHERE id = $1`, [order.variantIds[0]]);
+      expect(rows[0].inventory).toBe(3);
+    });
+
+    it("shows the Order page the current session's refunded Payment, not an earlier session's", async () => {
+      const order = await newOrder();
+      const first = sessionOf(await pay(order));
+      const paymentIntent = `pi_${randomUUID().replaceAll("-", "")}`;
+      await asStore(storeId, (client) =>
+        client.query(
+          `INSERT INTO payments (order_id, stripe_account_id, payment_intent_id, checkout_session_id, amount_cents, currency, status, refund_reason)
+           VALUES ($1, $2, $3, $4, $5, 'usd', 'refunded', 'insufficient_inventory')`,
+          [order.orderId, account, paymentIntent, first.id, order.total],
+        ),
+      );
+      expect((await getStorefrontOrder(storeId, order.orderId, order.token))!.payment).toEqual({
+        status: "refunded",
+        refundReason: "insufficient_inventory",
+      });
+
+      Object.assign(first, {
+        status: "complete",
+        payment_status: "paid",
+        paymentIntent: { id: paymentIntent, status: "succeeded" },
+      });
+      sessionOf(await pay(order));
+      expect((await getStorefrontOrder(storeId, order.orderId, order.token))!.payment).toBeNull();
     });
   });
 

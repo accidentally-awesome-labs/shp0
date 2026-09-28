@@ -38,8 +38,6 @@ export type {
 export { isUuid } from "./ids";
 export { transitionPayment, transitionFulfillment, isOrderOpen } from "./order";
 export type { PaymentStatus, FulfillmentStatus } from "./order";
-export { computeApplicationFee, buildCheckoutSessionParams } from "./payments";
-export type { CheckoutSessionParams } from "./payments";
 export { matchesRule } from "./collections";
 export type { CollectionRule, ProductForRule } from "./collections";
 export { applyDiscounts } from "./discounts";
@@ -56,6 +54,7 @@ export {
   validateCustomDomain,
   customDomainRejectionMessage,
   routeStorefrontHost,
+  storefrontOrigin,
   InvalidCustomDomainError,
 } from "./hostname";
 export type { CustomDomainRejection, CustomDomainValidation, StorefrontHostRoute } from "./hostname";
@@ -833,6 +832,12 @@ export async function applySchema(
         WITH CHECK (current_setting('app.store_id', true) = store_id::text);
     `);
     await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON orders, order_lines TO "default";`);
+    // Pay's bookkeeping (ADR-0006): the Order's current Stripe Checkout
+    // attempt (0 before the first), when it started, and its Checkout Session
+    // once Stripe has returned one.
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS checkout_attempt integer NOT NULL DEFAULT 0;`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS checkout_started_at timestamptz;`);
+    await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS checkout_session_id text;`);
 
     // ── payments (TENANT table — RLS-protected; ADR-0006) ──
     // One row per Stripe PaymentIntent the webhook accepted for an Order of
@@ -1052,8 +1057,8 @@ export async function applySchema(
       );
     `);
 
-    // ── commission_bps on stores (idempotent migration) ──
-    await client.query(`ALTER TABLE stores ADD COLUMN IF NOT EXISTS commission_bps integer NOT NULL DEFAULT 250;`);
+    // ── No Commission (ADR-0007): the old per-Store rate is dropped ──
+    await client.query(`ALTER TABLE stores DROP COLUMN IF EXISTS commission_bps;`);
     // ── status on stores (platform admin: active | suspended | terminated) ──
     await client.query(`ALTER TABLE stores ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'active';`);
 
@@ -1889,6 +1894,12 @@ export type StorefrontOrder = {
     quantity: number;
     unitPriceCents: number;
   }>;
+  /**
+   * The Payment Stripe reported for the Order's current Checkout Session, if
+   * any: the one that paid it, or one refunded automatically, with the
+   * reason (ADR-0006). A Payment of an earlier session is not shown.
+   */
+  payment: { status: PaymentRecordStatus; refundReason: RefundReason | null } | null;
 };
 
 /**
@@ -1911,7 +1922,7 @@ export async function getStorefrontOrder(
   if (!isUuid(orderId) || !isUuid(cartToken)) return null;
   return tenantClient(storeId, async (tx) => {
     const orderRows = await tx.execute(
-      sql`SELECT id, payment_status, fulfillment_status, total_cents FROM orders
+      sql`SELECT id, payment_status, fulfillment_status, total_cents, checkout_session_id FROM orders
           WHERE id = ${orderId} AND customer_id = ${cartToken} LIMIT 1`,
     );
     if (orderRows.rows.length === 0) return null;
@@ -1920,6 +1931,7 @@ export async function getStorefrontOrder(
       payment_status: string;
       fulfillment_status: string;
       total_cents: string | number;
+      checkout_session_id: string | null;
     };
 
     const lineRows = await tx.execute(
@@ -1930,6 +1942,17 @@ export async function getStorefrontOrder(
           WHERE ol.order_id = ${o.id}
           ORDER BY ol.created_at, ol.id`,
     );
+    const paymentRows =
+      o.checkout_session_id === null
+        ? []
+        : (
+            await tx.execute(
+              sql`SELECT status, refund_reason FROM payments
+                  WHERE order_id = ${o.id} AND checkout_session_id = ${o.checkout_session_id}
+                  ORDER BY created_at DESC LIMIT 1`,
+            )
+          ).rows;
+    const payment = paymentRows[0] as { status: PaymentRecordStatus; refund_reason: RefundReason | null } | undefined;
     return {
       id: o.id,
       paymentStatus: o.payment_status,
@@ -1949,6 +1972,7 @@ export async function getStorefrontOrder(
         quantity: r.quantity,
         unitPriceCents: Number(r.unit_price_cents),
       })),
+      payment: payment ? { status: payment.status, refundReason: payment.refund_reason } : null,
     };
   });
 }
@@ -2092,6 +2116,9 @@ export const STORE_CURRENCY = "usd";
 /** Why a Payment is refunded automatically (ADR-0006). */
 export type RefundReason = "insufficient_inventory" | "already_paid" | "mismatch" | "order_not_payable";
 
+/** A Payment's outcome (the payments table's status). */
+export type PaymentRecordStatus = "paid" | "refund_due" | "refunded" | "refund_failed";
+
 /**
  * Record a Stripe payment the webhook accepted for an Order of the Store, and
  * pay the Order with it when it can (ADR-0006, the payment transaction of
@@ -2230,6 +2257,87 @@ export async function markPaymentRefundFailed(
   });
 }
 
+/** The outcome of the Payment recorded for a PaymentIntent, or null if none is. */
+export async function getPaymentStatus(
+  storeId: string,
+  paymentIntentId: string,
+): Promise<PaymentRecordStatus | null> {
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT status FROM payments WHERE payment_intent_id = ${paymentIntentId} LIMIT 1`,
+    );
+    return (rows.rows[0]?.status as PaymentRecordStatus | undefined) ?? null;
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Pay: one Stripe Checkout Session per Order at a time (ADR-0006).
+//
+// An Order records its current Checkout attempt: a number, when it started
+// and, once Stripe returned it, its session. A new attempt is started only
+// through reserveCheckoutAttempt (one of two concurrent Pays wins), and a
+// session reaches the Customer only once recordCheckoutSession has recorded
+// it. So an Order never has two sessions a Customer could pay. The caller
+// (@shp0/payments startCheckout) has already matched the Order to the
+// Customer's cart token with getOrderForCheckout.
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * How long an attempt without a session counts as still being created. Pay's
+ * Stripe requests time out well within it; after it, the attempt is over and
+ * the next Pay starts a new one.
+ */
+export const CHECKOUT_ATTEMPT_LEASE_SECONDS = 60;
+
+/**
+ * Start the next Checkout attempt of a pending Order: only if its attempt and
+ * session are still `expected`, so of two Pays that saw the same state, one
+ * starts it. The session is cleared and the start time stamped. Returns the
+ * new attempt number, or null when the Order has changed (or is no longer
+ * pending) and the caller must look again.
+ */
+export async function reserveCheckoutAttempt(
+  storeId: string,
+  orderId: string,
+  expected: { attempt: number; sessionId: string | null },
+): Promise<number | null> {
+  if (!isUuid(orderId)) return null;
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(
+      sql`UPDATE orders SET checkout_attempt = checkout_attempt + 1, checkout_started_at = now(), checkout_session_id = NULL
+          WHERE id = ${orderId} AND payment_status = 'pending'
+            AND checkout_attempt = ${expected.attempt}
+            AND checkout_session_id IS NOT DISTINCT FROM ${expected.sessionId}
+          RETURNING checkout_attempt`,
+    );
+    return (rows.rows[0]?.checkout_attempt as number | undefined) ?? null;
+  });
+}
+
+/**
+ * Record the Checkout Session Stripe returned for an attempt: only while the
+ * Order is pending and the attempt is still its current one, without another
+ * session. Returns whether the session is recorded; one that is not must not
+ * be given to the Customer.
+ */
+export async function recordCheckoutSession(
+  storeId: string,
+  orderId: string,
+  attempt: number,
+  sessionId: string,
+): Promise<boolean> {
+  if (!isUuid(orderId)) return false;
+  return tenantClient(storeId, async (tx) => {
+    const rows = await tx.execute(
+      sql`UPDATE orders SET checkout_session_id = ${sessionId}
+          WHERE id = ${orderId} AND payment_status = 'pending' AND checkout_attempt = ${attempt}
+            AND (checkout_session_id IS NULL OR checkout_session_id = ${sessionId})
+          RETURNING id`,
+    );
+    return rows.rows.length > 0;
+  });
+}
+
 /**
  * Check whether a webhook event has already been processed (idempotency).
  * Returns true if the event id is in the processed_events table.
@@ -2304,19 +2412,6 @@ export async function getPaymentAccount(
 }
 
 /**
- * Get a Store's commission in basis points.
- */
-export async function getStoreCommissionBps(storeId: string): Promise<number> {
-  return platformClient(async (tx) => {
-    const rows = await tx.execute(
-      sql`SELECT commission_bps FROM stores WHERE id = ${storeId} LIMIT 1`,
-    );
-    if (rows.rows.length === 0) throw new Error("Store not found");
-    return rows.rows[0]!.commission_bps as number;
-  });
-}
-
-/**
  * Resolve a Store id from a Stripe Connect account id.
  * Used by the webhook handler to find which Store a payment belongs to.
  */
@@ -2332,67 +2427,102 @@ export async function getStoreIdByConnectAccount(
   });
 }
 
+/** An Order as Pay needs it (ADR-0006). */
+export type OrderForCheckout = {
+  id: string;
+  paymentStatus: string;
+  totalCents: number;
+  /** Every line, in the order placed, a deleted Variant's too. */
+  lines: Array<{
+    variantId: string;
+    /** Null when the Variant has since been deleted. */
+    productTitle: string | null;
+    variantTitle: string | null;
+    quantity: number;
+    unitPriceCents: number;
+    /** The Variant's units in stock now; null when it has been deleted. */
+    inventory: number | null;
+  }>;
+  /** Pay's bookkeeping. */
+  checkout: {
+    /** The current attempt; 0 before the first. */
+    attempt: number;
+    /** The current attempt's Checkout Session, once recorded. */
+    sessionId: string | null;
+    /**
+     * The current attempt has no session yet and started less than
+     * CHECKOUT_ATTEMPT_LEASE_SECONDS ago: it may still be being created.
+     */
+    inFlight: boolean;
+  };
+};
+
 /**
- * Load an Order with its lines in the shape needed by buildCheckoutSessionParams.
- * Includes product titles for the Stripe line item names.
+ * Load an Order for Pay, only for the cart token that placed it, matched in
+ * the query like getStorefrontOrder: anyone else gets null, as for a
+ * nonexistent Order.
  *
- * Only for the cart token that placed the Order, matched in the query like
- * getStorefrontOrder: anyone else gets null, as for a nonexistent Order.
+ * A deleted Variant's line is kept (null titles and inventory), so the caller
+ * can refuse it and can check that the lines add up to the total.
  */
 export async function getOrderForCheckout(
   storeId: string,
   orderId: string,
   cartToken: string | null | undefined,
-): Promise<{
-  id: string;
-  paymentStatus: string;
-  totalCents: number;
-  lines: Array<{
-    variantId: string;
-    productTitle: string;
-    quantity: number;
-    unitPriceCents: number;
-  }>;
-} | null> {
+): Promise<OrderForCheckout | null> {
   if (!isUuid(orderId) || !isUuid(cartToken)) return null;
   return tenantClient(storeId, async (tx) => {
     const orderRows = await tx.execute(
-      sql`SELECT id, payment_status, total_cents FROM orders
+      sql`SELECT id, payment_status, total_cents, checkout_attempt, checkout_session_id,
+                 COALESCE(checkout_session_id IS NULL
+                   AND checkout_started_at > now() - make_interval(secs => ${CHECKOUT_ATTEMPT_LEASE_SECONDS}), false) AS in_flight
+          FROM orders
           WHERE id = ${orderId} AND customer_id = ${cartToken} LIMIT 1`,
     );
     if (orderRows.rows.length === 0) return null;
     const o = orderRows.rows[0] as {
       id: string;
       payment_status: string;
-      total_cents: number;
+      total_cents: string | number;
+      checkout_attempt: number;
+      checkout_session_id: string | null;
+      in_flight: boolean;
     };
 
     const lineRows = await tx.execute(
-      sql`
-        SELECT ol.variant_id, ol.quantity, ol.unit_price_cents, p.title as product_title
-        FROM order_lines ol
-        JOIN variants v ON v.id = ol.variant_id
-        JOIN products p ON p.id = v.product_id
-        WHERE ol.order_id = ${orderId}
-      `,
+      sql`SELECT ol.variant_id, ol.quantity, ol.unit_price_cents,
+                 p.title AS product_title, v.title AS variant_title, v.inventory
+          FROM order_lines ol
+          LEFT JOIN variants v ON v.id = ol.variant_id
+          LEFT JOIN products p ON p.id = v.product_id
+          WHERE ol.order_id = ${o.id}
+          ORDER BY ol.created_at, ol.id`,
     );
-    const lines = (lineRows.rows as Array<{
-      variant_id: string;
-      quantity: number;
-      unit_price_cents: number;
-      product_title: string;
-    }>).map((r) => ({
+    const lines = (
+      lineRows.rows as Array<{
+        variant_id: string;
+        quantity: number;
+        unit_price_cents: string | number;
+        product_title: string | null;
+        variant_title: string | null;
+        inventory: number | null;
+      }>
+    ).map((r) => ({
       variantId: r.variant_id,
       productTitle: r.product_title,
+      variantTitle: r.product_title === null ? null : r.variant_title,
       quantity: r.quantity,
-      unitPriceCents: r.unit_price_cents,
+      // bigint columns arrive as strings from raw queries.
+      unitPriceCents: Number(r.unit_price_cents),
+      inventory: r.product_title === null ? null : r.inventory,
     }));
 
     return {
       id: o.id,
       paymentStatus: o.payment_status,
-      totalCents: o.total_cents,
+      totalCents: Number(o.total_cents),
       lines,
+      checkout: { attempt: o.checkout_attempt, sessionId: o.checkout_session_id, inFlight: o.in_flight },
     };
   });
 }
@@ -2863,11 +2993,11 @@ export async function listCustomerAddresses(
 
 
 // ─────────────────────────────────────────────────────────────────────────
-// Platform billing — Tiers / Subscriptions / Commission (Issue #15).
+// Platform billing — Tiers / Subscriptions (Issue #15).
 //
 // A Store holds one Subscription to a Tier at a time. The Tier determines
-// the commission rate (collected as the Connect application_fee) and usage
-// limits (Free = hard cap, Pro/Scale = overage).
+// its usage limits (Free = hard cap, Pro/Scale = overage). shp0 takes no
+// Commission on any Tier (ADR-0007).
 // ─────────────────────────────────────────────────────────────────────────
 
 import { TIERS } from "./billing";
@@ -2886,15 +3016,6 @@ export async function getStoreTier(storeId: string): Promise<Tier> {
     const tierId = rows.rows[0]!.tier_id as "free" | "pro" | "scale";
     return TIERS[tierId];
   });
-}
-
-/**
- * Get a Store's commission rate from its current Tier.
- * This replaces the static stores.commission_bps — the rate is tier-driven.
- */
-export async function getTierCommissionBps(storeId: string): Promise<number> {
-  const tier = await getStoreTier(storeId);
-  return tier.commissionBps;
 }
 
 /**

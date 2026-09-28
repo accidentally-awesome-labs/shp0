@@ -17,8 +17,6 @@ export const stores = pgTable("stores", {
   storeId: uuid("store_id").notNull(),
   name: text("name").notNull(),
   subdomain: text("subdomain").notNull().unique(),
-  // Commission in basis points (250 = 2.5%). Platform-wide default, overridable per store.
-  commissionBps: integer("commission_bps").notNull().default(250),
   // Platform admin status: active | suspended | terminated (Issue #16).
   status: text("status").notNull().default("active"),
   createdAt: timestamp("created_at", { withTimezone: true })
@@ -117,6 +115,10 @@ export const orders = pgTable("orders", {
   paymentStatus: text("payment_status").notNull().default("pending"),
   fulfillmentStatus: text("fulfillment_status").notNull().default("unfulfilled"),
   totalCents: bigint("total_cents", { mode: "number" }).notNull(),
+  // Pay's current Stripe Checkout attempt and its session (ADR-0006).
+  checkoutAttempt: integer("checkout_attempt").notNull().default(0),
+  checkoutStartedAt: timestamp("checkout_started_at", { withTimezone: true }),
+  checkoutSessionId: text("checkout_session_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });
@@ -189,7 +191,7 @@ export type NewCollectionProduct = typeof collectionProducts.$inferInsert;
 /**
  * A Subscription — links a Store to a billing Tier (Issue #15).
  * PLATFORM table (no RLS) — one Store → one Tier at a time.
- * Queried via platformClient. The tier determines the commission rate.
+ * Queried via platformClient. The tier determines the usage limits.
  */
 export const subscriptions = pgTable("subscriptions", {
   id: uuid("id").primaryKey().defaultRandom(),

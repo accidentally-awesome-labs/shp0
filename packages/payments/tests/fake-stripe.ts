@@ -175,7 +175,9 @@ export async function startFakeStripe(): Promise<FakeStripe> {
       if (!session || session.account !== account) {
         return stripeError(404, "resource_missing", `No such checkout.session: '${retrieve[1]}'`);
       }
-      return { status: 200, body: sessionBody(session, query.getAll("expand[]")) };
+      // The SDK sends expand[0]=…; accept expand[]=… as well.
+      const expand = [...query].filter(([key]) => /^expand\[\d*\]$/.test(key)).map(([, value]) => value);
+      return { status: 200, body: sessionBody(session, expand) };
     }
     if (method === "POST" && path === "/v1/refunds") {
       refunds += 1;

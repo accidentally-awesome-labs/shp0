@@ -25,21 +25,19 @@ export type Tier = {
   id: "free" | "pro" | "scale";
   name: string;
   priceCents: number;       // monthly price
-  commissionBps: number;    // decreases at higher tiers
   limits: TierLimits;
   hardCap: boolean;         // Free = true (blocks), Pro/Scale = false (overage)
 };
 
 /**
- * Platform-defined tiers. Commission DECREASES at higher tiers (the platform
- * takes less as merchants grow). Price increases. Limits increase.
+ * Platform-defined tiers. Price and limits increase at higher tiers. No Tier
+ * carries a Commission: shp0 takes none on a Store's sales (ADR-0007).
  */
 export const TIERS: Record<"free" | "pro" | "scale", Tier> = {
   free: {
     id: "free",
     name: "Free",
     priceCents: 0,
-    commissionBps: 300,      // 3.0%
     limits: { maxProducts: 10, maxOrdersPerMonth: 50, maxStaffSeats: 1 },
     hardCap: true,           // blocks at limits
   },
@@ -47,7 +45,6 @@ export const TIERS: Record<"free" | "pro" | "scale", Tier> = {
     id: "pro",
     name: "Pro",
     priceCents: 2900,        // $29/mo
-    commissionBps: 200,      // 2.0%
     limits: { maxProducts: 500, maxOrdersPerMonth: 2000, maxStaffSeats: 5 },
     hardCap: false,          // overages, not blocked
   },
@@ -55,7 +52,6 @@ export const TIERS: Record<"free" | "pro" | "scale", Tier> = {
     id: "scale",
     name: "Scale",
     priceCents: 9900,        // $99/mo
-    commissionBps: 100,      // 1.0%
     limits: { maxProducts: 10000, maxOrdersPerMonth: 50000, maxStaffSeats: 20 },
     hardCap: false,          // overages, not blocked
   },
