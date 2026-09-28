@@ -1333,12 +1333,19 @@ export async function listProducts(
 /**
  * Delete a Product (cascades to its Variants). RLS ensures only the Current
  * Store's products are deletable.
+ *
+ * The Product's Variants are locked in id order first (the LOCK ORDER at
+ * markOrderPaid): the cascade would lock them in storage order, and could
+ * deadlock with a payment for them.
  */
 export async function deleteProduct(
   storeId: string,
   productId: string,
 ): Promise<void> {
   await tenantClient(storeId, async (tx) => {
+    await tx.execute(
+      sql`SELECT id FROM variants WHERE product_id = ${productId} ORDER BY id FOR UPDATE`,
+    );
     await tx
       .delete(schema.products)
       .where(eq(schema.products.id, productId));
@@ -1904,27 +1911,55 @@ export async function getStorefrontOrder(
 // Payment transaction + idempotency (Issue #10, ADR-0002).
 //
 // markOrderPaid() is the concurrency fence: it transitions payment: pending→paid,
-// reads the affected Variants FOR UPDATE (row-lock), checks + decrements inventory,
-// all atomically inside ONE transaction. No oversell is possible.
+// reads the affected Variants FOR NO KEY UPDATE (row-lock), checks + decrements
+// inventory, all atomically inside ONE transaction. No oversell is possible.
+//
+// LOCK ORDER: a transaction that locks more than one Variant locks them in id
+// order (markOrderPaid, deleteProduct). Two such transactions can make each
+// other wait, but never deadlock.
 // ─────────────────────────────────────────────────────────────────────────
+
+/** How many times markOrderPaid runs its transaction when it loses a deadlock. */
+const PAYMENT_ATTEMPTS = 3;
 
 /**
  * Transition an Order to paid and decrement inventory atomically.
  *
  * THE CONCURRENCY FENCE (ADR-0002):
- * 1. Read the Order's lines.
- * 2. SELECT ... FOR UPDATE on each Variant (row-lock — serializes concurrent payments).
- * 3. Check inventory >= quantity for every line.
- *    - If ANY line is insufficient → throw (payment voided). NO decrement happens.
- * 4. Decrement all variants.
- * 5. Transition payment: pending → paid.
+ * 1. Lock the Order row and check it is pending (idempotency).
+ * 2. Read the Order's lines, one row per Variant with the total quantity of
+ *    its lines, in Variant id order.
+ * 3. Lock all those Variants in one statement, in id order (the LOCK ORDER
+ *    above; line order is the order the Cart was filled in, and two Orders
+ *    locking in opposite orders would deadlock).
+ * 4. Check inventory >= total for every Variant.
+ *    - If ANY is insufficient → insufficient_inventory. NO decrement happens.
+ * 5. Decrement all Variants.
+ * 6. Transition payment: pending → paid.
  *
- * All in ONE transaction — if step 3 fails, nothing is committed (no partial decrement).
+ * All in ONE transaction — if step 4 fails, nothing is committed (no partial
+ * decrement). If Postgres aborts the transaction to break a deadlock with some
+ * other transaction (40P01), nothing was committed, and the whole transaction
+ * runs again, up to PAYMENT_ATTEMPTS times.
  *
- * Returns true if the transition succeeded, false if the order was already paid
- * (idempotent — safe to call from a replayed webhook).
+ * Returns ok if the transition succeeded, already_paid if the order was
+ * already paid (idempotent — safe to call from a replayed webhook).
  */
 export async function markOrderPaid(
+  storeId: string,
+  orderId: string,
+): Promise<{ ok: true } | { ok: false; reason: "already_paid" | "insufficient_inventory" }> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await markOrderPaidOnce(storeId, orderId);
+    } catch (error) {
+      if (attempt < PAYMENT_ATTEMPTS && (error as { code?: unknown } | null)?.code === "40P01") continue;
+      throw error;
+    }
+  }
+}
+
+async function markOrderPaidOnce(
   storeId: string,
   orderId: string,
 ): Promise<{ ok: true } | { ok: false; reason: "already_paid" | "insufficient_inventory" }> {
@@ -1944,21 +1979,27 @@ export async function markOrderPaid(
       throw new Error(`Order ${orderId} is in unexpected state: ${currentStatus}`);
     }
 
-    // Load order lines.
+    // Load order lines: one row per Variant, its lines' quantities summed, in
+    // id order.
     const lineRows = await tx.execute(
-      sql`SELECT variant_id, quantity FROM order_lines WHERE order_id = ${orderId}`,
+      sql`SELECT variant_id, sum(quantity)::int AS quantity FROM order_lines WHERE order_id = ${orderId} GROUP BY variant_id ORDER BY variant_id`,
     );
     const lines = lineRows.rows as Array<{ variant_id: string; quantity: number }>;
 
-    // Lock + check each variant. FOR UPDATE serializes concurrent payments.
+    // Lock every Variant in id order (rows are locked as they leave the sort),
+    // then check each one. The lock serializes concurrent payments; NO KEY
+    // UPDATE is the lock the decrement takes anyway.
+    const variantRows = await tx.execute(
+      sql`SELECT id, inventory FROM variants WHERE id = ANY(${sql.param(lines.map((line) => line.variant_id))}::uuid[]) ORDER BY id FOR NO KEY UPDATE`,
+    );
+    const inventories = new Map(
+      (variantRows.rows as Array<{ id: string; inventory: number }>).map((row) => [row.id, row.inventory]),
+    );
     for (const line of lines) {
-      const variantRows = await tx.execute(
-        sql`SELECT inventory FROM variants WHERE id = ${line.variant_id} FOR UPDATE`,
-      );
-      if (variantRows.rows.length === 0) {
+      const inventory = inventories.get(line.variant_id);
+      if (inventory === undefined) {
         throw new Error(`Variant ${line.variant_id} not found`);
       }
-      const inventory = variantRows.rows[0]!.inventory as number;
       if (inventory < line.quantity) {
         // Insufficient inventory — void this payment attempt.
         // NO decrement happens (we haven't written any). The transaction rolls back.

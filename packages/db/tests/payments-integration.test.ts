@@ -24,7 +24,7 @@ import { variants } from "../src/schema";
  * Issue #10 — Payment transaction: the concurrency fence.
  *
  * markOrderPaid() is the critical correctness boundary:
- * - It decrements inventory under a FOR UPDATE row-lock.
+ * - It decrements inventory under a row lock on each Variant, taken in id order.
  * - It transitions payment: pending → paid.
  * - If inventory is insufficient, it voids the payment (no oversell).
  * - It's idempotent (replay = no-op).
