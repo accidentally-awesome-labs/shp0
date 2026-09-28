@@ -88,9 +88,9 @@ This ADR records the charge model and the rules every payment path follows.
 
    **How a refund is carried out:**
    1. **Recorded first.** The Payment is recorded with the outcome _refund due_ and its reason, in the same transaction that decides it, before the refund is requested.
-   2. **Requested.** The request carries no amount, so Stripe refunds whatever is still refundable, and it carries the idempotency key `refund:<PaymentIntent id>`.
-   3. **Result.** A created refund, or Stripe's answer that the charge is already refunded, makes the Payment _refunded_.
-   4. **Retryable failures** (network, rate limit, Stripe unavailable, a key already in use) are answered 5xx, so that Stripe delivers the event again. Stripe returns a key's saved result, even an error, for at least 24 hours; after that a retry is executed again.
+   2. **Requested.** The request carries no amount, so Stripe refunds whatever is still refundable. Each attempt carries its own idempotency key, `refund:<PaymentIntent id>:<attempt>`. Stripe keeps a key's first result, even an error, for at least 24 hours, so a retry under the same key would only get the same failure back. A new key per attempt is safe because a full refund cannot be made twice: once the charge is refunded, Stripe answers that it is already refunded.
+   3. **Result.** A created refund (its id and status recorded), or Stripe's answer that the charge is already refunded, makes the Payment _refunded_.
+   4. **Retryable failures** (no answer, rate limit, Stripe unavailable, a key already in use) are answered 5xx, so that Stripe delivers the event again, and the next attempt is made.
    5. **Any other refusal**, such as a disputed charge or lost access to the account, is answered 200. It makes the Payment _refund failed_, with Stripe's error code, for a Store Admin or an Operator to refund by hand.
 
    Stripe stops delivering an event after some days. Before live mode, _refund due_ Payments must also be retried outside the webhook.
@@ -98,7 +98,7 @@ This ADR records the charge model and the rules every payment path follows.
 7. **Idempotency is layered.**
    - `processed_events` skips an event that was already handled.
    - The unique Payment and the locked Order row make a repeated, or concurrent, delivery of the same payment change nothing, except retrying a refund that is still due.
-   - Stripe idempotency keys make a repeated account, session or refund request return the first result.
+   - Stripe idempotency keys make a repeated account or session request return the first result. Refund attempts have a key each, and a charge cannot be refunded twice.
 
 8. **Testing without Stripe.**
    - CI cannot reach Stripe. Tests point the Stripe SDK at a local fake Stripe server, configured with its `host`, `port` and `protocol` options. The fake records every request: method, path, parameters, `Stripe-Account` and `Idempotency-Key`.
@@ -126,4 +126,5 @@ This ADR records the charge model and the rules every payment path follows.
   - tax (#32);
   - storing the Store's Currency;
   - the Customer's email and delivery address on the Order;
-  - retrying _refund due_ Payments outside the webhook, needed before live mode.
+  - retrying _refund due_ Payments outside the webhook, needed before live mode;
+  - following a refund that Stripe created but that later fails (`refund.updated`, `refund.failed`).
