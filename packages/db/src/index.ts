@@ -2934,11 +2934,14 @@ export async function signUpCustomer(
 }
 
 /**
- * A hash of no one's password, checked when no Customer has the email, so an
- * unknown email costs the same scrypt as a wrong password (timing does not
- * tell whether an email has an account). Made once, on first use.
+ * A hash of no one's password (a random one, thrown away), checked when no
+ * Customer has the email, so an unknown email costs the same one scrypt as a
+ * wrong password: timing does not tell whether an email has an account.
  */
-let noCustomerHash: string | null = null;
+const NO_CUSTOMER_HASH =
+  "4d15f68698af755d6ef8761e6af8eca3:" +
+  "7e578ee3a177e81762dc28f5d93ff2a77a69a1e6a33c81eeadefa90f517a52ae" +
+  "71869876f751a5e1c314e73c0f526b5784d38d34e53a44654c14817d0bd3eb18";
 
 /**
  * Sign in a Customer — returns a session token, or null if credentials are wrong.
@@ -2948,12 +2951,14 @@ export async function signInCustomer(
   opts: { email: string; password: string },
 ): Promise<{ token: string; customerId: string } | null> {
   return tenantClient(storeId, async (tx) => {
+    // store_id as a column, not only through RLS (which compares a cast), so
+    // the lookup uses UNIQUE (store_id, email): one index probe whether or
+    // not the email has an account, never a scan of every Store's Customers.
     const rows = await tx.execute(
-      sql`SELECT id, password_hash FROM customers WHERE email = ${opts.email} LIMIT 1`,
+      sql`SELECT id, password_hash FROM customers WHERE store_id = ${storeId} AND email = ${opts.email} LIMIT 1`,
     );
     if (rows.rows.length === 0) {
-      noCustomerHash ??= hashPassword(randomUUID());
-      verifyPassword(opts.password, noCustomerHash);
+      verifyPassword(opts.password, NO_CUSTOMER_HASH);
       return null;
     }
     const customer = rows.rows[0] as { id: string; password_hash: string };
@@ -3030,8 +3035,21 @@ export async function startCustomerSignIn(
   return startedSession(storeId, session.token, previousToken);
 }
 
+/**
+ * The new session is committed by now: ending the browser's previous one is
+ * best effort (its cookie is replaced either way), so a failure there is
+ * logged, not reported as a failed sign-in.
+ */
 async function startedSession(storeId: string, token: string, previousToken: string | null): Promise<CustomerSessionResult> {
-  if (previousToken && previousToken !== token) await signOutCustomer(storeId, previousToken);
+  if (previousToken && previousToken !== token) {
+    try {
+      await signOutCustomer(storeId, previousToken);
+    } catch (error) {
+      console.error(
+        `Could not end the previous Customer session in Store ${storeId}: ${error instanceof Error ? `${error.name}: ${error.message}` : "unknown error"}`,
+      );
+    }
+  }
   return { ok: true, token };
 }
 

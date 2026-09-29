@@ -25,6 +25,11 @@ export default function SignOutButton() {
       >
         {pending || signedOut ? "Signing out…" : "Sign out"}
       </button>
+      {state?.ok === false && (
+        <p role="alert" className="mt-2 text-sm text-red-600">
+          Couldn&apos;t sign you out. Please try again.
+        </p>
+      )}
     </form>
   );
 }
