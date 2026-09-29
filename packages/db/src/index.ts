@@ -66,7 +66,9 @@ export type {
 } from "./domain-verification";
 export { hashPassword, verifyPassword } from "./customer-auth";
 export {
+  CUSTOMER_SESSION_MAX_AGE_SECONDS,
   customerFormMessage,
+  customerSessionCookieOptions,
   CustomerSignUpError,
   MAX_EMAIL_LENGTH,
   MAX_NAME_LENGTH,
@@ -2900,10 +2902,16 @@ export async function redeemDiscount(
 // ─────────────────────────────────────────────────────────────────────────
 
 import { hashPassword, verifyPassword } from "./customer-auth";
-import { CustomerSignUpError } from "./customer-forms";
+import {
+  CUSTOMER_SESSION_MAX_AGE_SECONDS,
+  CustomerSignUpError,
+  parseCustomerSignIn,
+  parseCustomerSignUp,
+  type CustomerFormRejection,
+} from "./customer-forms";
 
 /** Session expiry: 30 days. */
-const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_DURATION_MS = CUSTOMER_SESSION_MAX_AGE_SECONDS * 1000;
 
 /**
  * Sign up a new Customer in a Store. Throws CustomerSignUpError
@@ -2926,6 +2934,13 @@ export async function signUpCustomer(
 }
 
 /**
+ * A hash of no one's password, checked when no Customer has the email, so an
+ * unknown email costs the same scrypt as a wrong password (timing does not
+ * tell whether an email has an account). Made once, on first use.
+ */
+let noCustomerHash: string | null = null;
+
+/**
  * Sign in a Customer — returns a session token, or null if credentials are wrong.
  */
 export async function signInCustomer(
@@ -2936,7 +2951,11 @@ export async function signInCustomer(
     const rows = await tx.execute(
       sql`SELECT id, password_hash FROM customers WHERE email = ${opts.email} LIMIT 1`,
     );
-    if (rows.rows.length === 0) return null;
+    if (rows.rows.length === 0) {
+      noCustomerHash ??= hashPassword(randomUUID());
+      verifyPassword(opts.password, noCustomerHash);
+      return null;
+    }
     const customer = rows.rows[0] as { id: string; password_hash: string };
     if (!verifyPassword(opts.password, customer.password_hash)) return null;
     const token = randomUUID();
@@ -2957,6 +2976,63 @@ export async function signOutCustomer(storeId: string, token: string): Promise<v
   await tenantClient(storeId, async (tx) => {
     await tx.execute(sql`DELETE FROM customer_sessions WHERE token = ${token}`);
   });
+}
+
+/** What the storefront's sign-up or sign-in did: a new session's token, or why not. */
+export type CustomerSessionResult = { ok: true; token: string } | { ok: false; reason: CustomerFormRejection };
+
+/**
+ * The storefront's sign-up (ADR-0003): parse the form (parseCustomerSignUp),
+ * create the Customer, and start their session, ending the session the
+ * browser had before (`previousToken`), if any. A form the rules refuse, or
+ * a taken email, is a reason, and nothing is written; any other failure is
+ * thrown.
+ */
+export async function startCustomerSignUp(
+  storeId: string,
+  input: { email: unknown; name: unknown; password: unknown },
+  previousToken: string | null,
+): Promise<CustomerSessionResult> {
+  const parsed = parseCustomerSignUp(input);
+  if (!parsed.ok) return parsed;
+  try {
+    await signUpCustomer(storeId, parsed.value);
+  } catch (error) {
+    if (error instanceof CustomerSignUpError) return { ok: false, reason: error.reason };
+    throw error;
+  }
+  const session = await signInCustomer(storeId, parsed.value);
+  // `=== null`, not `!session`: see startCustomerSignIn.
+  if (session === null) throw new Error("A Customer who just signed up could not sign in");
+  return startedSession(storeId, session.token, previousToken);
+}
+
+/**
+ * The storefront's sign-in (ADR-0003): parse the form (parseCustomerSignIn)
+ * and start a session, ending the session the browser had before
+ * (`previousToken`), if any. Anything that is not a Customer's email and
+ * password is "wrong_credentials", whichever was wrong; a refused sign-in
+ * keeps the session the browser has.
+ */
+export async function startCustomerSignIn(
+  storeId: string,
+  input: { email: unknown; password: unknown },
+  previousToken: string | null,
+): Promise<CustomerSessionResult> {
+  const parsed = parseCustomerSignIn(input);
+  if (!parsed.ok) return parsed;
+  const session = await signInCustomer(storeId, parsed.value);
+  // `=== null`, not `!session`: Turbopack (Next 16.3 canary) folds a
+  // truthiness test on the awaited result of a function in this module that
+  // returns another async call (tenantClient(...)) to "always true", and
+  // drops this branch from the build. An explicit comparison is kept.
+  if (session === null) return { ok: false, reason: "wrong_credentials" };
+  return startedSession(storeId, session.token, previousToken);
+}
+
+async function startedSession(storeId: string, token: string, previousToken: string | null): Promise<CustomerSessionResult> {
+  if (previousToken && previousToken !== token) await signOutCustomer(storeId, previousToken);
+  return { ok: true, token };
 }
 
 /**

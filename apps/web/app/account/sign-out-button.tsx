@@ -1,42 +1,30 @@
 "use client";
 
-import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useActionState, useEffect } from "react";
 import { customerSignOutAction } from "@/app/actions/customers";
 
-/** Sign out, then show the account page signed out. */
+/**
+ * Sign out. The form posts the server action even before the page's
+ * JavaScript has loaded; then the browser loads the account page afresh,
+ * so no route the router keeps hidden outlives the session.
+ */
 export default function SignOutButton() {
-  const router = useRouter();
-  const [pending, setPending] = useState(false);
-  const [failed, setFailed] = useState(false);
+  const [state, formAction, pending] = useActionState(customerSignOutAction, null);
+  const signedOut = state?.ok === true;
 
-  async function signOut() {
-    setPending(true);
-    setFailed(false);
-    try {
-      await customerSignOutAction();
-      router.refresh();
-    } catch {
-      setFailed(true);
-    }
-    setPending(false);
-  }
+  useEffect(() => {
+    if (signedOut) window.location.assign("/account");
+  }, [signedOut]);
 
   return (
-    <div>
+    <form action={formAction}>
       <button
-        type="button"
-        onClick={signOut}
-        disabled={pending}
+        type="submit"
+        disabled={pending || signedOut}
         className="rounded border px-4 py-2 text-sm hover:bg-gray-50 disabled:opacity-50"
       >
-        {pending ? "Signing out…" : "Sign out"}
+        {pending || signedOut ? "Signing out…" : "Sign out"}
       </button>
-      {failed && (
-        <p role="alert" className="mt-2 text-sm text-red-600">
-          Couldn&apos;t sign you out. Please try again.
-        </p>
-      )}
-    </div>
+    </form>
   );
 }
