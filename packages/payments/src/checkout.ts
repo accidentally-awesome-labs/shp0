@@ -142,9 +142,12 @@ export async function startCheckout(deps: CheckoutDeps, request: CheckoutRequest
 
     const { order, stripeAccount } = assessed;
     const { attempt, sessionId, inFlight } = order.checkout;
+    // Before any attempt is reserved: a client that cannot be created (no
+    // key) must not leave one behind.
+    const stripe = deps.stripe();
     if (sessionId === null && inFlight) {
       // Another Pay started this attempt moments ago: its key returns its session.
-      const outcome = await createAndRecord(deps.stripe(), request, order, stripeAccount, attempt);
+      const outcome = await createAndRecord(stripe, request, order, stripeAccount, attempt);
       if (outcome) return outcome;
       continue;
     }
@@ -152,7 +155,7 @@ export async function startCheckout(deps: CheckoutDeps, request: CheckoutRequest
     // No session yet, or the recorded one can no longer take money: a new attempt.
     const next = await reserveCheckoutAttempt(request.storeId, order.id, { attempt, sessionId });
     if (next === null) continue; // Another Pay moved the Order on: look again.
-    const outcome = await createAndRecord(deps.stripe(), request, order, stripeAccount, next);
+    const outcome = await createAndRecord(stripe, request, order, stripeAccount, next);
     if (outcome) return outcome;
   }
   return blocked("in_progress");

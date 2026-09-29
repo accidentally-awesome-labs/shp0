@@ -1,7 +1,5 @@
 "use server";
 
-import { redirect } from "next/navigation";
-
 import { readCartToken } from "@/lib/cart-token";
 import { authorizeStore, resolveStorefront } from "@/lib/current-store";
 import { getPaymentAccount, isUuid } from "@shp0/db";
@@ -29,22 +27,29 @@ export async function onboardConnectAction(storeId: string): Promise<{ url: stri
   return { url };
 }
 
-/**
- * Storefront Pay (ADR-0006): send the Customer to Stripe Checkout for an
- * Order of the request host's Store, or back to the Order page, which works
- * out from the Order why it cannot be paid; `?checkout=` only notes a Pay
- * that failed or found another in progress. Only the request carrying the
- * cart token that placed the Order (its own shp0_cart_token cookie) gets a
- * session: startCheckout matches both, so another shopper's token, no token
- * and a nonexistent Order all read "not_found".
- *
- * Stripe's return URLs are on the host that served this request.
- */
-export async function payOrderAction(orderId: string): Promise<void> {
-  const storefront = await resolveStorefront();
-  if (!storefront || !isUuid(orderId)) redirect("/");
+/** Where the Order page goes after Pay: to Stripe, or back to the Order with a note. */
+export type PayResult = { kind: "stripe"; url: string } | { kind: "order"; note: "failed" | "in_progress" | null };
 
-  let outcome: CheckoutOutcome | { kind: "failed" };
+/**
+ * Storefront Pay (ADR-0006): start Stripe Checkout for an Order of the
+ * request host's Store. Only the request carrying the cart token that placed
+ * the Order (its own shp0_cart_token cookie) gets a session: startCheckout
+ * matches both, so another shopper's token, no token and a nonexistent Order
+ * are all refused alike.
+ *
+ * It returns where to go, and the Pay button goes there, instead of calling
+ * redirect(): Next renders a same-site redirect's target through an internal
+ * request to its own origin, which does not carry the storefront's Host, so
+ * the Store would not be found (a 404). The Order page works out from the
+ * Order why it cannot be paid; the note only says that this Pay failed or
+ * found another in progress. Stripe's return URLs are on the host that
+ * served this request.
+ */
+export async function payOrderAction(orderId: string): Promise<PayResult> {
+  const storefront = await resolveStorefront();
+  if (!storefront || !isUuid(orderId)) return { kind: "order", note: null };
+
+  let outcome: CheckoutOutcome;
   try {
     outcome = await startCheckout(
       { stripe: getStripe },
@@ -56,12 +61,9 @@ export async function payOrderAction(orderId: string): Promise<void> {
       `Pay failed for Order ${orderId} (Store ${storefront.storeId}):`,
       error instanceof Error ? error.message : String(error),
     );
-    outcome = { kind: "failed" };
+    return { kind: "order", note: "failed" };
   }
 
-  // redirect() throws, so it stays outside the try.
-  if (outcome.kind === "redirect") redirect(outcome.url);
-  if (outcome.kind === "failed") redirect(`/order/${orderId}?checkout=failed`);
-  if (outcome.reason === "in_progress") redirect(`/order/${orderId}?checkout=in_progress`);
-  redirect(`/order/${orderId}`);
+  if (outcome.kind === "redirect") return { kind: "stripe", url: outcome.url };
+  return { kind: "order", note: outcome.reason === "in_progress" ? "in_progress" : null };
 }

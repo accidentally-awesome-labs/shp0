@@ -514,6 +514,21 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
       ]);
     });
 
+    it("reserves no attempt when the Stripe client cannot be created (no key)", async () => {
+      const order = await newOrder();
+      const noClient = () => {
+        throw new Error("no Stripe key");
+      };
+      await expect(
+        startCheckout(
+          { stripe: noClient },
+          { storeId, orderId: order.orderId, cartToken: order.token, origin: ORIGIN },
+        ),
+      ).rejects.toThrow("no Stripe key");
+      expect(await recorded(order.orderId)).toEqual({ sessionId: null, attempt: 0 });
+      expect(await attemptStarted(order.orderId)).toBe(false);
+    });
+
     it("changes nothing when Stripe fails while Pay checks the recorded session", async () => {
       const order = await newOrder();
       const session = sessionOf(await pay(order));

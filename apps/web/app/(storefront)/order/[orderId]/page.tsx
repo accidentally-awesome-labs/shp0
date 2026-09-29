@@ -1,6 +1,5 @@
 import { Suspense } from "react";
 import { notFound } from "next/navigation";
-import { payOrderAction } from "@/app/actions/stripe";
 import { readCartToken } from "@/lib/cart-token";
 import { resolveStorefrontStore } from "@/lib/current-store";
 import { getStripe } from "@/lib/stripe";
@@ -174,10 +173,10 @@ async function OrderView({
       </div>
 
       {payment.payable && (
-        <form action={payOrderAction.bind(null, order.id)} className="mt-6">
-          <PayButton label={`Pay ${formatMoney(order.totalCents, "USD") as string}`} />
+        <div className="mt-6">
+          <PayButton orderId={order.id} label={`Pay ${formatMoney(order.totalCents, "USD") as string}`} />
           <p className="mt-2 text-center text-xs text-gray-500">You'll pay securely on Stripe.</p>
-        </form>
+        </div>
       )}
 
       <a href="/" className="mt-6 block text-center text-sm text-gray-500 underline">
