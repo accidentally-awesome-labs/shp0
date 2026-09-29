@@ -2284,8 +2284,8 @@ export async function getPaymentStatus(
 
 /**
  * How long an attempt without a session counts as still being created. Pay's
- * Stripe requests time out well within it; after it, the attempt is over and
- * the next Pay starts a new one.
+ * Stripe requests end well within it; after it (or once a failed attempt is
+ * ended), the next Pay starts a new attempt.
  */
 export const CHECKOUT_ATTEMPT_LEASE_SECONDS = 60;
 
@@ -2311,6 +2311,21 @@ export async function reserveCheckoutAttempt(
           RETURNING checkout_attempt`,
     );
     return (rows.rows[0]?.checkout_attempt as number | undefined) ?? null;
+  });
+}
+
+/**
+ * End a Checkout attempt whose create failed and has no session: the next Pay
+ * starts a new attempt, with a new idempotency key, instead of re-sending
+ * this one's (Stripe keeps a key's error). Nothing was delivered for it.
+ */
+export async function endCheckoutAttempt(storeId: string, orderId: string, attempt: number): Promise<void> {
+  if (!isUuid(orderId)) return;
+  await tenantClient(storeId, async (tx) => {
+    await tx.execute(
+      sql`UPDATE orders SET checkout_started_at = NULL
+          WHERE id = ${orderId} AND checkout_attempt = ${attempt} AND checkout_session_id IS NULL`,
+    );
   });
 }
 

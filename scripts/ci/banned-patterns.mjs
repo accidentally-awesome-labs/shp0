@@ -47,6 +47,13 @@ export const RULES = [
     pattern: /\b(?:saveDbCartLines|getOrCreateDbCart)\s*\(/,
     ignoreLine: /^\s*(?:\/\/|\*|\/\*)/,
   },
+  {
+    id: "no-checkout-bookkeeping-in-app",
+    why: "reserveCheckoutAttempt, recordCheckoutSession and endCheckoutAttempt change any Order of the Store without its cart token; Pay goes through startCheckout (@shp0/payments), which matches the Order to the cart token first",
+    files: /^apps\/.*\.[cm]?[jt]sx?$/,
+    pattern: /\b(?:reserveCheckoutAttempt|recordCheckoutSession|endCheckoutAttempt)\s*\(/,
+    ignoreLine: /^\s*(?:\/\/|\*|\/\*)/,
+  },
 ];
 
 // These two files necessarily contain the patterns they ban.

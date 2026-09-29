@@ -162,8 +162,9 @@ jobs:
         working-directory: packages/auth
         run: pnpm exec vitest run
 
-      # The Stripe webhook (ADR-0006), against Postgres and a local fake of
-      # the Stripe API: CI cannot reach Stripe, and needs no Stripe keys.
+      # Pay (Checkout Sessions) and the Stripe webhook (ADR-0006), against
+      # Postgres and a local fake of the Stripe API: CI cannot reach Stripe,
+      # and needs no Stripe keys.
       - name: Integration tests (payments)
         working-directory: packages/payments
         run: pnpm exec vitest run

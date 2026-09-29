@@ -12,10 +12,11 @@ import Stripe from "stripe";
  *
  * Like Stripe, it saves the result of a request made with an Idempotency-Key
  * (per account) and returns that saved result, even an error, to any later
- * request with the same key. Rate-limited (429) and conflicting (409)
- * requests never started executing, so Stripe saves nothing for them; a
- * dropped connection is not saved either (the request may never have
- * reached Stripe).
+ * request with the same key. A request that arrives while another with its
+ * key is still executing is answered 409 (idempotency_key_in_use). Rate-
+ * limited (429) and conflicting (409) requests never started executing, so
+ * Stripe saves nothing for them; a dropped connection is not saved either
+ * (the request may never have reached Stripe).
  */
 
 export type RecordedRequest = {
@@ -79,29 +80,50 @@ export function stripeError(status: number, code: string, message = code): FakeR
   return { status, body: { error: { type, code, message } } };
 }
 
-export async function startFakeStripe(): Promise<FakeStripe> {
+/**
+ * Start the fake. `clientRetries` is the returned client's maxNetworkRetries:
+ * 0 by default, so a test sees exactly the requests the code sends; 2 is the
+ * SDK's default, which production's client uses.
+ */
+export async function startFakeStripe({ clientRetries = 0 }: { clientRetries?: number } = {}): Promise<FakeStripe> {
   const requests: RecordedRequest[] = [];
   const queue: FakeReply[] = [];
   const hooks: Array<() => Promise<void>> = [];
   const saved = new Map<string, FakeReply>();
+  /** Keys of requests being executed (a hook may hold one open). */
+  const executing = new Set<string>();
   const sessions = new Map<string, FakeSession>();
   let refunds = 0;
   let sessionCount = 0;
 
   const server = createServer((req, res) => {
     void readBody(req).then(async (body) => {
-      await hooks.shift()?.();
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
       const params = new URLSearchParams(body);
       const stripeAccount = header(req, "stripe-account");
       const idempotencyKey = header(req, "idempotency-key");
       const savedKey = idempotencyKey === undefined ? undefined : `${stripeAccount ?? ""} ${idempotencyKey}`;
 
-      const reply =
-        (savedKey === undefined ? undefined : saved.get(savedKey)) ??
-        queue.shift() ??
-        defaultReply(req.method ?? "", url.pathname, params, stripeAccount, url.searchParams);
-      if (savedKey !== undefined && !saved.has(savedKey) && !isUnsaved(reply)) saved.set(savedKey, reply);
+      let reply: FakeReply;
+      if (savedKey !== undefined && !saved.has(savedKey) && executing.has(savedKey)) {
+        reply = stripeError(
+          409,
+          "idempotency_key_in_use",
+          "There is currently another in-progress request using this Idempotent Key.",
+        );
+      } else {
+        if (savedKey !== undefined) executing.add(savedKey);
+        try {
+          await hooks.shift()?.();
+          reply =
+            (savedKey === undefined ? undefined : saved.get(savedKey)) ??
+            queue.shift() ??
+            defaultReply(req.method ?? "", url.pathname, params, stripeAccount, url.searchParams);
+          if (savedKey !== undefined && !saved.has(savedKey) && !isUnsaved(reply)) saved.set(savedKey, reply);
+        } finally {
+          if (savedKey !== undefined) executing.delete(savedKey);
+        }
+      }
       requests.push({ method: req.method ?? "", path: url.pathname, params, stripeAccount, idempotencyKey, reply });
 
       if ("dropConnection" in reply) {
@@ -200,7 +222,7 @@ export async function startFakeStripe(): Promise<FakeStripe> {
     host: "127.0.0.1",
     port,
     protocol: "http",
-    maxNetworkRetries: 0,
+    maxNetworkRetries: clientRetries,
   });
 
   return {
@@ -218,6 +240,7 @@ export async function startFakeStripe(): Promise<FakeStripe> {
       queue.length = 0;
       hooks.length = 0;
       saved.clear();
+      executing.clear();
       sessions.clear();
     },
     close: () => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),

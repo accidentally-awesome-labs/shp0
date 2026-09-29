@@ -2,6 +2,7 @@ import Stripe from "stripe";
 
 import {
   CHECKOUT_ATTEMPT_LEASE_SECONDS,
+  endCheckoutAttempt,
   getOrderForCheckout,
   getPaymentAccount,
   getPaymentStatus,
@@ -27,6 +28,12 @@ export type CheckoutBlock =
   | "payments_not_set_up"
   /** The Order's session has taken a payment that is still being processed. */
   | "processing"
+  /**
+   * The Order's session took a payment that shp0 did not honour, and its
+   * refund is still owed or failed: that money is still held, so the
+   * Customer is not asked to pay again.
+   */
+  | "refund_pending"
   /** Another Pay for the Order is creating its session right now. */
   | "in_progress";
 
@@ -54,27 +61,40 @@ const MAX_AMOUNT = 99_999_999;
 const MAX_LINES = 100;
 
 /**
- * How long one of Pay's Stripe requests may take. Within the attempt lease,
- * so a request still running is never taken for an attempt that is over.
+ * Options for each of Pay's Stripe requests. No retries: the SDK would
+ * resend on a timeout, a 409 or a 5xx, and a Pay that fails is simply tried
+ * again by the Customer. The SDK still resends once after a closed
+ * connection, so one request can take up to about twice the timeout, which
+ * stays within the attempt lease: a request still running is never taken
+ * for an attempt that is over.
  */
-const STRIPE_TIMEOUT_MS = 20_000;
-if (STRIPE_TIMEOUT_MS >= CHECKOUT_ATTEMPT_LEASE_SECONDS * 1000) {
-  throw new Error("Pay's Stripe timeout must be shorter than the Checkout attempt lease");
+const STRIPE_REQUEST = { timeout: 20_000, maxNetworkRetries: 0 } as const;
+if (2 * STRIPE_REQUEST.timeout + 1_000 >= CHECKOUT_ATTEMPT_LEASE_SECONDS * 1000) {
+  throw new Error("Pay's Stripe requests must end within the Checkout attempt lease");
 }
 
 /** How many times Pay looks again after the Order changed under it. */
 const ROUNDS = 3;
 
 /**
- * Whether the Customer can pay an Order online now, without calling Stripe:
- * the Order page shows the Pay button only when it can. startCheckout makes
- * the same checks first.
+ * Whether Pay would send the Customer to Stripe now: the Order page shows
+ * the Pay button only when it would. The same checks as startCheckout, and
+ * the same reading of the Order's recorded session (asked of Stripe only
+ * when there is one), without creating anything.
  */
 export async function getCheckoutAvailability(
+  deps: CheckoutDeps,
   request: Omit<CheckoutRequest, "origin">,
 ): Promise<CheckoutAvailability> {
   const loaded = await load(request);
-  return "reason" in loaded ? { available: false, reason: loaded.reason } : { available: true };
+  if ("reason" in loaded) return { available: false, reason: loaded.reason };
+  const { sessionId } = loaded.order.checkout;
+  if (sessionId === null) return { available: true };
+  const recorded = await recordedSession(deps.stripe, request.storeId, loaded.stripeAccount, sessionId);
+  if (recorded.state === "processing" || recorded.state === "refund_pending") {
+    return { available: false, reason: recorded.state };
+  }
+  return { available: true };
 }
 
 /**
@@ -91,7 +111,8 @@ export async function getCheckoutAvailability(
  *   gone from the account, or is complete without money held for the Order
  *   (its delayed payment failed, or its payment was refunded automatically).
  *   A complete session whose payment is paid or still processing blocks Pay
- *   with `processing`.
+ *   with `processing`; one whose automatic refund is still owed or failed,
+ *   with `refund_pending`.
  * - A new session belongs to a new attempt, started with
  *   reserveCheckoutAttempt, and carries the idempotency key
  *   `checkout:<Order id>:<attempt>`. A Pay that finds an attempt still
@@ -101,8 +122,10 @@ export async function getCheckoutAvailability(
  *   Order (recordCheckoutSession). One that cannot be recorded (the Order
  *   changed meanwhile) is never delivered, and Pay looks again.
  *
- * Throws on a Stripe or database failure; nothing is delivered then, and the
- * Customer can Pay again.
+ * Throws on a Stripe or database failure; nothing is delivered then. A
+ * failed create ends its attempt (endCheckoutAttempt), because Stripe keeps
+ * the error for that attempt's key: the Customer's next Pay starts a new
+ * attempt with its own key.
  */
 export async function startCheckout(deps: CheckoutDeps, request: CheckoutRequest): Promise<CheckoutOutcome> {
   assertOrigin(request.origin);
@@ -116,7 +139,7 @@ export async function startCheckout(deps: CheckoutDeps, request: CheckoutRequest
     if (sessionId !== null) {
       const recorded = await recordedSession(deps.stripe, request.storeId, stripeAccount, sessionId);
       if (recorded.state === "open") return { kind: "redirect", url: recorded.url };
-      if (recorded.state === "processing") return blocked("processing");
+      if (recorded.state === "processing" || recorded.state === "refund_pending") return blocked(recorded.state);
       // Replaceable: fall through to a new attempt.
     } else if (inFlight) {
       // Another Pay started this attempt moments ago: its key returns its session.
@@ -178,7 +201,11 @@ function orderBlock(order: OrderForCheckout): CheckoutBlock | null {
   return null;
 }
 
-type RecordedSession = { state: "open"; url: string } | { state: "processing" } | { state: "replaceable" };
+type RecordedSession =
+  | { state: "open"; url: string }
+  | { state: "processing" }
+  | { state: "refund_pending" }
+  | { state: "replaceable" };
 
 /** What the Order's recorded session allows: reuse it, wait, or replace it. */
 async function recordedSession(
@@ -192,7 +219,7 @@ async function recordedSession(
     session = await stripe.checkout.sessions.retrieve(
       sessionId,
       { expand: ["payment_intent"] },
-      { stripeAccount, timeout: STRIPE_TIMEOUT_MS },
+      { stripeAccount, ...STRIPE_REQUEST },
     );
   } catch (error) {
     // Not on the Store's account: nobody can pay it.
@@ -211,11 +238,13 @@ async function recordedSession(
   if (session.payment_status === "paid") {
     const paymentIntentId = typeof paymentIntent === "string" ? paymentIntent : paymentIntent?.id;
     if (!paymentIntentId) return { state: "processing" };
-    // A payment the webhook did not honour is refunded (or being refunded),
-    // and the Order is still pending: it can be paid again. No Payment yet
-    // means the webhook has not processed it.
+    // No Payment yet: the webhook has not processed it. A payment the webhook
+    // did not honour can be paid again once it is refunded; until then the
+    // money is still held (refund owed, or failed and left to a person).
     const payment = await getPaymentStatus(storeId, paymentIntentId);
-    return payment !== null && payment !== "paid" ? { state: "replaceable" } : { state: "processing" };
+    if (payment === "refunded") return { state: "replaceable" };
+    if (payment === "refund_due" || payment === "refund_failed") return { state: "refund_pending" };
+    return { state: "processing" };
   }
   if (session.payment_status === "no_payment_required") return { state: "replaceable" };
 
@@ -243,11 +272,21 @@ async function createAndRecord(
     session = await stripe.checkout.sessions.create(sessionParams(request, order), {
       stripeAccount,
       idempotencyKey: `checkout:${order.id}:${attempt}`,
-      timeout: STRIPE_TIMEOUT_MS,
+      ...STRIPE_REQUEST,
     });
   } catch (error) {
     // Stripe is still running the other request with this key.
     if (error instanceof Stripe.errors.StripeError && error.statusCode === 409) return blocked("in_progress");
+    // Nothing was delivered. End the attempt: Stripe keeps this key's error,
+    // so the next Pay must use a new one.
+    try {
+      await endCheckoutAttempt(request.storeId, order.id, attempt);
+    } catch (endError) {
+      console.error(
+        `Could not end Checkout attempt ${attempt} of Order ${order.id}:`,
+        endError instanceof Error ? endError.message : String(endError),
+      );
+    }
     throw error;
   }
   if (!session.url) throw new Error(`Stripe returned Checkout Session ${session.id} without a URL`);
@@ -284,11 +323,17 @@ function sessionParams(request: CheckoutRequest, order: OrderForCheckout) {
   } satisfies Stripe.Checkout.SessionCreateParams;
 }
 
-/** A line's name on Stripe's page: the Product, and the Variant unless it is the default one. */
+/**
+ * A line's name on Stripe's page: the Product, and the Variant unless it is
+ * the default one. Stripe refuses an empty name, so a blank Product title
+ * falls back to the Variant's, then to "Item".
+ */
 function lineName(line: OrderForCheckout["lines"][number]): string {
-  const product = line.productTitle ?? "";
-  if (line.variantTitle === null || line.variantTitle === "" || line.variantTitle === "Default") return product;
-  return `${product} — ${line.variantTitle}`;
+  const product = (line.productTitle ?? "").trim();
+  const variant = (line.variantTitle ?? "").trim();
+  const namedVariant = variant !== "" && variant !== "Default";
+  if (product === "") return namedVariant ? variant : "Item";
+  return namedVariant ? `${product} — ${variant}` : product;
 }
 
 function assertOrigin(origin: string): void {

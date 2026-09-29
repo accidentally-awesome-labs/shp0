@@ -61,12 +61,14 @@ test("allows applySchema() in tests, its definition and comments, but not in app
   );
 });
 
-test("keeps app code off getOrder (outside the Store dashboard) and the unvalidated cart writers", () => {
+test("keeps app code off getOrder (outside the Store dashboard), the unvalidated cart writers and Pay's bookkeeping", () => {
   const violations = scanFiles({
     "apps/web/app/(storefront)/order/[orderId]/page.tsx": "const order = await getOrder(storeId, orderId);",
     "apps/web/app/account/orders/page.tsx": "const o = await db.getOrder (storeId, id);",
     "apps/web/app/actions/cart.ts":
       "await saveDbCartLines(storeId, token, lines);\nconst id = await getOrCreateDbCart(storeId, token);",
+    "apps/web/app/actions/stripe.ts":
+      "await reserveCheckoutAttempt(storeId, orderId, expected);\nawait recordCheckoutSession(storeId, orderId, 1, id);\nawait endCheckoutAttempt(storeId, orderId, 1);",
     // Allowed: the token-scoped and validated functions, a gated dashboard
     // page, the db package and its tests, and comments.
     "apps/web/app/(storefront)/order/[orderId]/ok.tsx":
@@ -75,6 +77,8 @@ test("keeps app code off getOrder (outside the Store dashboard) and the unvalida
     "apps/web/app/dashboard/[storeId]/orders/[orderId]/page.tsx": "const order = await getOrder(storeId, orderId);",
     "packages/db/src/index.ts": "export async function saveDbCartLines(\nreturn getOrder(storeId, orderId);",
     "packages/db/tests/cart.test.ts": "await saveDbCartLines(A, t, []);\nawait getOrder(A, id);",
+    "packages/payments/src/checkout.ts": "await reserveCheckoutAttempt(storeId, order.id, expected);",
+    "apps/web/app/actions/pay.ts": "// never recordCheckoutSession(storeId, id) here\nawait startCheckout(deps, request);",
   });
   assert.deepEqual(
     violations.map((v) => [v.file, v.line, v.rule]),
@@ -83,6 +87,9 @@ test("keeps app code off getOrder (outside the Store dashboard) and the unvalida
       ["apps/web/app/account/orders/page.tsx", 1, "no-store-wide-order-read-in-app"],
       ["apps/web/app/actions/cart.ts", 1, "no-unvalidated-cart-write-in-app"],
       ["apps/web/app/actions/cart.ts", 2, "no-unvalidated-cart-write-in-app"],
+      ["apps/web/app/actions/stripe.ts", 1, "no-checkout-bookkeeping-in-app"],
+      ["apps/web/app/actions/stripe.ts", 2, "no-checkout-bookkeeping-in-app"],
+      ["apps/web/app/actions/stripe.ts", 3, "no-checkout-bookkeeping-in-app"],
     ],
   );
 });

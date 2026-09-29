@@ -245,8 +245,13 @@ describe("routeStorefrontHost", () => {
 describe("storefrontOrigin (Stripe Checkout's return URLs)", () => {
   it("is https on the default port for a secure request, whatever the Host header's spelling", () => {
     expect(storefrontOrigin("acme.shp0.dev", { secure: true })).toBe("https://acme.shp0.dev");
-    expect(storefrontOrigin("Shop.Example.com.:443", { secure: true })).toBe("https://shop.example.com");
+    expect(storefrontOrigin("Shop.Example.com:443", { secure: true })).toBe("https://shop.example.com");
     expect(storefrontOrigin("shop.example.com:8443", { secure: true })).toBe("https://shop.example.com");
+  });
+
+  it("keeps a trailing dot, so the Customer comes back to the host that holds their cart cookie", () => {
+    expect(storefrontOrigin("Shop.Example.com.:443", { secure: true })).toBe("https://shop.example.com.");
+    expect(storefrontOrigin("acme.shp0.dev.", { secure: true })).toBe("https://acme.shp0.dev.");
   });
 
   it("is http on the request's port otherwise (local development)", () => {

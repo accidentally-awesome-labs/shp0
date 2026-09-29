@@ -46,14 +46,25 @@ This ADR records the charge model and the rules every payment path follows.
      - more than 100 lines.
 
      Whether a zero-total Order can become paid without Stripe is not decided here.
+   - **Orders shp0 would only refund get no session either**, and the storefront says why:
+     - a Variant of the Order has been deleted;
+     - there is less stock than the Order's quantity of a Variant, counting every line of it.
+
+     Pay checks stock without reserving it. Stock that runs out after Pay is still refunded (point 6).
    - **Metadata.** The session's `metadata` and its PaymentIntent's `metadata` (`payment_intent_data.metadata`) both carry `shp0_store_id` and `shp0_order_id`. The namespaced keys matter: the Merchant's own Stripe account may also serve other integrations.
    - **Return URLs.** The success and cancel URLs are on the storefront host that served the request, and point back at the Order.
    - **One live session per Order**, recorded on the Order:
-     - Pay reuses the recorded session while it is `open`.
-     - A new session is created only when the recorded one is `expired`, or is `complete` and its asynchronous payment failed.
-     - A `complete` session that is `paid` or still `unpaid` blocks a new session, and the Customer is told the payment is being processed.
-     - When shp0 must replace an open session, it expires it first. If the expire call fails, or finds the session `complete`, no new session is created.
-     - Session requests carry an idempotency key per Order and attempt.
+     - Pay reuses the recorded session while it is `open`. An open session is never replaced.
+     - A new session is created only when the recorded one can no longer take money for the Order: it is `expired`, it no longer exists on the Store's account, or it is `complete` and its delayed payment failed, or its payment was refunded automatically (point 6).
+     - Any other `complete` session blocks a new one, and the Customer is told why:
+       - its payment is `paid` and not yet recorded, or still processing: the payment is being processed;
+       - its automatic refund is still due, or Stripe refused it (_refund failed_): that money is still held, so the Customer is not asked to pay again until it is refunded.
+     - Each new session belongs to a new attempt, reserved on the Order before Stripe is called. Its request carries the idempotency key `checkout:<Order id>:<attempt>`.
+     - A Pay that finds an attempt with no session yet, started less than a minute ago, sends that attempt's key again, so Stripe returns the same session (or answers 409 while it is still creating it: the Customer is asked to try again in a moment). After that minute, the attempt is over and the next Pay starts a new one.
+     - Pay's Stripe requests are not retried by the SDK, so they end well within that minute (a 20-second timeout).
+     - A create that fails ends its attempt, since Stripe keeps a key's error: the Customer's next Pay starts a new attempt, with its own key.
+     - A session is given to the Customer only once it is recorded on the Order, while the Order is still `pending`. So an Order never has two sessions a Customer could pay.
+   - **The Order page** offers Pay only when Pay would send the Customer to Stripe. It reads the recorded session from Stripe, as Pay does, and never takes the payment's state from its URL.
    - **Type checking.** The parameters are an object literal checked with `satisfies Stripe.Checkout.SessionCreateParams`. An `as` cast, or a value of another named type, skips TypeScript's excess-property check.
 
 4. **Webhooks.**

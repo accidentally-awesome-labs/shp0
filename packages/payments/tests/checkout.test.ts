@@ -5,7 +5,7 @@ import { Pool, type PoolClient } from "pg";
 import { applySchema, closePools, getStorefrontOrder, provisionStore, upsertPaymentAccount } from "@shp0/db";
 
 import { getCheckoutAvailability, handleStripeWebhook, startCheckout, type CheckoutOutcome } from "../src/index";
-import { startFakeStripe, stripeError, type FakeStripe, type RecordedRequest } from "./fake-stripe";
+import { startFakeStripe, stripeError, type FakeSession, type FakeStripe, type RecordedRequest } from "./fake-stripe";
 
 /**
  * Pay: a Customer's pending Order gets one Checkout Session on the Store's own
@@ -31,7 +31,9 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
   beforeAll(async () => {
     await applySchema();
     pool = new Pool({ connectionString: PLATFORM_URL });
-    fake = await startFakeStripe();
+    // Production's client keeps the SDK's default of 2 retries: Pay must turn
+    // them off for its own requests (a retry could outlive the attempt).
+    fake = await startFakeStripe({ clientRetries: 2 });
     storeId = await newStore("checkout");
     account = newAccountId();
     await upsertPaymentAccount({ storeId, connectAccountId: account, detailsSubmitted: true, chargesEnabled: true });
@@ -159,6 +161,43 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
     return { sessionId: rows[0]!.checkout_session_id, attempt: rows[0]!.checkout_attempt };
   }
 
+  function availability(order: { orderId: string; token: string }) {
+    return getCheckoutAvailability(
+      { stripe: fake.stripe },
+      { storeId, orderId: order.orderId, cartToken: order.token },
+    );
+  }
+
+  const newPaymentIntentId = () => `pi_${randomUUID().replaceAll("-", "")}`;
+
+  /** The Customer paid the session (card): Stripe completed it, paid. Returns the PaymentIntent id. */
+  function completePaid(session: FakeSession): string {
+    const paymentIntent = newPaymentIntentId();
+    Object.assign(session, {
+      status: "complete",
+      payment_status: "paid",
+      paymentIntent: { id: paymentIntent, status: "succeeded" },
+    });
+    return paymentIntent;
+  }
+
+  /** The Payment the webhook recorded for a session's PaymentIntent. */
+  async function recordPayment(
+    order: { orderId: string; total: number },
+    sessionId: string,
+    paymentIntent: string,
+    status: "refund_due" | "refunded" | "refund_failed",
+  ): Promise<void> {
+    await asStore(storeId, (client) =>
+      client.query(
+        `INSERT INTO payments (order_id, stripe_account_id, payment_intent_id, checkout_session_id, amount_cents, currency,
+                               status, refund_reason, refund_error)
+         VALUES ($1, $2, $3, $4, $5, 'usd', $6, 'insufficient_inventory', $7)`,
+        [order.orderId, account, paymentIntent, sessionId, order.total, status, status === "refund_failed" ? "charge_disputed" : null],
+      ),
+    );
+  }
+
   const creates = (): RecordedRequest[] =>
     fake.requests.filter((r) => r.method === "POST" && r.path === "/v1/checkout/sessions");
 
@@ -209,6 +248,19 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
       expect(session.amount_total).toBe(order.total);
       expect(session.account).toBe(account);
       expect(await recorded(order.orderId)).toEqual({ sessionId: session.id, attempt: 1 });
+    });
+
+    it("names every line on Stripe's page, even one whose Product has no title", async () => {
+      const order = await newOrder({
+        lines: [
+          { title: " ", variantTitle: "Large" },
+          { title: "", variantTitle: "Default" },
+        ],
+      });
+      sessionOf(await pay(order));
+      const params = creates()[0]!.params;
+      expect(params.get("line_items[0][price_data][product_data][name]")).toBe("Large");
+      expect(params.get("line_items[1][price_data][product_data][name]")).toBe("Item");
     });
 
     it("is not delivered when the Order stops being payable while Stripe creates it", async () => {
@@ -272,23 +324,40 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
       // Order stayed pending, so it can be paid again (ADR-0006).
       const order = await newOrder();
       const session = sessionOf(await pay(order));
-      const paymentIntent = `pi_${randomUUID().replaceAll("-", "")}`;
-      Object.assign(session, {
-        status: "complete",
-        payment_status: "paid",
-        paymentIntent: { id: paymentIntent, status: "succeeded" },
-      });
-      await asStore(storeId, (client) =>
-        client.query(
-          `INSERT INTO payments (order_id, stripe_account_id, payment_intent_id, checkout_session_id, amount_cents, currency, status, refund_reason)
-           VALUES ($1, $2, $3, $4, $5, 'usd', 'refunded', 'insufficient_inventory')`,
-          [order.orderId, account, paymentIntent, session.id, order.total],
-        ),
-      );
+      await recordPayment(order, session.id, completePaid(session), "refunded");
 
       const next = sessionOf(await pay(order));
       expect(next.id).not.toBe(session.id);
       expect(creates().at(-1)!.idempotencyKey).toBe(`checkout:${order.orderId}:2`);
+    });
+
+    it("blocks Pay while the paid session's refund is still owed or has failed: that money is still held", async () => {
+      for (const status of ["refund_due", "refund_failed"] as const) {
+        const order = await newOrder();
+        const session = sessionOf(await pay(order));
+        await recordPayment(order, session.id, completePaid(session), status);
+
+        expect(await pay(order), status).toEqual({ kind: "blocked", reason: "refund_pending" });
+        expect(await availability(order), status).toEqual({ available: false, reason: "refund_pending" });
+        expect(await recorded(order.orderId)).toEqual({ sessionId: session.id, attempt: 1 });
+      }
+      expect(creates()).toHaveLength(2);
+    });
+
+    it("starts a new session when a delayed payment was canceled, or the session took no payment", async () => {
+      const canceled = await newOrder();
+      const first = sessionOf(await pay(canceled));
+      Object.assign(first, {
+        status: "complete",
+        payment_status: "unpaid",
+        paymentIntent: { id: newPaymentIntentId(), status: "canceled" },
+      });
+      expect(sessionOf(await pay(canceled)).id).not.toBe(first.id);
+
+      const free = await newOrder();
+      const second = sessionOf(await pay(free));
+      Object.assign(second, { status: "complete", payment_status: "no_payment_required", paymentIntent: null });
+      expect(sessionOf(await pay(free)).id).not.toBe(second.id);
     });
 
     it("waits on a delayed payment method, and starts a new session once it has failed", async () => {
@@ -329,27 +398,77 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
       expect(await recorded(order.orderId)).toEqual({ sessionId: sessionOf(outcomes[0]!).id, attempt: 1 });
     });
 
-    it("recovers from a failed create: a new key once the failed attempt is over", async () => {
+    it("tells a Pay that finds Stripe still creating the Order's session to wait, and delivers that one session", async () => {
+      const order = await newOrder();
+      let arrived!: () => void;
+      const createArrived = new Promise<void>((resolve) => (arrived = resolve));
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => (release = resolve));
+      // Stripe holds the first Pay's create open.
+      fake.beforeNextReply(async () => {
+        arrived();
+        await released;
+      });
+
+      const first = pay(order);
+      await createArrived;
+      const second = await pay(order);
+      release();
+
+      // The second Pay re-sent attempt 1's key; Stripe answered 409 once (no SDK retry).
+      expect(second).toEqual({ kind: "blocked", reason: "in_progress" });
+      const session = sessionOf(await first);
+      expect(sessionsFor(order.orderId)).toHaveLength(1);
+      expect(creates().map((r) => [r.idempotencyKey, "status" in r.reply ? r.reply.status : "dropped"])).toEqual([
+        [`checkout:${order.orderId}:1`, 409],
+        [`checkout:${order.orderId}:1`, 200],
+      ]);
+      expect(await recorded(order.orderId)).toEqual({ sessionId: session.id, attempt: 1 });
+    });
+
+    it("never delivers a session whose attempt was superseded while Stripe created it", async () => {
+      const order = await newOrder();
+      // Each time Stripe answers, the Order has already moved on to a newer attempt.
+      for (let i = 0; i < 3; i++) {
+        fake.beforeNextReply(async () => {
+          await pool.query(
+            `UPDATE orders SET checkout_attempt = checkout_attempt + 1, checkout_started_at = now() WHERE id = $1`,
+            [order.orderId],
+          );
+        });
+      }
+
+      expect(await pay(order)).toEqual({ kind: "blocked", reason: "in_progress" });
+      expect(creates()).toHaveLength(3);
+      expect((await recorded(order.orderId)).sessionId).toBeNull();
+    });
+
+    it("ends an attempt whose create failed, so the next Pay starts a new one at once", async () => {
       const order = await newOrder();
       fake.reply(stripeError(500, "api_error"));
+
       await expect(pay(order)).rejects.toThrow();
+      // One request: Pay turns the SDK's retries off.
+      expect(creates()).toHaveLength(1);
       expect(await recorded(order.orderId)).toEqual({ sessionId: null, attempt: 1 });
 
-      // Straight away, the attempt may still be in flight: the same key gets
-      // Stripe's saved answer, and no second session.
-      await expect(pay(order)).rejects.toThrow();
+      // Stripe keeps attempt 1's 500 for its key; the next Pay uses attempt 2's.
+      const session = sessionOf(await pay(order));
       expect(creates().map((r) => r.idempotencyKey)).toEqual([
         `checkout:${order.orderId}:1`,
-        `checkout:${order.orderId}:1`,
+        `checkout:${order.orderId}:2`,
       ]);
-
-      // Once the attempt is over, the next one has its own key.
-      await pool.query(`UPDATE orders SET checkout_started_at = now() - interval '10 minutes' WHERE id = $1`, [
-        order.orderId,
-      ]);
-      const session = sessionOf(await pay(order));
-      expect(creates().at(-1)!.idempotencyKey).toBe(`checkout:${order.orderId}:2`);
       expect(await recorded(order.orderId)).toEqual({ sessionId: session.id, attempt: 2 });
+    });
+
+    it("changes nothing when Stripe fails while Pay checks the recorded session", async () => {
+      const order = await newOrder();
+      const session = sessionOf(await pay(order));
+      fake.reply(stripeError(500, "api_error"));
+
+      await expect(pay(order)).rejects.toThrow();
+      expect(fake.requests.map((r) => r.method)).toEqual(["POST", "GET"]);
+      expect(await recorded(order.orderId)).toEqual({ sessionId: session.id, attempt: 1 });
     });
   });
 
@@ -504,15 +623,11 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
     });
   });
 
-  describe("getCheckoutAvailability (the Order page's Pay button, without calling Stripe)", () => {
-    it("is available exactly when Pay would reach Stripe", async () => {
+  describe("getCheckoutAvailability (the Order page's Pay button)", () => {
+    it("answers as Pay would, for the Order and its recorded session, and creates nothing", async () => {
       const payable = await newOrder();
       const soldOut = await newOrder({ lines: [{ quantity: 3, inventory: 2 }] });
       const paid = await newOrder({ paymentStatus: "paid" });
-
-      const availability = (order: { orderId: string; token: string }) =>
-        getCheckoutAvailability({ storeId, orderId: order.orderId, cartToken: order.token });
-
       expect(await availability(payable)).toEqual({ available: true });
       expect(await availability(soldOut)).toEqual({ available: false, reason: "out_of_stock" });
       expect(await availability(paid)).toEqual({ available: false, reason: "not_pending" });
@@ -520,7 +635,22 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
         available: false,
         reason: "not_found",
       });
+      // No recorded session: no need to ask Stripe.
       expect(fake.requests).toEqual([]);
+
+      const open = await newOrder();
+      sessionOf(await pay(open));
+      const processing = await newOrder();
+      completePaid(sessionOf(await pay(processing)));
+      const refunded = await newOrder();
+      const refundedSession = sessionOf(await pay(refunded));
+      await recordPayment(refunded, refundedSession.id, completePaid(refundedSession), "refunded");
+      const createsBefore = creates().length;
+
+      expect(await availability(open)).toEqual({ available: true });
+      expect(await availability(processing)).toEqual({ available: false, reason: "processing" });
+      expect(await availability(refunded)).toEqual({ available: true });
+      expect(creates()).toHaveLength(createsBefore);
     });
   });
 });

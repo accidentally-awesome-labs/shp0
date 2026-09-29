@@ -250,7 +250,8 @@ export function routeStorefrontHost(
  *
  * `secure` (production, or a request that arrived over https) gives https
  * on the default port. Otherwise, for local development, it is http on the
- * request's port.
+ * request's port. A trailing dot is kept: to the browser, "shop.example.com."
+ * is another host, with its own cookies (the cart token).
  */
 export function storefrontOrigin(
   host: string,
@@ -258,8 +259,8 @@ export function storefrontOrigin(
   platformDomain: string = PLATFORM_DOMAIN,
 ): string | null {
   if (routeStorefrontHost(host, platformDomain).kind === "none") return null;
-  const hostname = normalizeRequestHost(host);
+  const [name, port] = host.trim().toLowerCase().split(":");
+  const hostname = `${normalizeRequestHost(host)}${name!.endsWith(".") ? "." : ""}`;
   if (secure) return `https://${hostname}`;
-  const port = /^[^:]+:(\d{1,5})$/.exec(host.trim())?.[1];
-  return `http://${hostname}${port ? `:${port}` : ""}`;
+  return `http://${hostname}${port && /^\d{1,5}$/.test(port) ? `:${port}` : ""}`;
 }

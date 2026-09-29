@@ -3,41 +3,68 @@ import { notFound } from "next/navigation";
 import { payOrderAction } from "@/app/actions/stripe";
 import { readCartToken } from "@/lib/cart-token";
 import { resolveStorefrontStore } from "@/lib/current-store";
-import { getStorefrontOrder, formatMoney, isOrderOpen, type StorefrontOrder } from "@shp0/db";
-import { getCheckoutAvailability, type CheckoutAvailability, type CheckoutBlock } from "@shp0/payments";
+import { getStripe } from "@/lib/stripe";
+import { getStorefrontOrder, formatMoney, isOrderOpen, type RefundReason } from "@shp0/db";
+import {
+  describeOrderPayment,
+  getCheckoutAvailability,
+  type CheckoutAvailability,
+  type OrderPaymentNotice,
+} from "@shp0/payments";
 import PayButton from "./pay-button";
 
 export const instant = false;
 
-/** Why an Order cannot be paid online, as the Customer reads it. */
-const BLOCK_MESSAGES: Record<CheckoutBlock | "failed", string> = {
-  not_found: "This order could not be found.",
-  not_pending: "This order no longer needs a payment.",
-  item_unavailable:
-    "An item in this order is no longer available, so it can't be paid for online. Please contact the store.",
-  out_of_stock: "An item in this order is out of stock, so it can't be paid for right now.",
-  not_chargeable: "This order can't be paid for online. Please contact the store.",
-  payments_not_set_up: "This store isn't taking online payments yet.",
-  processing: "Your payment is being processed. This page will show the order as paid once it goes through.",
-  in_progress: "Your payment page is being prepared. Please try again in a moment.",
-  failed: "We couldn't start your payment. Please try again.",
-};
+type Tone = "success" | "info" | "warning";
 
-/**
- * What `?checkout=` may say about a moment ago: back from Stripe (its
- * success URL), or a Pay that could not open Stripe for a passing reason.
- * Any other reason is read from the Order itself, as it is now.
- */
-type CheckoutNote = "returned" | "processing" | "in_progress" | "failed";
-const CHECKOUT_NOTES = new Set<string>(["returned", "processing", "in_progress", "failed"]);
-
-type Notice = { tone: "success" | "info" | "warning"; text: string };
-
-const TONES: Record<Notice["tone"], string> = {
+const TONES: Record<Tone, string> = {
   success: "bg-green-50 text-green-800",
   info: "bg-blue-50 text-blue-700",
   warning: "bg-amber-50 text-amber-800",
 };
+
+/** The Customer's reading of each notice (describeOrderPayment decides which). */
+function noticeText(notice: OrderPaymentNotice, refundReason: RefundReason | null): { tone: Tone; text: string } {
+  const why =
+    refundReason === "insufficient_inventory"
+      ? "An item sold out before your payment went through"
+      : "Your payment could not be applied to this order";
+  switch (notice) {
+    case "paid":
+      return { tone: "success", text: "Payment received. Thank you for your order!" };
+    case "refunded":
+      return { tone: "warning", text: `${why}, so it has been refunded in full.` };
+    case "refund_pending":
+      return {
+        tone: "warning",
+        text: `${why}, so it is being refunded in full. You can pay again once the refund has gone through.`,
+      };
+    case "refund_failed":
+      return { tone: "warning", text: `${why}. The store will refund it; please contact the store.` };
+    case "confirming":
+      return { tone: "info", text: "Thank you! We're confirming your payment, which can take a moment." };
+    case "processing":
+      return {
+        tone: "info",
+        text: "Your payment is being processed. This page will show the order as paid once it goes through.",
+      };
+    case "failed":
+      return { tone: "info", text: "We couldn't start your payment. Please try again." };
+    case "in_progress":
+      return { tone: "info", text: "Your payment page is being prepared. Please try again in a moment." };
+    case "item_unavailable":
+      return {
+        tone: "info",
+        text: "An item in this order is no longer available, so it can't be paid for online. Please contact the store.",
+      };
+    case "out_of_stock":
+      return { tone: "info", text: "An item in this order is out of stock, so it can't be paid for right now." };
+    case "not_chargeable":
+      return { tone: "info", text: "This order can't be paid for online. Please contact the store." };
+    case "payments_not_set_up":
+      return { tone: "info", text: "This store isn't taking online payments yet." };
+  }
+}
 
 /**
  * The Order page. Only the request carrying the cart token that placed the
@@ -45,9 +72,10 @@ const TONES: Record<Notice["tone"], string> = {
  * id alone, gets the same not-found as for an Order that does not exist
  * (getStorefrontOrder). Lines show titles, not Variant ids.
  *
- * A pending Order that can be paid online has a Pay button (payOrderAction,
- * ADR-0006); otherwise the page says why it cannot be paid. It also says
- * when a payment was refunded automatically.
+ * A pending Order that Pay would send to Stripe has a Pay button
+ * (payOrderAction, ADR-0006); otherwise the page says why not, including a
+ * payment still processing or refunded automatically. describeOrderPayment
+ * decides, from the Order's state; `?checkout=` only adds a note.
  */
 async function OrderView({
   orderId,
@@ -64,17 +92,21 @@ async function OrderView({
   if (!order) notFound();
 
   const checkoutParam = (await searchParams).checkout;
-  const note =
-    typeof checkoutParam === "string" && CHECKOUT_NOTES.has(checkoutParam) ? (checkoutParam as CheckoutNote) : null;
-  const availability =
-    order.paymentStatus === "pending"
-      ? await getCheckoutAvailability({ storeId, orderId: order.id, cartToken })
-      : null;
-
-  const notice = paymentNotice(order, note, availability);
-  // Back from Stripe, or a payment still processing: wait rather than Pay again.
-  const waiting = order.payment === null && (note === "returned" || note === "processing");
-  const payable = availability?.available === true && !waiting;
+  const note = typeof checkoutParam === "string" ? checkoutParam : null;
+  let availability: CheckoutAvailability | null = null;
+  if (order.paymentStatus === "pending") {
+    try {
+      availability = await getCheckoutAvailability({ stripe: getStripe() }, { storeId, orderId: order.id, cartToken });
+    } catch (error) {
+      // Offer Pay, which checks again.
+      console.error(
+        `Could not read the payment state of Order ${order.id}:`,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+  const payment = describeOrderPayment(order, availability, note);
+  const notice = payment.notice && noticeText(payment.notice, order.payment?.refundReason ?? null);
 
   return (
     <div className="mx-auto max-w-2xl px-4 py-8">
@@ -86,7 +118,7 @@ async function OrderView({
       {notice && (
         <div role="status" className={`mt-6 rounded-lg p-4 text-sm ${TONES[notice.tone]}`}>
           {notice.text}
-          {waiting && (
+          {payment.refresh && (
             <>
               {" "}
               <a href={`/order/${order.id}`} className="underline">
@@ -138,7 +170,7 @@ async function OrderView({
         </div>
       </div>
 
-      {payable && (
+      {payment.payable && (
         <form action={payOrderAction.bind(null, order.id)} className="mt-6">
           <PayButton label={`Pay ${formatMoney(order.totalCents, "USD") as string}`} />
           <p className="mt-2 text-center text-xs text-gray-500">You'll pay securely on Stripe.</p>
@@ -150,33 +182,6 @@ async function OrderView({
       </a>
     </div>
   );
-}
-
-/** What the page tells the Customer about paying this Order, if anything. */
-function paymentNotice(
-  order: StorefrontOrder,
-  note: CheckoutNote | null,
-  availability: CheckoutAvailability | null,
-): Notice | null {
-  if (order.paymentStatus === "paid") return { tone: "success", text: "Payment received. Thank you for your order!" };
-  if (order.paymentStatus !== "pending") return null;
-
-  // The current session's payment was not honoured, and is refunded in full.
-  if (order.payment && order.payment.status !== "paid") {
-    const why =
-      order.payment.refundReason === "insufficient_inventory"
-        ? "An item sold out before your payment went through"
-        : "Your payment could not be applied to this order";
-    const when = order.payment.status === "refunded" ? "has been" : "will be";
-    return { tone: "warning", text: `${why}, so it ${when} refunded in full.` };
-  }
-
-  if (note === "returned") {
-    return { tone: "info", text: "Thank you! We're confirming your payment, which can take a moment." };
-  }
-  if (note !== null) return { tone: "info", text: BLOCK_MESSAGES[note] };
-  if (availability && !availability.available) return { tone: "info", text: BLOCK_MESSAGES[availability.reason] };
-  return null;
 }
 
 function lineTitle(line: { productTitle: string | null; variantTitle: string | null }): string {

@@ -8,3 +8,5 @@ export type {
   CheckoutOutcome,
   CheckoutRequest,
 } from "./checkout";
+export { describeOrderPayment } from "./order-page";
+export type { OrderPaymentNotice, OrderPaymentView } from "./order-page";
