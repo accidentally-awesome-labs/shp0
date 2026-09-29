@@ -55,6 +55,7 @@ export async function createCheckoutSessionAction(orderId: string): Promise<{ ur
   const commissionBps = await getStoreCommissionBps(storeId);
 
   const params = buildCheckoutSessionParams({
+    storeId,
     order,
     commissionBps,
     connectAccountId: account.connectAccountId,

@@ -63,10 +63,19 @@ export type CheckoutSessionParams = {
   payment_intent_data: {
     application_fee_amount: number;
     transfer_data: { destination: string };
+    metadata: CheckoutMetadata;
   };
   application_fee_amount: number;
-  metadata: { orderId: string };
+  metadata: CheckoutMetadata;
 };
+
+/**
+ * The metadata that marks a Checkout Session, and its PaymentIntent, as one
+ * of shp0's: the webhook acts only on sessions that carry both keys, with the
+ * Store id of the account the event came from (ADR-0006). The keys are
+ * namespaced because the Store's Stripe account may serve other integrations.
+ */
+export type CheckoutMetadata = { shp0_store_id: string; shp0_order_id: string };
 
 /**
  * Build the Stripe Checkout Session params from an Order.
@@ -74,11 +83,13 @@ export type CheckoutSessionParams = {
  * - One line_item per order line (variant).
  * - application_fee_amount computed from the commission basis points.
  * - transfer_data.destination routes the payment to the Store's Connect account.
- * - metadata.orderId lets the webhook reconcile the payment to our Order.
+ * - metadata (on the session and on its PaymentIntent) names the Store and
+ *   the Order, so the webhook can match the payment to the Order.
  *
  * This is a pure function — it does NOT call the Stripe API.
  */
 export function buildCheckoutSessionParams(opts: {
+  storeId: string;
   order: OrderForStripe;
   commissionBps: number;
   connectAccountId: string;
@@ -86,6 +97,7 @@ export function buildCheckoutSessionParams(opts: {
   cancelUrl: string;
 }): CheckoutSessionParams {
   const applicationFee = computeApplicationFee(opts.order.totalCents, opts.commissionBps);
+  const metadata: CheckoutMetadata = { shp0_store_id: opts.storeId, shp0_order_id: opts.order.id };
 
   return {
     mode: "payment",
@@ -103,7 +115,8 @@ export function buildCheckoutSessionParams(opts: {
     payment_intent_data: {
       application_fee_amount: applicationFee,
       transfer_data: { destination: opts.connectAccountId },
+      metadata,
     },
-    metadata: { orderId: opts.order.id },
+    metadata,
   };
 }

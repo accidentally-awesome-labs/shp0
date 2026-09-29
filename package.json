@@ -5,7 +5,7 @@
     "dev": "pnpm --filter @shp0/web dev",
     "build": "pnpm --filter @shp0/web build",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r test"
+    "test": "pnpm -r --workspace-concurrency=1 test"
   },
   "packageManager": "pnpm@11.9.0",
   "engines": {
