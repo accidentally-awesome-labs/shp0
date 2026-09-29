@@ -1,15 +1,9 @@
 "use server";
 
-import type Stripe from "stripe";
-
 import { readCartToken } from "@/lib/cart-token";
-import { authorizeStore, resolveStorefrontStore } from "@/lib/current-store";
-import {
-  getPaymentAccount,
-  getStoreCommissionBps,
-  getOrderForCheckout,
-  buildCheckoutSessionParams,
-} from "@shp0/db";
+import { authorizeStore, resolveStorefront } from "@/lib/current-store";
+import { getPaymentAccount, isUuid } from "@shp0/db";
+import { startCheckout, type CheckoutOutcome } from "@shp0/payments";
 import {
   createConnectAccountAndOnboardingLink,
   createOnboardingLink,
@@ -33,43 +27,43 @@ export async function onboardConnectAction(storeId: string): Promise<{ url: stri
   return { url };
 }
 
-// Storefront: pay for an Order of the request host's Store. Only the request
-// carrying the cart token that placed the Order (its own shp0_cart_token
-// cookie) may: getOrderForCheckout matches both in one query, so no token,
-// another shopper's token and a nonexistent Order all read "Order not found".
-export async function createCheckoutSessionAction(orderId: string): Promise<{ url: string }> {
-  const storeId = await resolveStorefrontStore();
-  if (!storeId) throw new Error("No store resolved");
+/** Where the Order page goes after Pay: to Stripe, or back to the Order with a note. */
+export type PayResult = { kind: "stripe"; url: string } | { kind: "order"; note: "failed" | "in_progress" | null };
 
-  const order = await getOrderForCheckout(storeId, orderId, await readCartToken());
-  if (!order) throw new Error("Order not found");
-  if (order.paymentStatus !== "pending") {
-    throw new Error("Order is not pending payment");
+/**
+ * Storefront Pay (ADR-0006): start Stripe Checkout for an Order of the
+ * request host's Store. Only the request carrying the cart token that placed
+ * the Order (its own shp0_cart_token cookie) gets a session: startCheckout
+ * matches both, so another shopper's token, no token and a nonexistent Order
+ * are all refused alike.
+ *
+ * It returns where to go, and the Pay button goes there, instead of calling
+ * redirect(): Next renders a same-site redirect's target through an internal
+ * request to its own origin, which does not carry the storefront's Host, so
+ * the Store would not be found (a 404). The Order page works out from the
+ * Order why it cannot be paid; the note only says that this Pay failed or
+ * found another in progress. Stripe's return URLs are on the host that
+ * served this request.
+ */
+export async function payOrderAction(orderId: string): Promise<PayResult> {
+  const storefront = await resolveStorefront();
+  if (!storefront || !isUuid(orderId)) return { kind: "order", note: null };
+
+  let outcome: CheckoutOutcome;
+  try {
+    outcome = await startCheckout(
+      { stripe: getStripe },
+      { storeId: storefront.storeId, orderId, cartToken: await readCartToken(), origin: storefront.origin },
+    );
+  } catch (error) {
+    // Nothing was given to the Customer; they can Pay again.
+    console.error(
+      `Pay failed for Order ${orderId} (Store ${storefront.storeId}):`,
+      error instanceof Error ? error.message : String(error),
+    );
+    return { kind: "order", note: "failed" };
   }
 
-  const account = await getPaymentAccount(storeId);
-  if (!account || !account.chargesEnabled) {
-    throw new Error("Store has not completed Stripe onboarding");
-  }
-
-  const commissionBps = await getStoreCommissionBps(storeId);
-
-  const params = buildCheckoutSessionParams({
-    storeId,
-    order,
-    commissionBps,
-    connectAccountId: account.connectAccountId,
-    successUrl: `${process.env.NEXT_PUBLIC_APP_URL}/order/${order.id}`,
-    cancelUrl: `${process.env.NEXT_PUBLIC_APP_URL}/checkout`,
-  });
-
-  const stripe = getStripe();
-  const session = await stripe.checkout.sessions.create(
-    params as Stripe.Checkout.SessionCreateParams,
-    {
-      stripeAccount: account.connectAccountId,
-    },
-  );
-
-  return { url: session.url! };
+  if (outcome.kind === "redirect") return { kind: "stripe", url: outcome.url };
+  return { kind: "order", note: outcome.reason === "in_progress" ? "in_progress" : null };
 }

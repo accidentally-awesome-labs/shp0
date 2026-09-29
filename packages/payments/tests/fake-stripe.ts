@@ -12,10 +12,11 @@ import Stripe from "stripe";
  *
  * Like Stripe, it saves the result of a request made with an Idempotency-Key
  * (per account) and returns that saved result, even an error, to any later
- * request with the same key. Rate-limited (429) and conflicting (409)
- * requests never started executing, so Stripe saves nothing for them; a
- * dropped connection is not saved either (the request may never have
- * reached Stripe).
+ * request with the same key. A request that arrives while another with its
+ * key is still executing is answered 409 (idempotency_key_in_use). Rate-
+ * limited (429) and conflicting (409) requests never started executing, so
+ * Stripe saves nothing for them; a dropped connection is not saved either
+ * (the request may never have reached Stripe).
  */
 
 export type RecordedRequest = {
@@ -30,12 +31,36 @@ export type RecordedRequest = {
 
 export type FakeReply = { status: number; body: unknown } | { dropConnection: true };
 
+/**
+ * A Checkout Session the fake created, which tests may move along (complete,
+ * paid, expired) the way a Customer and Stripe would.
+ */
+export type FakeSession = {
+  id: string;
+  account: string | undefined;
+  url: string;
+  status: "open" | "complete" | "expired";
+  payment_status: "paid" | "unpaid" | "no_payment_required";
+  amount_total: number;
+  currency: string;
+  metadata: Record<string, string>;
+  /** The PaymentIntent, once the Customer has paid or tried to. */
+  paymentIntent: { id: string; status: string } | null;
+};
+
 export type FakeStripe = {
   stripe: Stripe;
   requests: RecordedRequest[];
+  /** Checkout Sessions created through the fake, by id. */
+  sessions: Map<string, FakeSession>;
   /** Queue a reply for the next request that has no saved result. */
   reply(reply: FakeReply): void;
-  /** Forget requests, queued replies and saved results. */
+  /**
+   * Run `hook` when the next request arrives, before it is answered: for
+   * something that happens while shp0 waits on Stripe.
+   */
+  beforeNextReply(hook: () => Promise<void>): void;
+  /** Forget requests, queued replies, hooks, saved results and sessions. */
   reset(): void;
   close(): Promise<void>;
 };
@@ -55,25 +80,50 @@ export function stripeError(status: number, code: string, message = code): FakeR
   return { status, body: { error: { type, code, message } } };
 }
 
-export async function startFakeStripe(): Promise<FakeStripe> {
+/**
+ * Start the fake. `clientRetries` is the returned client's maxNetworkRetries:
+ * 0 by default, so a test sees exactly the requests the code sends; 2 is the
+ * SDK's default, which production's client uses.
+ */
+export async function startFakeStripe({ clientRetries = 0 }: { clientRetries?: number } = {}): Promise<FakeStripe> {
   const requests: RecordedRequest[] = [];
   const queue: FakeReply[] = [];
+  const hooks: Array<() => Promise<void>> = [];
   const saved = new Map<string, FakeReply>();
+  /** Keys of requests being executed (a hook may hold one open). */
+  const executing = new Set<string>();
+  const sessions = new Map<string, FakeSession>();
   let refunds = 0;
+  let sessionCount = 0;
 
   const server = createServer((req, res) => {
-    void readBody(req).then((body) => {
+    void readBody(req).then(async (body) => {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
       const params = new URLSearchParams(body);
       const stripeAccount = header(req, "stripe-account");
       const idempotencyKey = header(req, "idempotency-key");
       const savedKey = idempotencyKey === undefined ? undefined : `${stripeAccount ?? ""} ${idempotencyKey}`;
 
-      const reply =
-        (savedKey === undefined ? undefined : saved.get(savedKey)) ??
-        queue.shift() ??
-        defaultReply(req.method ?? "", url.pathname, params);
-      if (savedKey !== undefined && !saved.has(savedKey) && !isUnsaved(reply)) saved.set(savedKey, reply);
+      let reply: FakeReply;
+      if (savedKey !== undefined && !saved.has(savedKey) && executing.has(savedKey)) {
+        reply = stripeError(
+          409,
+          "idempotency_key_in_use",
+          "There is currently another in-progress request using this Idempotent Key.",
+        );
+      } else {
+        if (savedKey !== undefined) executing.add(savedKey);
+        try {
+          await hooks.shift()?.();
+          reply =
+            (savedKey === undefined ? undefined : saved.get(savedKey)) ??
+            queue.shift() ??
+            defaultReply(req.method ?? "", url.pathname, params, stripeAccount, url.searchParams);
+          if (savedKey !== undefined && !saved.has(savedKey) && !isUnsaved(reply)) saved.set(savedKey, reply);
+        } finally {
+          if (savedKey !== undefined) executing.delete(savedKey);
+        }
+      }
       requests.push({ method: req.method ?? "", path: url.pathname, params, stripeAccount, idempotencyKey, reply });
 
       if ("dropConnection" in reply) {
@@ -89,7 +139,68 @@ export async function startFakeStripe(): Promise<FakeStripe> {
     return "dropConnection" in reply || reply.status === 429 || reply.status === 409;
   }
 
-  function defaultReply(method: string, path: string, params: URLSearchParams): FakeReply {
+  function sessionBody(session: FakeSession, expand: string[]) {
+    return {
+      id: session.id,
+      object: "checkout.session",
+      mode: "payment",
+      url: session.status === "open" ? session.url : null,
+      status: session.status,
+      payment_status: session.payment_status,
+      amount_total: session.amount_total,
+      currency: session.currency,
+      metadata: session.metadata,
+      payment_intent: expand.includes("payment_intent")
+        ? session.paymentIntent && { object: "payment_intent", ...session.paymentIntent }
+        : (session.paymentIntent?.id ?? null),
+    };
+  }
+
+  function defaultReply(
+    method: string,
+    path: string,
+    params: URLSearchParams,
+    account: string | undefined,
+    query: URLSearchParams,
+  ): FakeReply {
+    if (method === "POST" && path === "/v1/checkout/sessions") {
+      sessionCount += 1;
+      const id = `cs_test_fake_${sessionCount}`;
+      let amount = 0;
+      for (let i = 0; params.has(`line_items[${i}][quantity]`); i++) {
+        amount +=
+          Number(params.get(`line_items[${i}][quantity]`)) *
+          Number(params.get(`line_items[${i}][price_data][unit_amount]`));
+      }
+      const metadata: Record<string, string> = {};
+      for (const [key, value] of params) {
+        const match = /^metadata\[(.+)\]$/.exec(key);
+        if (match) metadata[match[1]!] = value;
+      }
+      const session: FakeSession = {
+        id,
+        account,
+        url: `https://checkout.stripe.test/c/pay/${id}`,
+        status: "open",
+        payment_status: "unpaid",
+        amount_total: amount,
+        currency: params.get("line_items[0][price_data][currency]") ?? "usd",
+        metadata,
+        paymentIntent: null,
+      };
+      sessions.set(id, session);
+      return { status: 200, body: sessionBody(session, []) };
+    }
+    const retrieve = /^\/v1\/checkout\/sessions\/([^/]+)$/.exec(path);
+    if (method === "GET" && retrieve) {
+      const session = sessions.get(retrieve[1]!);
+      if (!session || session.account !== account) {
+        return stripeError(404, "resource_missing", `No such checkout.session: '${retrieve[1]}'`);
+      }
+      // The SDK sends expand[0]=…; accept expand[]=… as well.
+      const expand = [...query].filter(([key]) => /^expand\[\d*\]$/.test(key)).map(([, value]) => value);
+      return { status: 200, body: sessionBody(session, expand) };
+    }
     if (method === "POST" && path === "/v1/refunds") {
       refunds += 1;
       return {
@@ -111,7 +222,7 @@ export async function startFakeStripe(): Promise<FakeStripe> {
     host: "127.0.0.1",
     port,
     protocol: "http",
-    maxNetworkRetries: 0,
+    maxNetworkRetries: clientRetries,
   });
 
   return {
@@ -120,10 +231,17 @@ export async function startFakeStripe(): Promise<FakeStripe> {
     reply: (reply) => {
       queue.push(reply);
     },
+    beforeNextReply: (hook) => {
+      hooks.push(hook);
+    },
+    sessions,
     reset: () => {
       requests.length = 0;
       queue.length = 0;
+      hooks.length = 0;
       saved.clear();
+      executing.clear();
+      sessions.clear();
     },
     close: () => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
   };

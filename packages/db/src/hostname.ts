@@ -241,3 +241,26 @@ export function routeStorefrontHost(
   if (!valid.ok || valid.hostname !== hostname) return { kind: "none" };
   return { kind: "custom_domain", hostname };
 }
+
+/**
+ * The origin a Customer reached a storefront host on, for links that must
+ * bring them back to it, such as Stripe Checkout's return URLs (ADR-0006).
+ * Null unless the host is a storefront host (routeStorefrontHost): a Store's
+ * Subdomain or a valid Custom Domain, never localhost or an IP literal.
+ *
+ * `secure` (production, or a request that arrived over https) gives https
+ * on the default port. Otherwise, for local development, it is http on the
+ * request's port. A trailing dot is kept: to the browser, "shop.example.com."
+ * is another host, with its own cookies (the cart token).
+ */
+export function storefrontOrigin(
+  host: string,
+  { secure }: { secure: boolean },
+  platformDomain: string = PLATFORM_DOMAIN,
+): string | null {
+  if (routeStorefrontHost(host, platformDomain).kind === "none") return null;
+  const [name, port] = host.trim().toLowerCase().split(":");
+  const hostname = `${normalizeRequestHost(host)}${name!.endsWith(".") ? "." : ""}`;
+  if (secure) return `https://${hostname}`;
+  return `http://${hostname}${port && /^\d{1,5}$/.test(port) ? `:${port}` : ""}`;
+}

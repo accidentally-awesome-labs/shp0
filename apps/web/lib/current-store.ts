@@ -8,6 +8,7 @@ import {
   getMembershipRole,
   isCapability,
   resolveStoreByHost,
+  storefrontOrigin,
   type Capability,
   type Role,
 } from "@shp0/db";
@@ -149,4 +150,21 @@ export async function authorizeStorePage(
 export async function resolveStorefrontStore(): Promise<string | null> {
   const h = await headers();
   return resolveStoreByHost(h.get("host") ?? "localhost:3000");
+}
+
+/**
+ * The Current Store of a storefront request, as resolveStorefrontStore, and
+ * the origin the Customer reached it on (storefrontOrigin), for links that
+ * must bring them back to this host, such as Stripe Checkout's return URLs.
+ * The origin is built only from a host that resolved to the Store. Null
+ * when the host is not a Store's.
+ */
+export async function resolveStorefront(): Promise<{ storeId: string; origin: string } | null> {
+  const h = await headers();
+  const host = h.get("host") ?? "";
+  const storeId = await resolveStoreByHost(host);
+  if (!storeId) return null;
+  const secure = process.env.NODE_ENV === "production" || h.get("x-forwarded-proto") === "https";
+  const origin = storefrontOrigin(host, { secure });
+  return origin ? { storeId, origin } : null;
 }

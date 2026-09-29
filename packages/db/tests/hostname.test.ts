@@ -6,6 +6,7 @@ import {
   normalizeRequestHost,
   isPlatformHost,
   routeStorefrontHost,
+  storefrontOrigin,
   InvalidCustomDomainError,
 } from "../src/hostname";
 import type { CustomDomainRejection } from "../src/hostname";
@@ -238,5 +239,29 @@ describe("routeStorefrontHost", () => {
       kind: "custom_domain",
       hostname: "acme.shp0.dev",
     });
+  });
+});
+
+describe("storefrontOrigin (Stripe Checkout's return URLs)", () => {
+  it("is https on the default port for a secure request, whatever the Host header's spelling", () => {
+    expect(storefrontOrigin("acme.shp0.dev", { secure: true })).toBe("https://acme.shp0.dev");
+    expect(storefrontOrigin("Shop.Example.com:443", { secure: true })).toBe("https://shop.example.com");
+    expect(storefrontOrigin("shop.example.com:8443", { secure: true })).toBe("https://shop.example.com");
+  });
+
+  it("keeps a trailing dot, so the Customer comes back to the host that holds their cart cookie", () => {
+    expect(storefrontOrigin("Shop.Example.com.:443", { secure: true })).toBe("https://shop.example.com.");
+    expect(storefrontOrigin("acme.shp0.dev.", { secure: true })).toBe("https://acme.shp0.dev.");
+  });
+
+  it("is http on the request's port otherwise (local development)", () => {
+    expect(storefrontOrigin("acme.shp0.dev:3000", { secure: false })).toBe("http://acme.shp0.dev:3000");
+    expect(storefrontOrigin("shop.example.com", { secure: false })).toBe("http://shop.example.com");
+  });
+
+  it("is null for a host that is not a storefront host", () => {
+    for (const host of ["localhost:3000", "127.0.0.1", "[::1]:3000", "shp0.dev", "app.shp0.dev", "", "evil.com/path"]) {
+      expect(storefrontOrigin(host, { secure: true }), host).toBeNull();
+    }
   });
 });

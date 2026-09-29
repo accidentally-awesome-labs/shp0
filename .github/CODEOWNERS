@@ -9,12 +9,13 @@
 # Add the contracted security/payments reviewer to these lines once hired.
 /packages/db/src/index.ts              @salarsayyad
 /packages/db/src/schema.ts             @salarsayyad
-/packages/db/src/payments.ts           @salarsayyad
+/packages/db/src/hostname.ts           @salarsayyad
 /packages/db/src/billing.ts            @salarsayyad
 /packages/db/src/customer-auth.ts      @salarsayyad
 /packages/db/src/roles.ts              @salarsayyad
 /packages/db/drizzle.config.ts         @salarsayyad
 /packages/auth/                        @salarsayyad
+/packages/payments/                    @salarsayyad
 /apps/web/proxy.ts                     @salarsayyad
 /apps/web/app/(auth)/sign-in/page.tsx  @salarsayyad
 /apps/web/lib/auth.ts                  @salarsayyad
@@ -23,6 +24,7 @@
 /apps/web/lib/stripe.ts                @salarsayyad
 /apps/web/app/api/                     @salarsayyad
 /apps/web/app/admin/                   @salarsayyad
+/apps/web/app/(storefront)/order/      @salarsayyad
 # Every server action (an HTTP endpoint) and every dashboard page: each one
 # chooses the capability it requires (authorizeStore / authorizeStorePage),
 # and CI checks only that the check is there, not that the capability fits.

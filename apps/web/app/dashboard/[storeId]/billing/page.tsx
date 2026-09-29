@@ -22,7 +22,7 @@ export default async function BillingPage({
     <div className="mx-auto max-w-3xl p-8">
       <h1 className="mb-2 text-2xl font-bold">Billing</h1>
       <p className="mb-8 text-gray-500">
-        Current plan: <strong>{tier.name}</strong> — {tier.commissionBps / 100}% commission
+        Current plan: <strong>{tier.name}</strong>. No commission on your sales, on every plan.
       </p>
 
       <div className="mb-8 rounded-lg border p-4">
@@ -62,7 +62,6 @@ export default async function BillingPage({
                     ${(t.priceCents / 100).toFixed(0)}
                     <span className="text-sm font-normal text-gray-500">/mo</span>
                   </p>
-                  <p className="mt-2 text-sm text-gray-600">{(t.commissionBps / 100)}% commission</p>
                   <ul className="mt-2 space-y-1 text-xs text-gray-500">
                     <li>{t.limits.maxProducts} products</li>
                     <li>{t.limits.maxOrdersPerMonth} orders/mo</li>
