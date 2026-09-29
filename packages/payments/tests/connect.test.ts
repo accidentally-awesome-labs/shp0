@@ -213,6 +213,7 @@ describe("Connect a Store's Stripe account (ADR-0006)", () => {
 
   it("makes no link when the account cannot be saved; the next Connect gets the same account back and saves it", async () => {
     const store = await newStore();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const suffix = randomUUID().replaceAll("-", "");
     await pool.query(`
       CREATE FUNCTION refuse_${suffix}() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -223,6 +224,12 @@ describe("Connect a Store's Stripe account (ADR-0006)", () => {
       await expect(connect(store)).rejects.toThrow();
       expect(links()).toEqual([]);
       expect(await savedRows(store)).toEqual([]);
+      // The account Stripe created is on record, so it is never lost without a trace.
+      const [created] = [...fake.accounts.keys()];
+      const logged = error.mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(logged).toContain(created);
+      expect(logged).toContain(store);
+      expect(logged).toContain("database unavailable");
     } finally {
       await pool.query(`DROP TRIGGER refuse_${suffix} ON stripe_payment_accounts; DROP FUNCTION refuse_${suffix}();`);
     }
@@ -267,11 +274,14 @@ describe("Connect a Store's Stripe account (ADR-0006)", () => {
     ["connection dropped", [0, 1, 2].map(() => ({ dropConnection: true as const }))],
   ])("reports Stripe unavailable, and saves and links nothing: %s", async (_name, replies) => {
     const store = await newStore();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     for (const reply of replies) fake.reply(reply);
 
     expect(await connect(store)).toEqual({ kind: "unavailable" });
     expect(links()).toEqual([]);
     expect(await savedRows(store)).toEqual([]);
+    // Stripe may keep that answer under the Store's key: the log names the key, for support.
+    expect(warn.mock.calls.map((call) => call.join(" ")).join("\n")).toContain(`account:${store}`);
   });
 
   it("rejects Stripe's refusal with its code, and saves and links nothing", async () => {
@@ -317,7 +327,14 @@ describe("Connect a Store's Stripe account (ADR-0006)", () => {
     expect(fake.requests.map((r) => `${r.method} ${r.path}`)).toEqual([`GET /v2/core/accounts/${account}`]);
     expect(await getPaymentAccount(store)).toMatchObject({ chargesEnabled: true, cardPaymentsStatus: "active" });
 
-    // Stripe asks for more information: a link to give it.
+    // Stripe verifying something itself asks nothing of the Merchant: still no link.
+    fake.accounts.get(account!)!.requirements = {
+      entries: [{ ...newAccountState().requirements.entries[0]!, awaiting_action_from: "stripe" }],
+      summary: { minimum_deadline: { status: "currently_due", time: "2026-10-01T00:00:00Z" } },
+    };
+    expect(await connect(store)).toEqual({ kind: "active" });
+
+    // Stripe asks the Merchant for more information: a link to give it.
     fake.accounts.get(account!)!.requirements = newAccountState().requirements;
     expect((await connect(store)).kind).toBe("onboarding");
   });
@@ -335,8 +352,36 @@ describe("Connect a Store's Stripe account (ADR-0006)", () => {
     expect(await connect(goneStore)).toEqual({ kind: "missing" });
     expect(await getPaymentAccount(goneStore)).toMatchObject({ connectAccountId: gone, chargesEnabled: false });
 
+    // Stripe no longer lets shp0 read the account: the same.
+    const lockedStore = await newStore();
+    const locked = newAccountId();
+    await seedStripeAccount(lockedStore, locked, "active");
+    fake.reply(stripeError(403, "account_invalid"));
+    expect(await connect(lockedStore)).toEqual({ kind: "missing" });
+    expect(await getPaymentAccount(lockedStore)).toMatchObject({ connectAccountId: locked, chargesEnabled: false, cardPaymentsStatus: null });
+
     expect(creates()).toHaveLength(1);
     expect(await savedRows(closedStore)).toEqual([closed]);
+  });
+
+  it("treats the Store id in any case as the same Store: one key, one account", async () => {
+    const store = await newStore();
+    const upper = store.toUpperCase();
+
+    const outcomes = await Promise.all([connect(upper), connect(store)]);
+
+    expect(outcomes.map((o) => o.kind).sort()).toEqual(["onboarding", "onboarding"]);
+    expect(fake.accounts.size).toBe(1);
+    expect(new Set(creates().map((r) => r.idempotencyKey))).toEqual(new Set([`account:${store}`]));
+    expect(creates().map((r) => (r.body as { metadata: unknown }).metadata)).toEqual(
+      creates().map(() => ({ shp0_store_id: store })),
+    );
+    for (const link of links()) {
+      expect((link.body as { use_case: { account_onboarding: { return_url: string } } }).use_case.account_onboarding.return_url).toBe(
+        `${ORIGIN}/dashboard/${store}/payments?stripe=return`,
+      );
+    }
+    expect(await savedRows(store)).toEqual([...fake.accounts.keys()]);
   });
 
   it("refuses a malformed Store id or origin before asking Stripe anything", async () => {

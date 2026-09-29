@@ -179,7 +179,17 @@ describe("Stripe account events (ADR-0006)", () => {
       expect(await getPaymentAccount(store)).toMatchObject({ connectAccountId: account, chargesEnabled: false });
     });
 
-    it("answers 200 to a refusal a retry cannot fix, changes nothing, and logs its code", async () => {
+    it("records not able for an account Stripe no longer lets shp0 read (403), and answers 200", async () => {
+    const { store, account } = await storeWithAccount();
+    await deliver(thinEvent({ type: "v2.core.account.updated", account }));
+    expect(await getPaymentAccount(store)).toMatchObject({ chargesEnabled: true });
+    fake.reply(stripeError(403, "account_invalid"));
+
+    expect((await deliver(thinEvent({ type: "v2.core.account.updated", account }))).status).toBe(200);
+    expect(await getPaymentAccount(store)).toMatchObject({ connectAccountId: account, chargesEnabled: false, cardPaymentsStatus: null });
+  });
+
+  it("answers 200 to a refusal a retry cannot fix, changes nothing, and logs its code", async () => {
       const { store, account } = await storeWithAccount();
       const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
       vi.spyOn(console, "warn").mockImplementation(() => undefined);

@@ -65,7 +65,6 @@ const able: StripeAccountSummary = {
   cardPayments: "active",
   closed: false,
   needsInfo: false,
-  contactStripe: false,
   due: null,
   dueAt: null,
 };
@@ -91,7 +90,7 @@ describe("summarizeStripeAccount: can the Store take card payments?", () => {
   it("needs information from the Merchant: Stripe asks them to provide it, or it is due from them now", () => {
     expect(
       summarizeStripeAccount(account({ status: "restricted", details: [{ code: "requirements_past_due", resolution: "provide_info" }] })),
-    ).toMatchObject({ needsInfo: true, contactStripe: false });
+    ).toMatchObject({ needsInfo: true });
     for (const status of ["currently_due", "past_due"]) {
       expect(
         summarizeStripeAccount(account({ entries: [{ awaiting_action_from: "user", minimum_deadline: { status } }] })),
@@ -111,20 +110,37 @@ describe("summarizeStripeAccount: can the Store take card payments?", () => {
     ).toMatchObject({ needsInfo: false });
   });
 
-  it("must contact Stripe when Stripe offers no way for the Merchant to fix it", () => {
-    for (const resolution of ["contact_stripe", "no_resolution"]) {
-      expect(
-        summarizeStripeAccount(account({ status: "restricted", details: [{ code: "restricted_other", resolution }] })),
-        resolution,
-      ).toMatchObject({ contactStripe: true, needsInfo: false, canTakePayments: false });
-    }
+  it("reports the deadline of what the Merchant owes, with Stripe's time when every requirement is theirs", () => {
+    expect(
+      summarizeStripeAccount(
+        account({
+          entries: [
+            { awaiting_action_from: "user", minimum_deadline: { status: "eventually_due" } },
+            { awaiting_action_from: "user", minimum_deadline: { status: "past_due" } },
+          ],
+          due: { status: "past_due", time: "2026-10-01T00:00:00Z" },
+        }),
+      ),
+    ).toMatchObject({ due: "past_due", dueAt: "2026-10-01T00:00:00Z", needsInfo: true });
   });
 
-  it("reports Stripe's deadline for what is due", () => {
-    expect(summarizeStripeAccount(account({ due: { status: "past_due", time: "2026-10-01T00:00:00Z" } }))).toMatchObject({
-      due: "past_due",
-      dueAt: "2026-10-01T00:00:00Z",
+  it("does not count what Stripe itself is reviewing as owed by the Merchant", () => {
+    // Stripe's summary covers every requirement, its own included.
+    const reviewing = account({
+      entries: [{ awaiting_action_from: "stripe", minimum_deadline: { status: "currently_due" } }],
+      due: { status: "currently_due", time: "2026-10-01T00:00:00Z" },
     });
+    expect(summarizeStripeAccount(reviewing)).toEqual(able);
+
+    // With the Merchant owing something only eventually, Stripe's time may be for its own requirement: not shown.
+    const both = account({
+      entries: [
+        { awaiting_action_from: "user", minimum_deadline: { status: "eventually_due" } },
+        { awaiting_action_from: "stripe", minimum_deadline: { status: "past_due" } },
+      ],
+      due: { status: "past_due", time: "2026-10-01T00:00:00Z" },
+    });
+    expect(summarizeStripeAccount(both)).toMatchObject({ due: "eventually_due", dueAt: null, needsInfo: false });
   });
 });
 
@@ -212,7 +228,7 @@ describe("describeStripeAccount: what the Payments page says", () => {
     ],
     [
       "restricted by Stripe",
-      connected({ summary: summary({ contactStripe: true }), canTakePayments: false }),
+      connected({ summary: summary({}), canTakePayments: false }),
       null,
       page({ state: "restricted", stripeDashboard: true }),
     ],
@@ -260,6 +276,19 @@ describe("describeStripeAccount: what the Payments page says", () => {
       null,
       page({ state: "needs_info", action: "continue", stale: true }),
     ],
+    // Recorded as unable with no status to show (gone, no access, closed, not applied): no way forward from here.
+    [
+      "stale, recorded gone from Stripe",
+      connected({ fresh: false, summary: null, canTakePayments: false, cardPayments: null }),
+      null,
+      page({ state: "cannot_take_payments", stale: true }),
+    ],
+    [
+      "stale, recorded closed",
+      connected({ fresh: false, summary: null, canTakePayments: false, cardPayments: "active" }),
+      null,
+      page({ state: "cannot_take_payments", stale: true }),
+    ],
     // Where the Merchant came from only adds a note; the state is Stripe's.
     [
       "back from Stripe, still needs information",
@@ -303,5 +332,72 @@ describe("describeFailure: what a log line says about a failure", () => {
   it("gives shp0's own errors their name and message", () => {
     expect(describeFailure(new TypeError("STRIPE_SECRET_KEY is not set"))).toBe("TypeError: STRIPE_SECRET_KEY is not set");
     expect(describeFailure("a string")).toBe("unknown error");
+  });
+});
+
+describe("the Payments page for what Stripe actually sends", () => {
+  const view = (stripeAccount: Stripe.V2.Core.Account): StripeAccountView => {
+    const summary = summarizeStripeAccount(stripeAccount);
+    return {
+      connected: true,
+      accountId: "acct_test123",
+      fresh: true,
+      missing: false,
+      summary,
+      canTakePayments: summary.canTakePayments,
+      cardPayments: summary.cardPayments,
+      checkedAt: new Date("2026-09-29T00:00:00Z"),
+    };
+  };
+
+  it.each<[string, AccountFields, Partial<StripeAccountPage>]>([
+    [
+      "Stripe reviewing what the Merchant gave (pending, no_resolution)",
+      {
+        status: "pending",
+        details: [{ code: "requirements_pending_verification", resolution: "no_resolution" }],
+        entries: [{ awaiting_action_from: "stripe", minimum_deadline: { status: "currently_due" } }],
+        due: { status: "currently_due" },
+      },
+      { state: "in_review", action: null },
+    ],
+    [
+      "Stripe determining the status (pending)",
+      { status: "pending", details: [{ code: "determining_status", resolution: "no_resolution" }] },
+      { state: "in_review", action: null },
+    ],
+    [
+      "active while Stripe verifies a document",
+      {
+        entries: [{ awaiting_action_from: "stripe", minimum_deadline: { status: "currently_due" } }],
+        due: { status: "currently_due", time: "2026-10-01T00:00:00Z" },
+      },
+      { state: "active", warning: null, action: null },
+    ],
+    [
+      "active, the Merchant owes information",
+      {
+        entries: [{ awaiting_action_from: "user", minimum_deadline: { status: "currently_due" } }],
+        due: { status: "currently_due", time: "2026-10-01T00:00:00Z" },
+      },
+      { state: "active", warning: "information_due", action: "update" },
+    ],
+    [
+      "unsupported, but the Merchant can change what Stripe needs",
+      { status: "unsupported", details: [{ code: "unsupported_entity_type", resolution: "provide_info" }] },
+      { state: "needs_info", action: "continue" },
+    ],
+    [
+      "unsupported for the country",
+      { status: "unsupported", details: [{ code: "unsupported_country", resolution: "no_resolution" }] },
+      { state: "unsupported", action: null },
+    ],
+    [
+      "restricted, Stripe must be contacted",
+      { status: "restricted", details: [{ code: "restricted_other", resolution: "contact_stripe" }] },
+      { state: "restricted", action: null },
+    ],
+  ])("%s", (_name, fields, expected) => {
+    expect(describeStripeAccount(view(account(fields)), null)).toMatchObject(expected);
   });
 });

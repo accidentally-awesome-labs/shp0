@@ -119,6 +119,38 @@ describe("A Store's Stripe account (ADR-0006)", () => {
       expect((await row(a)).map((r) => r.connect_account_id)).toEqual([saved]);
     });
 
+    it("the database refuses to delete a saved account, so it cannot be replaced by a delete and an insert", async () => {
+      const store = await newStore();
+      const saved = accountId();
+      await savePaymentAccount(store, saved);
+
+      await expect(pool.query(`DELETE FROM stripe_payment_accounts WHERE store_id = $1`, [store])).rejects.toThrow(
+        /never replaced/,
+      );
+      expect((await row(store)).map((r) => r.connect_account_id)).toEqual([saved]);
+    });
+
+    it("lets the account go with its Store, when the Store itself is deleted", async () => {
+      const store = await newStore();
+      await savePaymentAccount(store, accountId());
+
+      // The Owner rule lets a Store go only with its Owner demoted in the same transaction.
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        await client.query(`UPDATE memberships SET role = 'admin' WHERE store_id = $1 AND role = 'owner'`, [store]);
+        await client.query(`DELETE FROM stores WHERE id = $1`, [store]);
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw error;
+      } finally {
+        client.release();
+      }
+
+      expect(await row(store)).toEqual([]);
+    });
+
     it("keeps the table's rules: status values, and card payments only with an active status", async () => {
       const store = await newStore();
       await savePaymentAccount(store, accountId());

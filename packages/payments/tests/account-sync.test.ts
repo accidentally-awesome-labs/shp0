@@ -137,6 +137,17 @@ describe("Reading a Store's Stripe account from Stripe (ADR-0006)", () => {
     expect(await getPaymentAccount(store)).toMatchObject({ connectAccountId: gone, chargesEnabled: false, cardPaymentsStatus: null });
   });
 
+  it("records not able for an account Stripe no longer lets shp0 read (403), and keeps its id", async () => {
+    const { store, account } = await storeWithAccount(activeAccountState());
+    await sync(store);
+    fake.reply(stripeError(403, "account_invalid"));
+
+    const view = await sync(store);
+
+    expect(view).toMatchObject({ connected: true, fresh: true, missing: true, canTakePayments: false });
+    expect(await getPaymentAccount(store)).toMatchObject({ connectAccountId: account, chargesEnabled: false, cardPaymentsStatus: null });
+  });
+
   it("never lets a read that began earlier overwrite a later one", async () => {
     const { store, account } = await storeWithAccount(activeAccountState());
     const fakeAccount = fake.accounts.get(account)!;
