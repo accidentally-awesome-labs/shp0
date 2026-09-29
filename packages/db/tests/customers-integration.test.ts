@@ -19,6 +19,8 @@ import {
   signOutCustomer,
   getCustomerBySession,
   CustomerSignUpError,
+  startCustomerSignIn,
+  startCustomerSignUp,
   listCustomers,
   listCustomerOrders,
   addCustomerAddress,
@@ -99,6 +101,9 @@ describe("Customer identity (Issue #13)", () => {
       password: "wrongpassword",
     });
     expect(failed).toBeNull();
+    // An email with no account, and Store B's Customer in Store A, are no sign-in either.
+    expect(await signInCustomer(storeAId, { email: "nobody@example.com", password: "password123" })).toBeNull();
+    expect(await signInCustomer(storeAId, { email: "shopper@example.com", password: "different456" })).toBeNull();
   });
 
   it("refuses a second Customer with the same email in the Store, with a typed reason, and adds no row", async () => {
@@ -177,5 +182,125 @@ describe("Customer identity (Issue #13)", () => {
     const orders = await listCustomerOrders(storeAId, customerId);
     expect(orders).toHaveLength(1);
     expect(orders[0]!.paymentStatus).toBe("pending");
+  });
+
+  describe("the storefront's sign-up and sign-in (startCustomerSignUp, startCustomerSignIn)", () => {
+    /** A Store of its own, so these tests add no Customer to Store A. */
+    async function newStore(): Promise<string> {
+      const owner = randomUUID();
+      await pool.query(`INSERT INTO "user" (id, name, email) VALUES ($1, 'Owner', $2)`, [owner, `${owner}@example.com`]);
+      const { store } = await provisionStore({ name: "Gamma", subdomain: `gamma-${owner.slice(0, 8)}`, ownerId: owner });
+      return store.id;
+    }
+    const count = async (storeId: string) => (await listCustomers(storeId)).length;
+    const signUp = { email: " pat@example.com ", name: " Pat ", password: "password123" };
+
+    it("signs a new Customer up and in: the token resolves to them", async () => {
+      const store = await newStore();
+
+      const result = await startCustomerSignUp(store, signUp, null);
+
+      expect(result).toEqual({ ok: true, token: expect.any(String) });
+      expect(await getCustomerBySession(store, (result as { token: string }).token)).toMatchObject({
+        email: "pat@example.com",
+        name: "Pat",
+      });
+    });
+
+    it("refuses what the form rules refuse, writing nothing", async () => {
+      const store = await newStore();
+
+      expect(await startCustomerSignUp(store, { ...signUp, password: "short" }, null)).toEqual({ ok: false, reason: "weak_password" });
+      expect(await startCustomerSignUp(store, { ...signUp, email: "a\u0000b@example.com" }, null)).toEqual({
+        ok: false,
+        reason: "invalid_email",
+      });
+      expect(await count(store)).toBe(0);
+    });
+
+    it("refuses a taken email with its reason, and signs no one in", async () => {
+      const store = await newStore();
+      await startCustomerSignUp(store, signUp, null);
+
+      expect(await startCustomerSignUp(store, { ...signUp, name: "Someone else" }, null)).toEqual({ ok: false, reason: "email_taken" });
+      expect(await count(store)).toBe(1);
+    });
+
+    it("lets any other failure through, as an error (not a form message)", async () => {
+      const store = await newStore();
+      const suffix = randomUUID().replaceAll("-", "");
+      await pool.query(`
+        CREATE FUNCTION refuse_${suffix}() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'database unavailable'; END $$;
+        CREATE TRIGGER refuse_${suffix} BEFORE INSERT ON customers
+          FOR EACH ROW WHEN (NEW.store_id = '${store}') EXECUTE FUNCTION refuse_${suffix}();`);
+      try {
+        await expect(startCustomerSignUp(store, signUp, null)).rejects.toThrow(/database unavailable/);
+      } finally {
+        await pool.query(`DROP TRIGGER refuse_${suffix} ON customers; DROP FUNCTION refuse_${suffix}();`);
+      }
+    });
+
+    it("signs a Customer in with the right password, and never says which of email or password was wrong", async () => {
+      const store = await newStore();
+      await startCustomerSignUp(store, signUp, null);
+
+      const result = await startCustomerSignIn(store, { email: "pat@example.com", password: "password123" }, null);
+      expect(result).toEqual({ ok: true, token: expect.any(String) });
+      expect(await startCustomerSignIn(store, { email: "pat@example.com", password: "wrong-password" }, null)).toEqual({
+        ok: false,
+        reason: "wrong_credentials",
+      });
+      expect(await startCustomerSignIn(store, { email: "nobody@example.com", password: "password123" }, null)).toEqual({
+        ok: false,
+        reason: "wrong_credentials",
+      });
+      expect(await startCustomerSignIn(store, { email: "a\u0000b@example.com", password: "password123" }, null)).toEqual({
+        ok: false,
+        reason: "wrong_credentials",
+      });
+    });
+
+    it("ends the session the browser had before, on sign-in and on sign-up", async () => {
+      const store = await newStore();
+      const first = await startCustomerSignUp(store, signUp, null);
+      const before = (first as { token: string }).token;
+
+      const again = await startCustomerSignIn(store, { email: "pat@example.com", password: "password123" }, before);
+      const after = (again as { token: string }).token;
+      expect(after).not.toBe(before);
+      expect(await getCustomerBySession(store, before)).toBeNull();
+      expect(await getCustomerBySession(store, after)).not.toBeNull();
+
+      // A sign-up in the same browser ends the signed-in Customer's session too.
+      const other = await startCustomerSignUp(store, { ...signUp, email: "sam@example.com", name: "Sam" }, after);
+      expect(await getCustomerBySession(store, after)).toBeNull();
+      expect(await getCustomerBySession(store, (other as { token: string }).token)).toMatchObject({ name: "Sam" });
+
+      // A refused attempt keeps the session the browser has.
+      const kept = (other as { token: string }).token;
+      await startCustomerSignIn(store, { email: "pat@example.com", password: "wrong-password" }, kept);
+      expect(await getCustomerBySession(store, kept)).not.toBeNull();
+    });
+
+    it("takes as long for an email with no account as for a wrong password, so timing does not tell them apart", async () => {
+      const store = await newStore();
+      await startCustomerSignUp(store, signUp, null);
+      const median = async (email: string) => {
+        const times: number[] = [];
+        for (let i = 0; i < 7; i++) {
+          const started = performance.now();
+          await startCustomerSignIn(store, { email, password: "wrong-password" }, null);
+          times.push(performance.now() - started);
+        }
+        return times.sort((a, b) => a - b)[3]!;
+      };
+
+      const known = await median("pat@example.com");
+      const unknown = await median("nobody@example.com");
+
+      // One scrypt each (tens of milliseconds); without it, an unknown email answers in a few.
+      expect(unknown).toBeGreaterThan(known * 0.5);
+    });
   });
 });
