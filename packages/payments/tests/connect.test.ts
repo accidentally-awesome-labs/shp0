@@ -265,7 +265,7 @@ describe("Connect a Store's Stripe account (ADR-0006)", () => {
   });
 
   it.each<[string, FakeReply[]]>([
-    ["Stripe unavailable (500)", [stripeError(500, "api_error")]],
+    ["Stripe unavailable (500, not kept under the key)", [0, 1, 2].map(() => ({ ...stripeError(500, "api_error"), notKept: true as const }))],
     [
       "rate limited",
       [0, 1, 2].map(() => ({ status: 429, body: { error: { type: "rate_limit", code: "rate_limit", message: "slow down" } } })),
@@ -282,6 +282,22 @@ describe("Connect a Store's Stripe account (ADR-0006)", () => {
     expect(await savedRows(store)).toEqual([]);
     // Stripe may keep that answer under the Store's key: the log names the key, for support.
     expect(warn.mock.calls.map((call) => call.join(" ")).join("\n")).toContain(`account:${store}`);
+  });
+
+  it("tells the Admin to contact support when Stripe answers with an error it kept under the Store's key", async () => {
+    const store = await newStore();
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    // Stripe keeps the 500 under the key: the SDK's retries, and every later Connect, get it back.
+    fake.reply(stripeError(500, "api_error"));
+
+    await expect(connect(store)).rejects.toMatchObject({ statusCode: 500 });
+    await expect(connect(store)).rejects.toMatchObject({ statusCode: 500 });
+
+    expect(fake.accounts.size).toBe(0);
+    expect(links()).toEqual([]);
+    const logged = error.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(logged).toContain(`account:${store}`);
   });
 
   it("rejects Stripe's refusal with its code, and saves and links nothing", async () => {
@@ -315,6 +331,48 @@ describe("Connect a Store's Stripe account (ADR-0006)", () => {
       }
     }
   });
+
+  it("reports Stripe unavailable when it cannot read a saved account, and creates and links nothing", async () => {
+    const store = await newStore();
+    await connect(store);
+    fake.requests.length = 0;
+    fake.reply(stripeError(500, "api_error"));
+    fake.reply({ dropConnection: true });
+
+    expect(await connect(store)).toEqual({ kind: "unavailable" });
+    expect(creates()).toEqual([]);
+    expect(links()).toEqual([]);
+  });
+
+  it("keeps the account when Stripe cannot make its link; the next Connect links that same account", async () => {
+    const store = await newStore();
+    // The link fails; its SDK retry, under the same key, gets the same answer.
+    fake.beforeNextReply(async () => undefined); // the create
+    fake.beforeNextReply(async () => fake.reply(stripeError(500, "api_error"))); // the link
+
+    expect(await connect(store)).toEqual({ kind: "unavailable" });
+    const [account] = [...fake.accounts.keys()];
+    expect(await savedRows(store)).toEqual([account]);
+
+    const outcome = await connect(store);
+
+    expect(outcome.kind).toBe("onboarding");
+    expect(creates()).toHaveLength(1);
+    expect((links().at(-1)!.body as { account: string }).account).toBe(account);
+  });
+
+  it.each(["javascript:alert(1)", "http://connect.stripe.test/setup/1"])(
+    "never hands the browser an onboarding link that is not https: %s",
+    async (url) => {
+      const store = await newStore();
+      fake.beforeNextReply(async () => undefined); // the create
+      fake.beforeNextReply(async () => {
+        fake.reply({ status: 200, body: { object: "v2.core.account_link", url, expires_at: "2026-10-01T00:00:00Z" } });
+      });
+
+      await expect(connect(store)).rejects.toThrow(/https/);
+    },
+  );
 
   it("makes no link for an account that can take payments and needs nothing", async () => {
     const store = await newStore();

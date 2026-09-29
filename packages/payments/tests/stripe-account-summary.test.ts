@@ -297,6 +297,13 @@ describe("describeStripeAccount: what the Payments page says", () => {
       page({ state: "needs_info", action: "continue", notice: "returned" }),
     ],
     ["back from Stripe, active", connected(), "return", page({ state: "active", notice: "returned", stripeDashboard: true })],
+    // Stripe could not be read on the way back: only the stale note, never "this is what Stripe reports now".
+    [
+      "back from Stripe, Stripe unreachable",
+      connected({ fresh: false, summary: null, canTakePayments: false, cardPayments: "pending" }),
+      "return",
+      page({ state: "in_review", stale: true }),
+    ],
     [
       "expired link, can continue",
       connected({ summary: summary({ needsInfo: true }), canTakePayments: false }),

@@ -42,7 +42,8 @@ export type RecordedRequest = {
 };
 
 export type FakeReply =
-  | { status: number; body: unknown }
+  /** `notKept`: Stripe does not keep this answer under the key (it failed before executing). */
+  | { status: number; body: unknown; notKept?: true }
   | { dropConnection: true }
   /** Execute the request and save its result, then drop the connection: Stripe did it, the answer was lost. */
   | { saveThenDrop: true };
@@ -250,13 +251,17 @@ export async function startFakeStripe({
         req.socket.destroy();
         return;
       }
-      res.writeHead(reply.status, { "content-type": "application/json" });
+      res.writeHead(reply.status, {
+        "content-type": "application/json",
+        // Stripe marks an answer it replays under a key (v1 documents it; assumed for v2).
+        ...(previous && previous.body === body ? { "idempotent-replayed": "true" } : {}),
+      });
       res.end(JSON.stringify(reply.body));
     });
   });
 
   function isUnsaved(reply: FakeReply): boolean {
-    return !("status" in reply) || reply.status === 429 || reply.status === 409;
+    return !("status" in reply) || reply.status === 429 || reply.status === 409 || reply.notKept === true;
   }
 
   /** The v2 `include` values of a request: from a JSON body, or include[N] in the query. */

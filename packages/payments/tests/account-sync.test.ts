@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 
@@ -125,6 +125,54 @@ describe("Reading a Store's Stripe account from Stripe (ADR-0006)", () => {
     expect(view).toMatchObject({ connected: true, fresh: false, summary: null, canTakePayments: true, cardPayments: "active" });
     expect(await getPaymentAccount(store)).toMatchObject({ chargesEnabled: true, cardPaymentsStatus: "active" });
   });
+
+  it.each<[string, (store: string) => Promise<unknown>]>([
+    [
+      "Stripe refused the read (400)",
+      (store) => {
+        fake.reply(stripeError(400, "invalid_request"));
+        return sync(store);
+      },
+    ],
+    [
+      "no Stripe key configured",
+      (store) =>
+        syncStripeAccount(
+          {
+            stripe: () => {
+              throw new Error("Neither apiKey nor config.authenticator provided");
+            },
+          },
+          store,
+        ),
+    ],
+  ])("shows what Stripe last reported when it cannot be asked: %s", async (_name, read) => {
+    const { store } = await storeWithAccount(activeAccountState());
+    await sync(store);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    expect(await read(store)).toMatchObject({ connected: true, fresh: false, canTakePayments: true, cardPayments: "active" });
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it(
+    "gives up on Stripe after the page's 5 seconds, and shows what Stripe last reported",
+    async () => {
+      const { store } = await storeWithAccount(activeAccountState());
+      await sync(store);
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      fake.beforeNextReply(() => new Promise((resolve) => setTimeout(resolve, 7_000)));
+
+      const started = Date.now();
+      const view = await sync(store);
+
+      expect(view).toMatchObject({ fresh: false, canTakePayments: true });
+      expect(Date.now() - started).toBeLessThan(6_500);
+      warn.mockRestore();
+    },
+    15_000,
+  );
 
   it("records not able for an account Stripe no longer has, and keeps its id", async () => {
     const store = await newStore();
