@@ -1,7 +1,7 @@
 # 0002 — Cart-to-Order Boundary and Inventory Timing
 
 Date: 2026-07-01
-Status: Accepted
+Status: Accepted (point 4 clarified by ADR-0006, 2026-09-28)
 
 ## Context
 
@@ -29,3 +29,8 @@ The choice is constrained by the isolation model: per ADR-0001, all tenant-scope
 - The concurrency fence is the payment transaction; there is no separate reservation table or expiry scheduler to build or maintain.
 - A Customer may reach checkout and discover a Variant is sold out only at payment time (if stock ran out between viewing the product and paying). This is an accepted, standard trade-off; the loss is a clear, recoverable "sold out" message rather than an oversold order.
 - This decision composes cleanly with ADR-0001: inventory decrement runs inside the transaction-wrapped tenant client, so it inherits Store-scoped RLS and atomicity for free.
+
+## Amendments
+
+- 2026-09-28, ADR-0006: Stripe captures a payment when the Customer pays, before the payment transaction runs. "Rejected/voided" in point 4 therefore means the captured payment is refunded in full, automatically. As point 4 says, the Order stays `payment: pending`.
+- 2026-09-28, ADR-0006: the "sold out" outcome in Consequences is found after payment, not at it. The Customer is charged, returned to the Order, and refunded in full automatically. The Order page shows that the Order was not paid and that the payment was refunded.

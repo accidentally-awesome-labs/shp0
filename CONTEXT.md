@@ -25,7 +25,7 @@ The highest Role within a Store's Membership — exactly one per Store. Holds ev
 _Avoid_: primary admin, super admin
 
 **Admin**:
-The middle Role. Manages the Store's catalog, Orders, Customers, and Store settings (including payouts), but cannot transfer or delete the Store, change platform billing, or manage Memberships.
+The middle Role. Manages the Store's catalog, Orders, Customers, and Store settings (including connecting the Store's Stripe account), but cannot transfer or delete the Store, change platform billing, or manage Memberships.
 _Avoid_: manager, full access
 
 **Staff**:
@@ -92,15 +92,15 @@ The constraints on a Discount's applicability — validity window, usage limit, 
 _Avoid_: rules (too generic)
 
 **Tier**:
-A named plan level a Store subscribes to, defining a monthly price, a commission rate, and a set of included Usage limits (e.g. Free, Pro, Scale).
+A named plan level a Store subscribes to, defining a monthly price and a set of included Usage limits (e.g. Free, Pro, Scale).
 _Avoid_: plan (use Tier for the level; Subscription for the Store's choice of it), package, level
 
 **Subscription**:
-A Store's active choice of Tier — the recurring monthly relationship that sets its price, commission rate, and included Usage limits.
+A Store's active choice of Tier — the recurring monthly relationship that sets its price and included Usage limits.
 _Avoid_: plan, membership (collides with Merchant Membership)
 
 **Commission**:
-The percentage of each paid Order that the platform takes as its fee. The Commission rate is set by the Store's Tier and decreases at higher Tiers. It is collected at payment time as the platform fee on the Store's Stripe Connect payment.
+A percentage of a paid Order taken by the platform as its fee. shp0 takes no Commission (0%) on Orders from a Store's own traffic — its storefront, its API, and AI agents acting for its Customers — on every Tier, and adds no platform fee to a Store's payments (ADR-0007). A fee on demand shp0 itself creates is undecided.
 _Avoid_: transaction fee, platform cut, take rate
 
 **Usage**:
@@ -110,6 +110,14 @@ _Avoid_: quota, consumption, meter
 **Payment status**:
 Where an Order stands on the money axis — its own state machine (e.g. pending, paid, partially paid, refunded, partially refunded). Independent of fulfillment status.
 _Avoid_: order status (that is the derived overall state)
+
+**Stripe account**:
+The Store's own Stripe account, owned by the Merchant's business, on which every Payment and refund for the Store's Orders is made (direct charges; the Store, not shp0, is the merchant of record). A Store has at most one Stripe account and a Stripe account serves one Store. The Store can take Payments only while Stripe reports the account able to accept card payments.
+_Avoid_: Connect account, payout account, merchant account
+
+**Payment**:
+One Customer payment for an Order, made through Stripe on the Store's Stripe account and identified by its Stripe PaymentIntent. An Order is paid by exactly one Payment. Any other Payment for it, and any Payment shp0 cannot honour (for example, the stock ran out before it arrived), is refunded in full automatically (ADR-0006).
+_Avoid_: transaction, charge (a Stripe object within a Payment)
 
 **Fulfillment status**:
 Where an Order stands on the delivery axis — its own state machine (e.g. unfulfilled, partially fulfilled, fulfilled). Independent of payment status.
@@ -140,7 +148,8 @@ _Avoid_: locale, money format
 - A Cart line is a Variant of a published Product of the Cart's own Store, at a whole quantity from 1 to 99 (`MAX_LINE_QUANTITY`, a storefront limit, not a stock level). Checkout re-checks every line against the live catalog and refuses the whole Cart if any line is invalid; it never drops a line silently.
 - Each Store denominates in exactly one Currency. All Money in that Store (prices, totals, fees) is held and computed as integer minor units of that Currency; floating-point is used only to parse input or format display, never in arithmetic.
 - A Store defines Discounts. Each Discount is a Trigger plus a Reward plus Conditions. Multiple Discounts may stack on one Order under a fixed precedence (line-level before order-level before shipping; percent before fixed; never below zero), and the merchant sees a previewed outcome rather than choosing the combination order. A free-item Reward adds an Order Line at unit price 0 and decrements that Variant's inventory like any other line.
-- A Store holds one Subscription to a Tier at a time. The Tier sets a monthly price, a Commission rate (which decreases at higher Tiers), and included Usage limits. The platform takes the Commission at payment time as the fee on the Store's Stripe Connect payment. Exceeding a Usage limit incurs an overage rather than blocking the Store, except on the Free Tier, where the limit is a hard cap.
+- A Store holds one Subscription to a Tier at a time. The Tier sets a monthly price and included Usage limits. shp0 takes no Commission on Orders from the Store's own traffic (ADR-0007). Exceeding a Usage limit incurs an overage rather than blocking the Store, except on the Free Tier, where the limit is a hard cap.
+- A Store has at most one Stripe account, and Customers pay for its Orders on that account (direct charges); shp0 never holds a Customer's money. An Order is paid by exactly one Payment. A Payment for an Order that is already paid, that no longer matches the Order, or for stock that ran out before it arrived is refunded in full automatically, and in the last case the Order stays payment: pending (ADR-0002, ADR-0006).
 
 ## Flagged ambiguities
 
@@ -155,5 +164,7 @@ _Avoid_: locale, money format
 - _Resolved_ — Discounts and promotions: a Discount is a unified, declarative Trigger + Reward + Conditions entity (so a code-based and an automatic/BOGO discount are the same concept, not two). Discounts stack from day one under a fixed precedence (line → order → shipping; percent before fixed; never-negative floor) shown via a merchant preview, not configurable ordering. Reward types include amount off (order/line/shipping), free item (an Order Line at unit price 0 that decrements inventory), and free shipping. Percentage reductions round half-up on minor units. Usage limits are enforced under a row-lock at redemption.
 - _Resolved_ — Custom Domain verification: a Custom Domain is served only after DNS-proven ownership (CNAME for subdomains, TXT/ALIAS for apex), and is re-verified periodically; a domain that fails re-verification stops being served. Vercel is orchestrated for serving and TLS. Recorded in ADR-0005.
 - _Implemented, pending decision #73_ — Operator access (Issue #52, as proposed in decision #73; mark it _Resolved_ once #73 is accepted): Operators are an allowlist of Merchant user ids in `SHP0_OPERATOR_USER_IDS` (comma-separated; whitespace and empty entries ignored), never emails, because Merchant emails are not verified and an email allowlist would make whoever signs up with that address first an Operator. Unset, empty, or separators only means nobody is an Operator and the platform admin is locked (fail closed); there is no wildcard. Every Operator server action checks this itself, and CI checks that they do (`scripts/ci/operator-guard.mjs`). A signed-out visitor to `/admin` is sent to sign in; a signed-in non-Operator gets a not-found page.
-- _Implemented, pending owner decision_ — Dashboard authorization by Role (no decision issue exists yet; mark it _Resolved_ once the owner accepts or changes each **Pending** choice below): each dashboard capability has a minimum Role and a Merchant may use it when their Role ranks at or above it (`packages/db/src/roles.ts`). Staff: view the catalog (Products, Collections and their members, the Discounts list), Customers and a Customer's Orders, view and fulfill Orders. Admin: manage the catalog, create and preview Discounts, Store settings including payouts and Custom Domains. Owner: change platform billing, Memberships, transfer or delete the Store. Role text other than exactly `owner`, `admin` or `staff` grants nothing. A dashboard action refuses a non-member, a missing Store and a too-low Role with the same "Not authorized for this store"; a dashboard page shows a non-member the not-found page, and a member whose Role is too low a message naming the Role required, without the data. CI checks that every action and page makes the check (`scripts/ci/action-guard.mjs`). **Pending** (choices this document did not settle): (1) viewing platform billing (Tier, Usage) is Owner-only; this document reserves only _managing_ billing to the Owner; (2) _moot_: the database refuses a second Membership for one person in one Store (`memberships_user_store_key`) and any role text other than exactly `owner`, `admin` or `staff` (`memberships_role_check`), so several rows or invalid role text cannot be stored; the read still fails closed on them as defense in depth (several rows: the lowest Role counts; any invalid row: no access); (3) opening a Store's dashboard home at all (`store.view`) takes any Role, Staff included.
-- _Resolved_ — Platform billing: a Store holds one Subscription to a Tier at a time. Tiers define a monthly price, a Commission rate that decreases at higher Tiers, and included Usage limits (products, orders, bandwidth, staff seats). Commission is collected at payment time as the Stripe Connect application fee. Usage overages are charged (not blocking) except on the Free Tier, which hard-caps.
+- _Implemented, pending owner decision_ — Dashboard authorization by Role (no decision issue exists yet; mark it _Resolved_ once the owner accepts or changes each **Pending** choice below): each dashboard capability has a minimum Role and a Merchant may use it when their Role ranks at or above it (`packages/db/src/roles.ts`). Staff: view the catalog (Products, Collections and their members, the Discounts list), Customers and a Customer's Orders, view and fulfill Orders. Admin: manage the catalog, create and preview Discounts, Store settings including the Store's Stripe account and Custom Domains. Owner: change platform billing, Memberships, transfer or delete the Store. Role text other than exactly `owner`, `admin` or `staff` grants nothing. A dashboard action refuses a non-member, a missing Store and a too-low Role with the same "Not authorized for this store"; a dashboard page shows a non-member the not-found page, and a member whose Role is too low a message naming the Role required, without the data. CI checks that every action and page makes the check (`scripts/ci/action-guard.mjs`). **Pending** (choices this document did not settle): (1) viewing platform billing (Tier, Usage) is Owner-only; this document reserves only _managing_ billing to the Owner; (2) _moot_: the database refuses a second Membership for one person in one Store (`memberships_user_store_key`) and any role text other than exactly `owner`, `admin` or `staff` (`memberships_role_check`), so several rows or invalid role text cannot be stored; the read still fails closed on them as defense in depth (several rows: the lowest Role counts; any invalid row: no access); (3) opening a Store's dashboard home at all (`store.view`) takes any Role, Staff included.
+- _Resolved_ — Platform billing: a Store holds one Subscription to a Tier at a time. Tiers define a monthly price and included Usage limits (products, orders, bandwidth, staff seats). Usage overages are charged (not blocking) except on the Free Tier, which hard-caps.
+- _Resolved_ — Commission: 0% on Orders from a Store's own traffic, on every Tier, with no platform fee on a Store's payments (decision #70, accepted 2026-09-28). This replaces a Tier-set Commission collected as the Stripe Connect application fee. A fee on demand shp0 itself creates is undecided. Recorded in ADR-0007.
+- _Provisional, test mode only (decision #74, final 2026-10-26)_ — Charge model: direct charges on the Store's own, Merchant-owned Stripe account (Accounts v2 with the full Stripe Dashboard; Stripe collects fees and carries losses). shp0 is not the merchant of record and holds no Customer money. A payment taken for stock that ran out is refunded in full automatically and the Order stays payment: pending (owner, 2026-09-28). Recorded in ADR-0006.
