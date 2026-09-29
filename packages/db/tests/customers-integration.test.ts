@@ -16,7 +16,9 @@ import {
   verifyPassword,
   signUpCustomer,
   signInCustomer,
+  signOutCustomer,
   getCustomerBySession,
+  CustomerSignUpError,
   listCustomers,
   listCustomerOrders,
   addCustomerAddress,
@@ -97,6 +99,32 @@ describe("Customer identity (Issue #13)", () => {
       password: "wrongpassword",
     });
     expect(failed).toBeNull();
+  });
+
+  it("refuses a second Customer with the same email in the Store, with a typed reason, and adds no row", async () => {
+    const before = await listCustomers(storeAId);
+    const again = signUpCustomer(storeAId, { email: "shopper@example.com", password: "another123", name: "Again" });
+    await expect(again).rejects.toBeInstanceOf(CustomerSignUpError);
+    await expect(again).rejects.toMatchObject({ reason: "email_taken" });
+    expect(await listCustomers(storeAId)).toEqual(before);
+  });
+
+  it("signs a Customer out: that session no longer resolves, their other sessions and other Stores' stay", async () => {
+    const credentials = { email: "shopper@example.com", password: "password123" };
+    const phone = await signInCustomer(storeAId, credentials);
+    const laptop = await signInCustomer(storeAId, credentials);
+
+    // Another Store cannot end Store A's session (RLS): nothing changes.
+    await signOutCustomer(storeBId, phone!.token);
+    expect(await getCustomerBySession(storeAId, phone!.token)).not.toBeNull();
+
+    await signOutCustomer(storeAId, phone!.token);
+
+    expect(await getCustomerBySession(storeAId, phone!.token)).toBeNull();
+    expect(await getCustomerBySession(storeAId, laptop!.token)).toMatchObject({ email: "shopper@example.com" });
+    // Signing out twice, or with a token that is no session, is harmless.
+    await expect(signOutCustomer(storeAId, phone!.token)).resolves.toBeUndefined();
+    await expect(signOutCustomer(storeAId, "not-a-token")).resolves.toBeUndefined();
   });
 
   it("resolves a session token to the correct customer + store", async () => {

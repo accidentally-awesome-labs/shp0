@@ -81,6 +81,7 @@ jobs:
           tests/money.test.ts
           tests/cart.test.ts
           tests/cart-rules.test.ts
+          tests/customer-forms.test.ts
           tests/order.test.ts
           tests/discounts.test.ts
           tests/billing.test.ts
