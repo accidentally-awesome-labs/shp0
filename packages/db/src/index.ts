@@ -1063,11 +1063,12 @@ export async function applySchema(
     await client.query(`ALTER TABLE stores ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'active';`);
 
     // ── stripe_payment_accounts (PLATFORM table — no RLS; ADR-0006) ──
-    // A Store's Stripe account: saved once, never replaced, one per Store and
-    // one Store per account. Whether it can take card payments is only what
-    // the latest read of Stripe reported (card_payments_status, and
-    // charges_enabled only while that is 'active'); status_read is the ticket
-    // of that read, so an older read never overwrites a newer one.
+    // A Store's Stripe account: saved once, never replaced (nor deleted, but
+    // with its Store), one per Store and one Store per account. Whether it
+    // can take card payments is only what the latest read of Stripe reported
+    // (card_payments_status, and charges_enabled only while that is
+    // 'active'); status_read is the ticket of that read, so an older read
+    // never overwrites a newer one.
     await client.query(`
       CREATE TABLE IF NOT EXISTS stripe_payment_accounts (
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1122,13 +1123,20 @@ export async function applySchema(
       CREATE OR REPLACE FUNCTION stripe_payment_accounts_keep_account() RETURNS trigger
       LANGUAGE plpgsql AS $$
       BEGIN
+        IF TG_OP = 'DELETE' THEN
+          -- Only with its Store: the cascade runs once the Store row is gone.
+          IF EXISTS (SELECT 1 FROM stores WHERE id = OLD.store_id) THEN
+            RAISE EXCEPTION 'a Store''s saved Stripe account is never replaced (ADR-0006)' USING ERRCODE = 'check_violation';
+          END IF;
+          RETURN OLD;
+        END IF;
         IF NEW.connect_account_id IS DISTINCT FROM OLD.connect_account_id OR NEW.store_id IS DISTINCT FROM OLD.store_id THEN
           RAISE EXCEPTION 'a Store''s saved Stripe account is never replaced (ADR-0006)' USING ERRCODE = 'check_violation';
         END IF;
         RETURN NEW;
       END $$;
       DROP TRIGGER IF EXISTS stripe_payment_accounts_keep_account ON stripe_payment_accounts;
-      CREATE TRIGGER stripe_payment_accounts_keep_account BEFORE UPDATE ON stripe_payment_accounts
+      CREATE TRIGGER stripe_payment_accounts_keep_account BEFORE UPDATE OR DELETE ON stripe_payment_accounts
         FOR EACH ROW EXECUTE FUNCTION stripe_payment_accounts_keep_account();
     `);
 

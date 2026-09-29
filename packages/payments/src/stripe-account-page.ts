@@ -7,17 +7,19 @@ export type StripeAccountState =
   | "needs_info"
   /** Stripe is reviewing what the Merchant gave it. */
   | "in_review"
-  /** Stripe has restricted card payments; the Merchant must contact Stripe. */
+  /** Stripe has restricted card payments and asks nothing of the Merchant: they must contact Stripe. */
   | "restricted"
   /** Stripe cannot offer card payments to this business. */
   | "unsupported"
   | "closed"
-  /** Stripe no longer has the saved account. */
+  /** Stripe no longer has the saved account, or no longer lets shp0 use it. */
   | "missing"
   /** The Store takes card payments. */
   | "active"
   /** Stripe has not said (not read yet, or no status reported). */
-  | "unknown";
+  | "unknown"
+  /** Stripe could not be read, and last reported the account unable, with no status to say why. */
+  | "cannot_take_payments";
 
 export type StripeAccountPage = {
   state: StripeAccountState;
@@ -55,16 +57,17 @@ function describeState(view: StripeAccountView): Omit<StripeAccountPage, "notice
   if (view.fresh && summary) {
     if (summary.closed) return { ...base, state: "closed" };
     if (summary.canTakePayments) {
-      const due = summary.needsInfo || summary.due === "currently_due" || summary.due === "past_due";
-      return due
+      return summary.needsInfo
         ? { ...base, state: "active", warning: "information_due", action: "update", stripeDashboard: true }
         : { ...base, state: "active", stripeDashboard: true };
     }
-    if (summary.cardPayments === "unsupported") return { ...base, state: "unsupported", stripeDashboard: true };
+    // Whatever the status, Stripe asking the Merchant for something is the way forward.
     if (summary.needsInfo) return { ...base, state: "needs_info", action: "continue" };
-    if (summary.contactStripe) return { ...base, state: "restricted", stripeDashboard: true };
+    // Pending: Stripe is deciding (its status details then offer no resolution).
     if (summary.cardPayments === "pending") return { ...base, state: "in_review" };
+    if (summary.cardPayments === "unsupported") return { ...base, state: "unsupported", stripeDashboard: true };
     if (summary.cardPayments === null) return { ...base, state: "unknown", action: "continue" };
+    // Restricted (or active on a configuration not applied), with nothing asked of the Merchant.
     return { ...base, state: "restricted", stripeDashboard: true };
   }
 
@@ -80,6 +83,7 @@ function describeState(view: StripeAccountView): Omit<StripeAccountPage, "notice
     case "restricted":
       return { ...stale, state: "needs_info", action: "continue" };
     default:
-      return { ...stale, state: "unknown", action: "continue" };
+      // Recorded unable with no status that says why: gone, no access, closed, or not applied.
+      return { ...stale, state: "cannot_take_payments" };
   }
 }

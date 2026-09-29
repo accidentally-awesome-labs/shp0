@@ -6,9 +6,9 @@ import { connectStripeAccountAction, type ConnectResult } from "@/app/actions/st
 
 const ERRORS: Record<Extract<ConnectResult, { kind: "error" }>["reason"], string> = {
   busy: "Stripe is still setting up this Store's account. Try again in a few seconds.",
-  unavailable: "Couldn't reach Stripe. Nothing was changed; try again in a minute.",
+  unavailable: "Couldn't reach Stripe. Nothing was changed; try again in a few minutes. If it keeps failing, contact shp0 support.",
   closed: "This Store's Stripe account is closed.",
-  missing: "Stripe can't find this Store's Stripe account.",
+  missing: "shp0 can no longer use this Store's Stripe account. Contact shp0 support.",
   failed: "Stripe couldn't set up the account. Try again later; if it keeps failing, contact shp0 support.",
 };
 

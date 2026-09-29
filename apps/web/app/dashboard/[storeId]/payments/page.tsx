@@ -41,8 +41,8 @@ const STATES: Record<StripeAccountState, { title: string; body: string; tone: st
     tone: "border-red-300 bg-red-50",
   },
   missing: {
-    title: "Stripe can't find this Store's Stripe account",
-    body: "Customers can't pay online. A Store keeps the Stripe account it was set up with; contact shp0 support.",
+    title: "shp0 can no longer use this Store's Stripe account",
+    body: "Stripe can't find the account, or no longer lets shp0 use it. Customers can't pay online. A Store keeps the Stripe account it was set up with; contact shp0 support.",
     tone: "border-red-300 bg-red-50",
   },
   active: {
@@ -53,6 +53,11 @@ const STATES: Record<StripeAccountState, { title: string; body: string; tone: st
   unknown: {
     title: "Not checked yet",
     body: "Stripe hasn't reported on this account yet. Continue with Stripe to finish setting it up.",
+    tone: "border-gray-200",
+  },
+  cannot_take_payments: {
+    title: "Not taking card payments",
+    body: "Stripe last reported that this account can't take card payments. Open this page again to see what Stripe says now.",
     tone: "border-gray-200",
   },
 };

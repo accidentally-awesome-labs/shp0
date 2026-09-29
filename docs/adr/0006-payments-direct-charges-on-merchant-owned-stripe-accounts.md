@@ -33,11 +33,12 @@ This ADR records the charge model and the rules every payment path follows.
      - `defaults.responsibilities` set explicitly to `{ fees_collector: 'stripe', losses_collector: 'stripe' }`, because v2 has no default;
      - the merchant configuration, requesting the card payments capability (`configuration.merchant.capabilities.card_payments.requested: true`);
      - `metadata.shp0_store_id`, and nothing else: nothing the Merchant typed (no email, name or country). Stripe refuses a reused idempotency key with other parameters, so the parameters are a constant of the Store id; Stripe's hosted onboarding collects the rest.
-   - Account creation carries the idempotency key `account:<Store id>`, and its id is saved as soon as Stripe returns it, before onboarding. A second or concurrent attempt therefore reuses the account instead of creating another. A saved account id is never replaced by a later attempt; an account created meanwhile is logged and left unused.
-   - The database enforces it: a saved account id and its Store cannot be updated, and an account id belongs to one Store.
-   - A Store can take payments only while Stripe reports its account able to accept card payments: the account is not closed, its merchant configuration is applied, and `configuration.merchant.capabilities.card_payments.status` is `active` (read with `include: ['configuration.merchant', 'requirements']`). Any other status, a missing value, or an account Stripe no longer has means it cannot.
+   - Account creation carries the idempotency key `account:<Store id>` (the Store id in lower case), and its id is saved as soon as Stripe returns it, before onboarding. A second or concurrent attempt therefore reuses the account instead of creating another. A saved account id is never replaced by a later attempt; an account created meanwhile is logged and left unused. A save that fails is logged with the account Stripe created.
+   - The key is the same on every attempt, so if Stripe keeps a failed create's answer under it (as v1 keeps errors; #74 asks about v2), later attempts get that answer back until Stripe drops the key. Such a failure is logged with the key, and the Admin is told to contact support if it keeps failing.
+   - The database enforces it: a saved account id and its Store cannot be updated, a saved account cannot be deleted except with its Store, and an account id belongs to one Store.
+   - A Store can take payments only while Stripe reports its account able to accept card payments: the account is not closed, its merchant configuration is applied, and `configuration.merchant.capabilities.card_payments.status` is `active` (read with `include: ['configuration.merchant', 'requirements']`). Any other status, a missing value, or an account Stripe no longer has (404) or no longer lets shp0 read (403) means it cannot.
    - shp0 reads that from Stripe, never from anything the Merchant submits or from a URL: whenever an Admin opens the Store's Payments page (where Stripe's onboarding returns), before offering onboarding for a saved account, and on account events. A read that began before the one recorded never overwrites it.
-   - shp0 offers Stripe's onboarding for a saved account only while Stripe says it cannot take card payments or asks the Merchant for information. An onboarding link is a bearer credential: it is never stored or logged.
+   - shp0 offers Stripe's onboarding for a saved account only while Stripe says it cannot take card payments or asks the Merchant for information. What the Merchant owes is read from the requirements awaiting them (`awaiting_action_from: 'user'`), not from the summary deadline, which also covers what Stripe itself is reviewing. An onboarding link is a bearer credential: it is never stored or logged.
    - Connecting a Merchant's _existing_ Stripe account waits for #74's questions to Stripe.
    - Connecting an account stays an Admin capability (`settings.manage`), as today.
 
@@ -117,7 +118,7 @@ This ADR records the charge model and the rules every payment path follows.
 7. **Idempotency is layered.**
    - `processed_events` skips an event that was already handled.
    - The unique Payment and the locked Order row make a repeated, or concurrent, delivery of the same payment change nothing, except retrying a refund that is still due.
-   - Stripe idempotency keys make a repeated account or session request return the first result, for as long as Stripe keeps the key. A retry after a lost save that comes later than that would create a second account, which is logged and never saved. Refund attempts have a key each, and a charge cannot be refunded twice.
+   - Stripe idempotency keys make a repeated account or session request return the first result, for as long as Stripe keeps the key. After a save that failed, a retry within that time gets the account back and saves it; a retry after it creates and saves another, and the first, logged at the failed save, is left unused. Refund attempts have a key each, and a charge cannot be refunded twice.
 
 8. **Testing without Stripe.**
    - CI cannot reach Stripe. Tests point the Stripe SDK at a local fake Stripe server, configured with its `host`, `port` and `protocol` options. The fake records every request: method, path, parameters, `Stripe-Account` and `Idempotency-Key`.
@@ -148,7 +149,8 @@ This ADR records the charge model and the rules every payment path follows.
   - storing the Store's Currency;
   - the Customer's email and delivery address on the Order;
   - retrying _refund due_ Payments outside the webhook, needed before live mode;
-  - replacing a Store's closed Stripe account, or one Stripe no longer has: today such a Store cannot take payments, and needs an Operator decision;
+  - replacing a Store's closed Stripe account, or one Stripe no longer has or no longer lets shp0 use: today such a Store cannot take payments, and needs an Operator decision;
+  - letting a Store whose account creation Stripe keeps refusing under its key try again under another key (needs #74's answer on v2 replays);
   - showing Operators each Store's Stripe account and status;
   - resolving a _refund failed_ Payment once a person has refunded it (handling `charge.refunded`, or an Admin or Operator action); until then, Pay stays blocked on that Order;
   - following a refund that Stripe created but that later fails (`refund.updated`, `refund.failed`).

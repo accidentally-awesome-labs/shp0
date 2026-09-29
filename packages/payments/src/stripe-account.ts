@@ -19,12 +19,15 @@ export type StripeAccountSummary = {
   closed: boolean;
   /** Stripe asks the Merchant for information, now or overdue. */
   needsInfo: boolean;
-  /** Stripe offers no way for the Merchant to resolve a restriction themselves. */
-  contactStripe: boolean;
-  /** The deadline of what Stripe asks for, if anything. */
-  due: "currently_due" | "eventually_due" | "past_due" | null;
+  /** The strictest deadline of what Stripe asks the Merchant for, if anything (not what Stripe itself is reviewing). */
+  due: Deadline | null;
+  /** When that is due: Stripe's time, given only when every requirement is the Merchant's. */
   dueAt: string | null;
 };
+
+type Deadline = "currently_due" | "eventually_due" | "past_due";
+/** Deadlines from the least to the most strict. */
+const DEADLINES: readonly Deadline[] = ["eventually_due", "currently_due", "past_due"];
 
 export type StripeAccountDeps = {
   /**
@@ -41,7 +44,7 @@ export type ConnectOutcome =
   /** The account can take card payments and Stripe needs nothing more. */
   | { kind: "active" }
   | { kind: "closed" }
-  /** Stripe no longer has the saved account. */
+  /** Stripe no longer has the saved account, or no longer lets shp0 use it. */
   | { kind: "missing" }
   /** Another Connect for the Store is creating its account right now. */
   | { kind: "busy" }
@@ -56,7 +59,7 @@ export type StripeAccountView =
       accountId: string;
       /** Read from Stripe just now; false when Stripe could not be read (the stored status is shown). */
       fresh: boolean;
-      /** Stripe no longer has the account. */
+      /** Stripe no longer has the account, or no longer lets shp0 read it. */
       missing: boolean;
       /** What Stripe reported, when fresh and not missing. */
       summary: StripeAccountSummary | null;
@@ -130,6 +133,10 @@ export function onboardingUrls(origin: string, storeId: string): { refresh_url: 
  * payments. Only an open account whose merchant configuration is applied and
  * whose card payments are `active` can take them; anything else, including a
  * status shp0 does not know or a missing configuration, cannot.
+ *
+ * What the Merchant owes comes from the requirements awaiting them: Stripe's
+ * summary deadline covers every requirement, those Stripe itself is
+ * reviewing too, so its time is used only when every requirement is theirs.
  */
 export function summarizeStripeAccount(account: Stripe.V2.Core.Account): StripeAccountSummary {
   const merchant = account.configuration?.merchant;
@@ -139,22 +146,23 @@ export function summarizeStripeAccount(account: Stripe.V2.Core.Account): StripeA
   const details = cardPaymentsCapability?.status_details ?? [];
   const closed = account.closed === true;
   const entries = account.requirements?.entries ?? [];
-  const deadline = account.requirements?.summary?.minimum_deadline;
+  const merchantOwes = entries.filter((entry) => entry.awaiting_action_from === "user");
+  const due = strictest(merchantOwes.map((entry) => entry.minimum_deadline?.status));
+  const allMerchants = merchantOwes.length === entries.length;
   return {
     canTakePayments: !closed && merchant?.applied === true && cardPayments === "active",
     cardPayments,
     closed,
-    needsInfo:
-      details.some((detail) => detail.resolution === "provide_info") ||
-      entries.some(
-        (entry) =>
-          entry.awaiting_action_from === "user" &&
-          (entry.minimum_deadline?.status === "currently_due" || entry.minimum_deadline?.status === "past_due"),
-      ),
-    contactStripe: details.some((detail) => detail.resolution === "contact_stripe" || detail.resolution === "no_resolution"),
-    due: deadline?.status ?? null,
-    dueAt: deadline?.time ?? null,
+    needsInfo: details.some((detail) => detail.resolution === "provide_info") || due === "currently_due" || due === "past_due",
+    due,
+    dueAt: due !== null && allMerchants ? (account.requirements?.summary?.minimum_deadline?.time ?? null) : null,
   };
+}
+
+function strictest(deadlines: Array<string | undefined>): Deadline | null {
+  let found = -1;
+  for (const deadline of deadlines) found = Math.max(found, DEADLINES.indexOf(deadline as Deadline));
+  return found < 0 ? null : DEADLINES[found]!;
 }
 
 /**
@@ -167,20 +175,27 @@ export function summarizeStripeAccount(account: Stripe.V2.Core.Account): StripeA
  *   one already saved is used, and never replaced (an account created
  *   meanwhile is logged and left unused).
  * - A saved account: read it from Stripe first (and record what Stripe
- *   reports). A closed account, or one Stripe no longer has, gets no link;
- *   one that can take payments and needs nothing gets none either.
+ *   reports). A closed account, or one Stripe no longer has or no longer
+ *   lets shp0 use, gets no link; one that can take payments and that Stripe
+ *   asks nothing of the Merchant for gets none either.
  * - Otherwise: an onboarding link for the saved account, returning to the
  *   Store's Payments page (onboardingUrls).
  *
- * Throws on Stripe's refusal (logged by the caller with its code) and on a
- * database failure: nothing is linked then, and the next Connect gets the
- * same account back.
+ * The Store id is used in lower case, so the same Store always has the same
+ * key. Throws on Stripe's refusal (logged by the caller with its code) and on
+ * a database failure: nothing is linked then. A create whose save failed is
+ * logged with the account Stripe created, and the next Connect gets it back
+ * while Stripe keeps the key.
+ *
+ * Stripe may keep a failed create's answer under the key too (#74): the next
+ * Connects then get that answer back until Stripe drops the key. The failure
+ * is logged with the key, for support.
  */
 export async function connectStripeAccount(
   deps: StripeAccountDeps,
   request: { storeId: string; origin: string },
 ): Promise<ConnectOutcome> {
-  const { storeId } = request;
+  const storeId = request.storeId.toLowerCase();
   const urls = onboardingUrls(request.origin, storeId);
   const stripe = deps.stripe();
 
@@ -197,23 +212,31 @@ export async function connectStripeAccount(
     if (result.missing) return { kind: "missing" };
     const { summary } = result;
     if (summary.closed) return { kind: "closed" };
-    const due = summary.due === "currently_due" || summary.due === "past_due";
-    if (summary.canTakePayments && !summary.needsInfo && !due) return { kind: "active" };
+    if (summary.canTakePayments && !summary.needsInfo) return { kind: "active" };
     accountId = read.accountId;
   } else {
+    const key = accountIdempotencyKey(storeId);
     let created: Stripe.V2.Core.Account;
     try {
-      created = await stripe.v2.core.accounts.create(accountCreateParams(storeId), {
-        idempotencyKey: accountIdempotencyKey(storeId),
-        ...CREATE,
-      });
+      created = await stripe.v2.core.accounts.create(accountCreateParams(storeId), { idempotencyKey: key, ...CREATE });
     } catch (error) {
       if (isStripeFailure(error, "in_use")) return { kind: "busy" };
-      if (isStripeFailure(error, "retryable")) return { kind: "unavailable" };
+      if (isStripeFailure(error, "retryable")) {
+        console.warn(`Stripe could not create the Stripe account of Store ${storeId} (key ${key}): ${describeFailure(error)}`);
+        return { kind: "unavailable" };
+      }
       throw error;
     }
     if (!STRIPE_ACCOUNT_ID.test(created.id)) throw new Error("Stripe returned an account id shp0 cannot save");
-    const saved = await savePaymentAccount(storeId, created.id);
+    let saved: { accountId: string; saved: boolean };
+    try {
+      saved = await savePaymentAccount(storeId, created.id);
+    } catch (error) {
+      console.error(
+        `Stripe account ${created.id} was created for Store ${storeId} but could not be saved: ${describeFailure(error)}`,
+      );
+      throw error;
+    }
     if (saved.accountId !== created.id) {
       console.warn(
         `Stripe account ${created.id} was created for Store ${storeId}, which already has ${saved.accountId}; the new one is not used`,
@@ -280,8 +303,9 @@ export type AccountRead = { missing: true } | { missing: false; summary: StripeA
 /**
  * Read a saved account from Stripe as the platform (no Stripe-Account), and
  * record what Stripe reports, ordered by the read's ticket. An account Stripe
- * no longer has (404) is recorded as unable to take payments. Other Stripe
- * errors are thrown, and nothing is recorded.
+ * no longer has (404), or no longer lets shp0 read (403: access revoked), is
+ * recorded as unable to take payments. Other Stripe errors are thrown, and
+ * nothing is recorded.
  */
 export async function readAccount(
   stripe: Stripe,
@@ -292,7 +316,7 @@ export async function readAccount(
   try {
     account = await stripe.v2.core.accounts.retrieve(read.accountId, ACCOUNT_READ, options);
   } catch (error) {
-    if (isStripeFailure(error, "missing")) {
+    if (isStripeFailure(error, "missing", "no_access")) {
       await recordStripeAccountStatus(read, { cardPayments: null, canTakePayments: false });
       return { missing: true };
     }
@@ -304,13 +328,14 @@ export async function readAccount(
 }
 
 /** How a Stripe request failed. */
-export type StripeFailure = "in_use" | "retryable" | "missing" | "refused";
+export type StripeFailure = "in_use" | "retryable" | "missing" | "no_access" | "refused";
 
 /**
  * Classify a Stripe error by its status, not its class (v2 maps some errors
  * to other classes than v1): a key in use (409 idempotency_key_in_use); a
  * failure a retry can fix (no answer, 5xx, 429, another 409, or 401, a
- * configuration fix); gone (404); or a refusal. Null for anything else.
+ * configuration fix); gone (404); not permitted (403); or a refusal. Null for
+ * anything else.
  */
 export function stripeFailure(error: unknown): StripeFailure | null {
   if (!(error instanceof Stripe.errors.StripeError)) return null;
@@ -327,6 +352,7 @@ export function stripeFailure(error: unknown): StripeFailure | null {
     return "retryable";
   }
   if (status === 404) return "missing";
+  if (status === 403) return "no_access";
   return "refused";
 }
 
