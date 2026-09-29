@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import { drizzle } from "drizzle-orm/node-postgres";
@@ -281,6 +281,30 @@ describe("Customer identity (Issue #13)", () => {
       const kept = (other as { token: string }).token;
       await startCustomerSignIn(store, { email: "pat@example.com", password: "wrong-password" }, kept);
       expect(await getCustomerBySession(store, kept)).not.toBeNull();
+    });
+
+    it("still starts the new session if ending the browser's previous one fails, and logs it", async () => {
+      const store = await newStore();
+      const first = await startCustomerSignUp(store, signUp, null);
+      const before = (first as { token: string }).token;
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const suffix = randomUUID().replaceAll("-", "");
+      await pool.query(`
+        CREATE FUNCTION refuse_${suffix}() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'database unavailable'; END $$;
+        CREATE TRIGGER refuse_${suffix} BEFORE DELETE ON customer_sessions
+          FOR EACH ROW WHEN (OLD.store_id = '${store}') EXECUTE FUNCTION refuse_${suffix}();`);
+      try {
+        const again = await startCustomerSignIn(store, { email: "pat@example.com", password: "password123" }, before);
+
+        // The new session is committed: the Customer is signed in with it.
+        expect(again).toEqual({ ok: true, token: expect.any(String) });
+        expect(await getCustomerBySession(store, (again as { token: string }).token)).not.toBeNull();
+        expect(error.mock.calls.map((call) => call.join(" ")).join("\n")).toContain("database unavailable");
+      } finally {
+        await pool.query(`DROP TRIGGER refuse_${suffix} ON customer_sessions; DROP FUNCTION refuse_${suffix}();`);
+        error.mockRestore();
+      }
     });
 
     it("takes as long for an email with no account as for a wrong password, so timing does not tell them apart", async () => {
