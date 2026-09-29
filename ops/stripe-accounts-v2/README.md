@@ -49,4 +49,4 @@ Until the app has the secret, the route answers 500 and Stripe retries the deliv
 ## Not verified against real Stripe or a real database
 
 - Both scripts were tested only against a local Postgres 16 and a local stand-in for Stripe's API.
-- Whether `@self` receives `v2.core.account` events for the platform's Accounts v2 accounts is one of #74's open questions.
+- Stripe's Connect webhooks page says a v2 Account's v2 events use the platform's own scope ("Your account", which is `@self`), while its v1 events use the connected-accounts scope. No event from a real account has been seen yet.
