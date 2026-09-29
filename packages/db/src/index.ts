@@ -2283,9 +2283,12 @@ export async function getPaymentStatus(
 // ─────────────────────────────────────────────────────────────────────────
 
 /**
- * How long an attempt without a session counts as still being created. Pay's
- * Stripe requests end well within it; after it (or once a failed attempt is
- * ended), the next Pay starts a new attempt.
+ * How long an attempt without a session counts as still being created: a Pay
+ * in that time re-sends the attempt's key rather than start another. After
+ * it (or once a failed attempt is ended), the next Pay starts a new attempt.
+ * Pay's Stripe requests normally end well within it. Correctness does not
+ * depend on that: a session that comes back after its attempt was superseded
+ * is never recorded, so never delivered.
  */
 export const CHECKOUT_ATTEMPT_LEASE_SECONDS = 60;
 

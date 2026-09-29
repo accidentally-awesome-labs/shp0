@@ -31,11 +31,12 @@ export async function onboardConnectAction(storeId: string): Promise<{ url: stri
 
 /**
  * Storefront Pay (ADR-0006): send the Customer to Stripe Checkout for an
- * Order of the request host's Store, or back to the Order page, whose
- * `?checkout=` says why not. Only the request carrying the cart token that
- * placed the Order (its own shp0_cart_token cookie) gets a session:
- * startCheckout matches both, so another shopper's token, no token and a
- * nonexistent Order all read "not_found".
+ * Order of the request host's Store, or back to the Order page, which works
+ * out from the Order why it cannot be paid; `?checkout=` only notes a Pay
+ * that failed or found another in progress. Only the request carrying the
+ * cart token that placed the Order (its own shp0_cart_token cookie) gets a
+ * session: startCheckout matches both, so another shopper's token, no token
+ * and a nonexistent Order all read "not_found".
  *
  * Stripe's return URLs are on the host that served this request.
  */
@@ -46,7 +47,7 @@ export async function payOrderAction(orderId: string): Promise<void> {
   let outcome: CheckoutOutcome | { kind: "failed" };
   try {
     outcome = await startCheckout(
-      { stripe: getStripe() },
+      { stripe: getStripe },
       { storeId: storefront.storeId, orderId, cartToken: await readCartToken(), origin: storefront.origin },
     );
   } catch (error) {
@@ -60,5 +61,7 @@ export async function payOrderAction(orderId: string): Promise<void> {
 
   // redirect() throws, so it stays outside the try.
   if (outcome.kind === "redirect") redirect(outcome.url);
-  redirect(`/order/${orderId}?checkout=${outcome.kind === "failed" ? "failed" : outcome.reason}`);
+  if (outcome.kind === "failed") redirect(`/order/${orderId}?checkout=failed`);
+  if (outcome.reason === "in_progress") redirect(`/order/${orderId}?checkout=in_progress`);
+  redirect(`/order/${orderId}`);
 }

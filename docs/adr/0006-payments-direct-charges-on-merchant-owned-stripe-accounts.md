@@ -55,16 +55,16 @@ This ADR records the charge model and the rules every payment path follows.
    - **Return URLs.** The success and cancel URLs are on the storefront host that served the request, and point back at the Order.
    - **One live session per Order**, recorded on the Order:
      - Pay reuses the recorded session while it is `open`. An open session is never replaced.
-     - A new session is created only when the recorded one can no longer take money for the Order: it is `expired`, it no longer exists on the Store's account, or it is `complete` and its delayed payment failed, or its payment was refunded automatically (point 6).
-     - Any other `complete` session blocks a new one, and the Customer is told why:
+     - A new session is created only when the recorded one can no longer take money for the Order: it is `expired`, or it no longer exists on the Store's account; or it is `complete` and its delayed payment failed or was canceled, it took no payment, or its payment was refunded automatically (point 6). A refund Stripe has created but not yet finished counts as refunded, as in point 6.
+     - Any other `complete` session blocks a new one, and the Customer is told why. Such a payment is reported first, before the stock or account checks above, which may have changed since:
        - its payment is `paid` and not yet recorded, or still processing: the payment is being processed;
-       - its automatic refund is still due, or Stripe refused it (_refund failed_): that money is still held, so the Customer is not asked to pay again until it is refunded.
+       - its automatic refund is still due, or Stripe refused it (_refund failed_): that money is still held, so the Customer is not asked to pay again. A _refund failed_ Payment blocks Pay on that Order until a person resolves it; nothing records a refund made by hand yet (see Consequences).
      - Each new session belongs to a new attempt, reserved on the Order before Stripe is called. Its request carries the idempotency key `checkout:<Order id>:<attempt>`.
      - A Pay that finds an attempt with no session yet, started less than a minute ago, sends that attempt's key again, so Stripe returns the same session (or answers 409 while it is still creating it: the Customer is asked to try again in a moment). After that minute, the attempt is over and the next Pay starts a new one.
-     - Pay's Stripe requests are not retried by the SDK, so they end well within that minute (a 20-second timeout).
+     - Pay's Stripe requests are not retried by the SDK, except for its one resend after a dropped connection. With a 20-second timeout, they normally end well within that minute. Correctness does not depend on it: a session that comes back after its attempt was superseded is never recorded, so never given out.
      - A create that fails ends its attempt, since Stripe keeps a key's error: the Customer's next Pay starts a new attempt, with its own key.
      - A session is given to the Customer only once it is recorded on the Order, while the Order is still `pending`. So an Order never has two sessions a Customer could pay.
-   - **The Order page** offers Pay only when Pay would send the Customer to Stripe. It reads the recorded session from Stripe, as Pay does, and never takes the payment's state from its URL.
+   - **The Order page** offers Pay only when Pay would send the Customer to Stripe. It reads the recorded session from Stripe, as Pay does (with a shorter timeout), and never takes the payment's state from its URL. If Stripe cannot be read, it offers Pay, which checks again, except just after the Customer came back from Stripe.
    - **Type checking.** The parameters are an object literal checked with `satisfies Stripe.Checkout.SessionCreateParams`. An `as` cast, or a value of another named type, skips TypeScript's excess-property check.
 
 4. **Webhooks.**
@@ -104,7 +104,7 @@ This ADR records the charge model and the rules every payment path follows.
    4. **Retryable failures** (no answer, rate limit, Stripe unavailable, a key already in use) are answered 5xx, so that Stripe delivers the event again, and the next attempt is made.
    5. **Any other refusal**, such as a disputed charge or lost access to the account, is answered 200. It makes the Payment _refund failed_, with Stripe's error code, for a Store Admin or an Operator to refund by hand.
 
-   Stripe stops delivering an event after some days. Before live mode, _refund due_ Payments must also be retried outside the webhook.
+   Stripe stops redelivering an event: as we understand its webhook documentation, after up to three days in live mode, and after a few hours (three retries) in test mode. Before live mode, _refund due_ Payments must also be retried outside the webhook.
 
 7. **Idempotency is layered.**
    - `processed_events` skips an event that was already handled.
@@ -138,4 +138,5 @@ This ADR records the charge model and the rules every payment path follows.
   - storing the Store's Currency;
   - the Customer's email and delivery address on the Order;
   - retrying _refund due_ Payments outside the webhook, needed before live mode;
+  - resolving a _refund failed_ Payment once a person has refunded it (handling `charge.refunded`, or an Admin or Operator action); until then, Pay stays blocked on that Order;
   - following a refund that Stripe created but that later fails (`refund.updated`, `refund.failed`).

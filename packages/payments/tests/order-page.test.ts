@@ -48,8 +48,13 @@ describe("describeOrderPayment", () => {
     ["an item deleted", pending, blocked("item_unavailable"), null, view("item_unavailable", false)],
     ["not chargeable", pending, blocked("not_chargeable"), "failed", view("not_chargeable", false)],
     ["no Stripe account", pending, blocked("payments_not_set_up"), null, view("payments_not_set_up", false)],
-    // Stripe could not be asked: offer Pay, which checks again.
+    // Stripe could not be asked: offer Pay, which checks again...
     ["availability unknown", pending, null, null, view(null, true)],
+    // ...except just back from Stripe; and never while a refund is owed.
+    ["availability unknown, back from Stripe", pending, null, "returned", view("confirming", false, true)],
+    ["availability unknown, refund owed", withPayment("refund_due"), null, null, view("refund_pending", false)],
+    ["availability unknown, refund failed", withPayment("refund_failed"), null, "returned", view("refund_failed", false)],
+    ["availability unknown, refunded", withPayment("refunded"), null, null, view("refunded", true)],
   ])("%s", (_name, order, availability, note, expected) => {
     expect(describeOrderPayment(order, availability, note)).toEqual(expected);
   });

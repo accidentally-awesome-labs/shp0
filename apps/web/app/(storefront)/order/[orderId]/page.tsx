@@ -37,10 +37,13 @@ function noticeText(notice: OrderPaymentNotice, refundReason: RefundReason | nul
     case "refund_pending":
       return {
         tone: "warning",
-        text: `${why}, so it is being refunded in full. You can pay again once the refund has gone through.`,
+        text: `${why}, so it is being refunded in full. If the refund hasn't reached you in a few days, please contact the store.`,
       };
     case "refund_failed":
-      return { tone: "warning", text: `${why}. The store will refund it; please contact the store.` };
+      return {
+        tone: "warning",
+        text: `${why}, and it has not been refunded yet. Please contact the store about your refund.`,
+      };
     case "confirming":
       return { tone: "info", text: "Thank you! We're confirming your payment, which can take a moment." };
     case "processing":
@@ -96,7 +99,7 @@ async function OrderView({
   let availability: CheckoutAvailability | null = null;
   if (order.paymentStatus === "pending") {
     try {
-      availability = await getCheckoutAvailability({ stripe: getStripe() }, { storeId, orderId: order.id, cartToken });
+      availability = await getCheckoutAvailability({ stripe: getStripe }, { storeId, orderId: order.id, cartToken });
     } catch (error) {
       // Offer Pay, which checks again.
       console.error(

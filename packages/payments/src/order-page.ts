@@ -10,7 +10,10 @@ export type OrderPaymentNotice =
   | "refunded"
   /** The current session's payment is being refunded automatically. */
   | "refund_pending"
-  /** Stripe refused the automatic refund: the Store must refund it. */
+  /**
+   * Stripe refused the automatic refund: a person must refund it, and until
+   * someone does, this Order cannot be paid online.
+   */
   | "refund_failed"
   /** Back from Stripe; the payment is being confirmed. */
   | "confirming"
@@ -51,7 +54,9 @@ const BLOCK_NOTICES: Partial<Record<CheckoutBlock, OrderPaymentNotice>> = {
  * "failed" or found one "in_progress") and never overrides the state.
  *
  * `availability` is null when it could not be read (Stripe unreachable):
- * Pay is offered, and checks again.
+ * Pay is offered, and checks again, except just after the Customer came back
+ * from Stripe ("returned"), when the page says it is confirming instead. A
+ * note can so hide the viewer's own Pay button, never offer one.
  */
 export function describeOrderPayment(
   order: {
@@ -66,6 +71,7 @@ export function describeOrderPayment(
 
   const reason = availability && !availability.available ? availability.reason : null;
   const payable = reason === null;
+  const unknown = availability === null;
 
   // The current session's payment was not honoured.
   if (order.payment?.status === "refund_failed") return view("refund_failed", false);
@@ -73,6 +79,7 @@ export function describeOrderPayment(
   if (order.payment?.status === "refunded") return view("refunded", payable);
 
   if (reason === "processing") return view(note === "returned" ? "confirming" : "processing", false, true);
+  if (unknown && note === "returned") return view("confirming", false, true);
   if (reason !== null) return view(BLOCK_NOTICES[reason] ?? null, false);
   if (note === "failed" || note === "in_progress") return view(note, true);
   return view(null, true);

@@ -139,7 +139,7 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
 
   function pay(order: { orderId: string; token: string }, store = storeId): Promise<CheckoutOutcome> {
     return startCheckout(
-      { stripe: fake.stripe },
+      { stripe: () => fake.stripe },
       { storeId: store, orderId: order.orderId, cartToken: order.token, origin: ORIGIN },
     );
   }
@@ -153,6 +153,15 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
     return session!;
   }
 
+  /** Whether the Order's current attempt still has a start time (it is not ended). */
+  async function attemptStarted(orderId: string): Promise<boolean> {
+    const { rows } = await pool.query<{ started: boolean }>(
+      `SELECT checkout_started_at IS NOT NULL AS started FROM orders WHERE id = $1`,
+      [orderId],
+    );
+    return rows[0]!.started;
+  }
+
   async function recorded(orderId: string): Promise<{ sessionId: string | null; attempt: number }> {
     const { rows } = await pool.query<{ checkout_session_id: string | null; checkout_attempt: number }>(
       `SELECT checkout_session_id, checkout_attempt FROM orders WHERE id = $1`,
@@ -163,7 +172,7 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
 
   function availability(order: { orderId: string; token: string }) {
     return getCheckoutAvailability(
-      { stripe: fake.stripe },
+      { stripe: () => fake.stripe },
       { storeId, orderId: order.orderId, cartToken: order.token },
     );
   }
@@ -387,7 +396,7 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
       expect(await recorded(order.orderId)).toEqual({ sessionId: session.id, attempt: 2 });
     });
 
-    it("gives two concurrent Pay clicks the same session", async () => {
+    it("gives a Pay that races another's reservation the winner's session, through the winner's key", async () => {
       const order = await newOrder();
 
       const outcomes = await Promise.all([pay(order), pay(order)]);
@@ -413,6 +422,8 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
       const first = pay(order);
       await createArrived;
       const second = await pay(order);
+      // The 409 does not end the attempt the first Pay is still creating.
+      expect(await attemptStarted(order.orderId)).toBe(true);
       release();
 
       // The second Pay re-sent attempt 1's key; Stripe answered 409 once (no SDK retry).
@@ -461,6 +472,48 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
       expect(await recorded(order.orderId)).toEqual({ sessionId: session.id, attempt: 2 });
     });
 
+    it("ends only its own attempt when a failed create comes back after a newer attempt started", async () => {
+      const order = await newOrder();
+      // While Stripe fails attempt 1, another Pay has already started attempt 2.
+      fake.beforeNextReply(async () => {
+        await pool.query(`UPDATE orders SET checkout_attempt = 2, checkout_started_at = now() WHERE id = $1`, [
+          order.orderId,
+        ]);
+      });
+      fake.reply(stripeError(500, "api_error"));
+      await expect(pay(order)).rejects.toThrow();
+
+      // Attempt 2 is still being created: the next Pay re-sends its key.
+      expect(await attemptStarted(order.orderId)).toBe(true);
+      const session = sessionOf(await pay(order));
+      expect(creates().map((r) => r.idempotencyKey)).toEqual([
+        `checkout:${order.orderId}:1`,
+        `checkout:${order.orderId}:2`,
+      ]);
+      expect(await recorded(order.orderId)).toEqual({ sessionId: session.id, attempt: 2 });
+    });
+
+    it("re-sends an attempt's key within the lease, and starts a new attempt after it", async () => {
+      const recent = await newOrder();
+      const stale = await newOrder();
+      for (const [order, age] of [
+        [recent, 59],
+        [stale, 61],
+      ] as const) {
+        await pool.query(
+          `UPDATE orders SET checkout_attempt = 1, checkout_started_at = now() - make_interval(secs => $2) WHERE id = $1`,
+          [order.orderId, age],
+        );
+      }
+
+      sessionOf(await pay(recent));
+      sessionOf(await pay(stale));
+      expect(creates().map((r) => r.idempotencyKey)).toEqual([
+        `checkout:${recent.orderId}:1`,
+        `checkout:${stale.orderId}:2`,
+      ]);
+    });
+
     it("changes nothing when Stripe fails while Pay checks the recorded session", async () => {
       const order = await newOrder();
       const session = sessionOf(await pay(order));
@@ -484,7 +537,7 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
         [storeId, "not-a-uuid", order.token],
       ];
       for (const [store, orderId, cartToken] of cases) {
-        expect(await startCheckout({ stripe: fake.stripe }, { storeId: store, orderId, cartToken, origin: ORIGIN })).toEqual({
+        expect(await startCheckout({ stripe: () => fake.stripe }, { storeId: store, orderId, cartToken, origin: ORIGIN })).toEqual({
           kind: "blocked",
           reason: "not_found",
         });
@@ -651,6 +704,38 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
       expect(await availability(processing)).toEqual({ available: false, reason: "processing" });
       expect(await availability(refunded)).toEqual({ available: true });
       expect(creates()).toHaveLength(createsBefore);
+    });
+
+    it("reports a payment in flight before anything that has changed since, and never gives out an open session for an Order that cannot be paid", async () => {
+      // A delayed payment is processing; meanwhile the stock has gone.
+      const paying = await newOrder({ lines: [{ quantity: 1, inventory: 1 }] });
+      const session = sessionOf(await pay(paying));
+      Object.assign(session, {
+        status: "complete",
+        payment_status: "unpaid",
+        paymentIntent: { id: newPaymentIntentId(), status: "processing" },
+      });
+      // An open session; meanwhile the stock has gone.
+      const open = await newOrder({ lines: [{ quantity: 1, inventory: 1 }] });
+      sessionOf(await pay(open));
+      await pool.query(`UPDATE variants SET inventory = 0 WHERE id = ANY($1::uuid[])`, [
+        [...paying.variantIds, ...open.variantIds],
+      ]);
+
+      expect(await availability(paying)).toEqual({ available: false, reason: "processing" });
+      expect(await pay(paying)).toEqual({ kind: "blocked", reason: "processing" });
+      expect(await availability(open)).toEqual({ available: false, reason: "out_of_stock" });
+      expect(await pay(open)).toEqual({ kind: "blocked", reason: "out_of_stock" });
+    });
+
+    it("answers from shp0's own data without creating a Stripe client when no session is recorded", async () => {
+      const soldOut = await newOrder({ lines: [{ quantity: 2, inventory: 1 }] });
+      const noClient = () => {
+        throw new Error("no Stripe key");
+      };
+      expect(
+        await getCheckoutAvailability({ stripe: noClient }, { storeId, orderId: soldOut.orderId, cartToken: soldOut.token }),
+      ).toEqual({ available: false, reason: "out_of_stock" });
     });
   });
 });

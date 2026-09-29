@@ -42,8 +42,12 @@ export type CheckoutOutcome = { kind: "redirect"; url: string } | { kind: "block
 export type CheckoutAvailability = { available: true } | { available: false; reason: CheckoutBlock };
 
 export type CheckoutDeps = {
-  /** Stripe API client (the platform's key; requests go to the Store's account). */
-  stripe: Stripe;
+  /**
+   * The Stripe API client (the platform's key; requests go to the Store's
+   * account), created only when Stripe must be asked: an Order that cannot
+   * be paid for reasons shp0 knows itself is answered without it.
+   */
+  stripe: () => Stripe;
 };
 
 export type CheckoutRequest = {
@@ -61,63 +65,64 @@ const MAX_AMOUNT = 99_999_999;
 const MAX_LINES = 100;
 
 /**
- * Options for each of Pay's Stripe requests. No retries: the SDK would
- * resend on a timeout, a 409 or a 5xx, and a Pay that fails is simply tried
- * again by the Customer. The SDK still resends once after a closed
- * connection, so one request can take up to about twice the timeout, which
- * stays within the attempt lease: a request still running is never taken
- * for an attempt that is over.
+ * Options for Pay's Stripe requests. No SDK retries (it would resend on a
+ * timeout, a 409 or a 5xx): a Pay that fails is tried again by the Customer,
+ * as a new attempt. The SDK still resends once after a dropped connection.
+ *
+ * Correctness does not depend on how long a request takes: a session is
+ * given to the Customer only once it is recorded for the Order's current
+ * attempt, so one that comes back after its attempt was superseded is never
+ * delivered. The timeout keeps a Pay, in the usual case, within the attempt
+ * lease, so that another Pay does not start a new attempt meanwhile.
  */
 const STRIPE_REQUEST = { timeout: 20_000, maxNetworkRetries: 0 } as const;
 if (2 * STRIPE_REQUEST.timeout + 1_000 >= CHECKOUT_ATTEMPT_LEASE_SECONDS * 1000) {
-  throw new Error("Pay's Stripe requests must end within the Checkout attempt lease");
+  throw new Error("Pay's Stripe timeout must leave a request within the Checkout attempt lease");
 }
+
+/** The Order page's read of the recorded session: short, so the page is not held up. */
+const STRIPE_READ = { timeout: 5_000, maxNetworkRetries: 0 } as const;
 
 /** How many times Pay looks again after the Order changed under it. */
 const ROUNDS = 3;
 
 /**
  * Whether Pay would send the Customer to Stripe now: the Order page shows
- * the Pay button only when it would. The same checks as startCheckout, and
- * the same reading of the Order's recorded session (asked of Stripe only
- * when there is one), without creating anything.
+ * the Pay button only when it would. The same assessment as startCheckout
+ * (Stripe is asked about the Order's recorded session, if it has one), with
+ * a shorter timeout, and nothing is created.
  */
 export async function getCheckoutAvailability(
   deps: CheckoutDeps,
   request: Omit<CheckoutRequest, "origin">,
 ): Promise<CheckoutAvailability> {
-  const loaded = await load(request);
-  if ("reason" in loaded) return { available: false, reason: loaded.reason };
-  const { sessionId } = loaded.order.checkout;
-  if (sessionId === null) return { available: true };
-  const recorded = await recordedSession(deps.stripe, request.storeId, loaded.stripeAccount, sessionId);
-  if (recorded.state === "processing" || recorded.state === "refund_pending") {
-    return { available: false, reason: recorded.state };
-  }
-  return { available: true };
+  const assessed = await assess(deps, request, STRIPE_READ);
+  return assessed.kind === "blocked" ? { available: false, reason: assessed.reason } : { available: true };
 }
 
 /**
  * Pay (ADR-0006): send the Customer to Stripe Checkout for a pending Order of
  * the Store, placed with their cart token, on the Store's own Stripe account.
  *
+ * - A payment already made through the Order's recorded session comes first:
+ *   a complete session whose payment is paid (not yet recorded) or still
+ *   processing blocks Pay with `processing`; one whose automatic refund is
+ *   still owed or failed, with `refund_pending` (that money is still held).
  * - Only an Order Stripe can charge now gets a session: all its Variants
  *   still exist and are in stock, its lines add up to its total, the total is
  *   within Stripe's limits, it has at most 100 lines, and the Store's account
- *   can take payments. Otherwise the reason is returned and Stripe is not
- *   called.
+ *   can take payments. Otherwise the reason is returned, and no session is
+ *   created or given out, not even an open one.
  * - One live session per Order. The recorded session is reused while it is
- *   open. A new one is created only when the recorded one is expired, is
- *   gone from the account, or is complete without money held for the Order
- *   (its delayed payment failed, or its payment was refunded automatically).
- *   A complete session whose payment is paid or still processing blocks Pay
- *   with `processing`; one whose automatic refund is still owed or failed,
- *   with `refund_pending`.
+ *   open. A new one is created only when the recorded one can no longer take
+ *   money for the Order: it is expired or gone from the account, or it is
+ *   complete and its delayed payment failed or was canceled, it took no
+ *   payment, or its payment was refunded automatically.
  * - A new session belongs to a new attempt, started with
  *   reserveCheckoutAttempt, and carries the idempotency key
  *   `checkout:<Order id>:<attempt>`. A Pay that finds an attempt still
  *   being created uses the same key, so Stripe returns that attempt's
- *   session (or its error) instead of creating another.
+ *   session (or answers 409 while still creating it: `in_progress`).
  * - A session is given to the Customer only once it is recorded on the
  *   Order (recordCheckoutSession). One that cannot be recorded (the Order
  *   changed meanwhile) is never delivered, and Pay looks again.
@@ -131,43 +136,63 @@ export async function startCheckout(deps: CheckoutDeps, request: CheckoutRequest
   assertOrigin(request.origin);
 
   for (let round = 0; round < ROUNDS; round++) {
-    const loaded = await load(request);
-    if ("reason" in loaded) return blocked(loaded.reason);
-    const { order, stripeAccount } = loaded;
-    const { attempt, sessionId, inFlight } = order.checkout;
+    const assessed = await assess(deps, request, STRIPE_REQUEST);
+    if (assessed.kind === "blocked") return blocked(assessed.reason);
+    if (assessed.kind === "open") return { kind: "redirect", url: assessed.url };
 
-    if (sessionId !== null) {
-      const recorded = await recordedSession(deps.stripe, request.storeId, stripeAccount, sessionId);
-      if (recorded.state === "open") return { kind: "redirect", url: recorded.url };
-      if (recorded.state === "processing" || recorded.state === "refund_pending") return blocked(recorded.state);
-      // Replaceable: fall through to a new attempt.
-    } else if (inFlight) {
+    const { order, stripeAccount } = assessed;
+    const { attempt, sessionId, inFlight } = order.checkout;
+    if (sessionId === null && inFlight) {
       // Another Pay started this attempt moments ago: its key returns its session.
-      const outcome = await createAndRecord(deps.stripe, request, order, stripeAccount, attempt);
+      const outcome = await createAndRecord(deps.stripe(), request, order, stripeAccount, attempt);
       if (outcome) return outcome;
       continue;
     }
 
+    // No session yet, or the recorded one can no longer take money: a new attempt.
     const next = await reserveCheckoutAttempt(request.storeId, order.id, { attempt, sessionId });
     if (next === null) continue; // Another Pay moved the Order on: look again.
-    const outcome = await createAndRecord(deps.stripe, request, order, stripeAccount, next);
+    const outcome = await createAndRecord(deps.stripe(), request, order, stripeAccount, next);
     if (outcome) return outcome;
   }
   return blocked("in_progress");
 }
 
-type Loaded = { order: OrderForCheckout; stripeAccount: string } | { reason: CheckoutBlock };
+type Assessment =
+  | { kind: "blocked"; reason: CheckoutBlock }
+  /** The recorded session is open: give it to the Customer again. */
+  | { kind: "open"; url: string }
+  /** The Order needs a session: it has none, or the recorded one can no longer take money. */
+  | { kind: "new"; order: OrderForCheckout; stripeAccount: string };
 
-async function load(request: Omit<CheckoutRequest, "origin">): Promise<Loaded> {
+/** What Pay may do for the Order now, as startCheckout describes. */
+async function assess(
+  deps: CheckoutDeps,
+  request: Omit<CheckoutRequest, "origin">,
+  options: typeof STRIPE_REQUEST | typeof STRIPE_READ,
+): Promise<Assessment> {
   const order = await getOrderForCheckout(request.storeId, request.orderId, request.cartToken);
-  if (!order) return { reason: "not_found" };
-  if (order.paymentStatus !== "pending") return { reason: "not_pending" };
-
+  if (!order) return { kind: "blocked", reason: "not_found" };
+  if (order.paymentStatus !== "pending") return { kind: "blocked", reason: "not_pending" };
   const account = await getPaymentAccount(request.storeId);
-  if (!account || !account.chargesEnabled) return { reason: "payments_not_set_up" };
 
+  // The recorded session first: a payment in flight, or money still held, is
+  // what the Customer must be told, whatever has changed since.
+  let openUrl: string | null = null;
+  const { sessionId } = order.checkout;
+  if (sessionId !== null && account) {
+    const recorded = await recordedSession(deps.stripe(), request.storeId, account.connectAccountId, sessionId, options);
+    if (recorded.state === "processing" || recorded.state === "refund_pending") {
+      return { kind: "blocked", reason: recorded.state };
+    }
+    if (recorded.state === "open") openUrl = recorded.url;
+  }
+
+  if (!account || !account.chargesEnabled) return { kind: "blocked", reason: "payments_not_set_up" };
   const reason = orderBlock(order);
-  return reason ? { reason } : { order, stripeAccount: account.connectAccountId };
+  if (reason) return { kind: "blocked", reason };
+  if (openUrl !== null) return { kind: "open", url: openUrl };
+  return { kind: "new", order, stripeAccount: account.connectAccountId };
 }
 
 /** Why Stripe cannot charge this pending Order now, if it cannot. */
@@ -213,13 +238,14 @@ async function recordedSession(
   storeId: string,
   stripeAccount: string,
   sessionId: string,
+  options: typeof STRIPE_REQUEST | typeof STRIPE_READ,
 ): Promise<RecordedSession> {
   let session: Stripe.Checkout.Session;
   try {
     session = await stripe.checkout.sessions.retrieve(
       sessionId,
       { expand: ["payment_intent"] },
-      { stripeAccount, ...STRIPE_REQUEST },
+      { stripeAccount, ...options },
     );
   } catch (error) {
     // Not on the Store's account: nobody can pay it.
@@ -246,9 +272,10 @@ async function recordedSession(
     if (payment === "refund_due" || payment === "refund_failed") return { state: "refund_pending" };
     return { state: "processing" };
   }
+  // It took no payment: nothing is held (not reached with shp0's sessions).
   if (session.payment_status === "no_payment_required") return { state: "replaceable" };
 
-  // Unpaid: a delayed payment method, still processing or failed.
+  // Unpaid: a delayed payment method, still processing, or failed or canceled.
   const status = typeof paymentIntent === "object" && paymentIntent !== null ? paymentIntent.status : null;
   return status === "requires_payment_method" || status === "canceled"
     ? { state: "replaceable" }
