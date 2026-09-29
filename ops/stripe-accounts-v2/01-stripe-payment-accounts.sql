@@ -18,6 +18,8 @@
 -- event from the thin destination (step 2).
 
 \set ON_ERROR_STOP on
+-- A pager would wait for a key while the transaction holds its locks.
+\pset pager off
 BEGIN;
 SET LOCAL lock_timeout = '5s';
 
@@ -165,7 +167,10 @@ DROP TRIGGER IF EXISTS stripe_payment_accounts_keep_account ON stripe_payment_ac
 CREATE TRIGGER stripe_payment_accounts_keep_account BEFORE UPDATE OR DELETE ON stripe_payment_accounts
   FOR EACH ROW EXECUTE FUNCTION stripe_payment_accounts_keep_account();
 
--- ── After ──
+COMMIT;
+\echo 'Committed.'
+
+-- ── After, once the locks are released ──
 
 \echo
 \echo 'After the change:'
@@ -176,6 +181,3 @@ SELECT count(*) AS accounts,
 SELECT conname FROM pg_constraint
  WHERE conrelid = 'stripe_payment_accounts'::regclass AND conname LIKE 'stripe_payment_accounts_%'
  ORDER BY conname;
-
-COMMIT;
-\echo 'Committed.'

@@ -93,14 +93,22 @@ async function create(appUrl, secretOut) {
 
   for await (const d of stripe.v2.core.eventDestinations.list({ include: ["webhook_endpoint.url"] })) {
     if (d.webhook_endpoint?.url !== url) continue;
-    const same =
-      d.event_payload === "thin" &&
-      d.enabled_events.length === EVENTS.length &&
-      EVENTS.every((e) => d.enabled_events.includes(e));
     console.log(`A destination already points at ${url}; nothing was created.\n${describe(d)}`);
-    if (!same) console.log("Its payload or events differ from the 5 thin events the route handles: update it in the Dashboard.");
-    if (d.status !== "enabled") console.log("It is disabled.");
-    console.log("Stripe shows its signing secret only in the Dashboard (Workbench > Webhooks).");
+    const problems = [];
+    if (d.event_payload !== "thin") {
+      problems.push(
+        `Its payload is ${d.event_payload}, and a destination's payload cannot be changed. ` +
+          `Delete ${d.id} (or move it to another URL), then run this again.`,
+      );
+    } else if (d.enabled_events.length !== EVENTS.length || !EVENTS.every((e) => d.enabled_events.includes(e))) {
+      problems.push("Its events differ from the 5 the route handles: set its events to exactly those (Workbench > Webhooks).");
+    }
+    if (d.status !== "enabled") problems.push("It is disabled: enable it (Workbench > Webhooks).");
+    if (problems.length) {
+      for (const p of problems) console.log(p);
+      process.exit(1);
+    }
+    console.log("It is already set up. Stripe shows its signing secret only in the Dashboard (Workbench > Webhooks).");
     return;
   }
 
@@ -132,7 +140,8 @@ async function create(appUrl, secretOut) {
   }
 
   const secret = d.webhook_endpoint?.signing_secret ?? "";
-  if (secret) writeSync(fd, `${secret}\n`);
+  // The secret only, with no newline: a newline kept in the variable breaks every signature.
+  if (secret) writeSync(fd, secret);
   closeSync(fd);
   console.log(`Created the destination:\n${describe(d)}`);
   if (d.livemode) console.log("WARNING: Stripe reports this destination as live mode.");
