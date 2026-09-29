@@ -2,10 +2,11 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { randomUUID } from "node:crypto";
 import { Client, Pool, type PoolClient } from "pg";
 
-import { applySchema, closePools, provisionStore, upsertPaymentAccount } from "@shp0/db";
+import { applySchema, closePools, provisionStore } from "@shp0/db";
 
 import { handleStripeWebhook } from "../src/index";
 import { startFakeStripe, stripeError, type FakeStripe } from "./fake-stripe";
+import { seedStripeAccount } from "./stripe-accounts";
 
 /**
  * The Stripe webhook takes only real payments that match shp0's own Orders,
@@ -37,13 +38,8 @@ describe("Stripe webhook (ADR-0006)", () => {
     otherStoreId = await newStore("webhook-other");
     account = `acct_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
     otherAccount = `acct_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
-    await upsertPaymentAccount({ storeId, connectAccountId: account, detailsSubmitted: true, chargesEnabled: true });
-    await upsertPaymentAccount({
-      storeId: otherStoreId,
-      connectAccountId: otherAccount,
-      detailsSubmitted: true,
-      chargesEnabled: true,
-    });
+    await seedStripeAccount(storeId, account, "active");
+    await seedStripeAccount(otherStoreId, otherAccount, "active");
   });
 
   afterAll(async () => {

@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
 import Stripe from "stripe";
@@ -7,7 +8,8 @@ import Stripe from "stripe";
  *
  * The real Stripe SDK is pointed at it (host, port, protocol) with network
  * retries off, so tests see exactly the requests the code sends: method,
- * path, form parameters, Stripe-Account and Idempotency-Key. Each request is
+ * path, form parameters (v1) or JSON body (v2), query, Stripe-Account,
+ * Stripe-Context, Stripe-Version and Idempotency-Key. Each request is
  * answered by the next queued reply, or by a default for the path.
  *
  * Like Stripe, it saves the result of a request made with an Idempotency-Key
@@ -16,20 +18,93 @@ import Stripe from "stripe";
  * key is still executing is answered 409 (idempotency_key_in_use). Rate-
  * limited (429) and conflicting (409) requests never started executing, so
  * Stripe saves nothing for them; a dropped connection is not saved either
- * (the request may never have reached Stripe).
+ * (the request may never have reached Stripe). A key reused with a different
+ * body is refused (400 idempotency_error). Whether v2 errors are saved is an
+ * option, since Stripe's v2 behaviour is not established (ADR-0006).
  */
 
 export type RecordedRequest = {
   method: string;
   path: string;
+  /** A v1 request's form parameters (empty for v2). */
   params: URLSearchParams;
+  /** A v2 request's JSON body (undefined for v1 and GET). */
+  body: unknown;
+  query: URLSearchParams;
   stripeAccount: string | undefined;
+  stripeContext: string | undefined;
+  stripeVersion: string | undefined;
   idempotencyKey: string | undefined;
   /** What the fake answered: a status and body, or a dropped connection. */
   reply: FakeReply;
+  /** The request was executed (and its result saved), but the connection was dropped before the answer. */
+  dropped: boolean;
 };
 
-export type FakeReply = { status: number; body: unknown } | { dropConnection: true };
+export type FakeReply =
+  | { status: number; body: unknown }
+  | { dropConnection: true }
+  /** Execute the request and save its result, then drop the connection: Stripe did it, the answer was lost. */
+  | { saveThenDrop: true };
+
+/**
+ * An Accounts v2 account the fake created, which tests move along (onboarded,
+ * restricted, closed) the way Stripe would.
+ */
+export type FakeAccount = {
+  id: string;
+  metadata: Record<string, string>;
+  created: string;
+  closed: boolean;
+  /** Whether the merchant configuration is applied. */
+  applied: boolean;
+  cardPayments: { status: string; status_details: Array<{ code: string; resolution: string }> };
+  requirements: {
+    entries: Array<{
+      awaiting_action_from: "stripe" | "user";
+      description: string;
+      errors: Array<{ code: string; description: string }>;
+      impact: Record<string, unknown>;
+      minimum_deadline: { status: "currently_due" | "eventually_due" | "past_due" };
+      requested_reasons: Array<{ code: string }>;
+    }>;
+    summary: { minimum_deadline?: { status: "currently_due" | "eventually_due" | "past_due"; time?: string } };
+  };
+  /** Leave configuration out of every answer, as if Stripe ignored `include`. */
+  hideConfiguration?: boolean;
+};
+
+/** A new account's state: onboarding not done, card payments not yet possible. */
+export function newAccountState(): Pick<FakeAccount, "closed" | "applied" | "cardPayments" | "requirements"> {
+  return {
+    closed: false,
+    applied: true,
+    cardPayments: { status: "restricted", status_details: [{ code: "requirements_past_due", resolution: "provide_info" }] },
+    requirements: {
+      entries: [
+        {
+          awaiting_action_from: "user",
+          description: "Provide business details",
+          errors: [],
+          impact: {},
+          minimum_deadline: { status: "currently_due" },
+          requested_reasons: [{ code: "routine_onboarding" }],
+        },
+      ],
+      summary: { minimum_deadline: { status: "currently_due" } },
+    },
+  };
+}
+
+/** An onboarded account's state: card payments active, nothing due. */
+export function activeAccountState(): Pick<FakeAccount, "closed" | "applied" | "cardPayments" | "requirements"> {
+  return {
+    closed: false,
+    applied: true,
+    cardPayments: { status: "active", status_details: [] },
+    requirements: { entries: [], summary: {} },
+  };
+}
 
 /**
  * A Checkout Session the fake created, which tests may move along (complete,
@@ -53,6 +128,8 @@ export type FakeStripe = {
   requests: RecordedRequest[];
   /** Checkout Sessions created through the fake, by id. */
   sessions: Map<string, FakeSession>;
+  /** Accounts v2 accounts created through the fake, by id. */
+  accounts: Map<string, FakeAccount>;
   /** Queue a reply for the next request that has no saved result. */
   reply(reply: FakeReply): void;
   /**
@@ -60,7 +137,7 @@ export type FakeStripe = {
    * something that happens while shp0 waits on Stripe.
    */
   beforeNextReply(hook: () => Promise<void>): void;
-  /** Forget requests, queued replies, hooks, saved results and sessions. */
+  /** Forget requests, queued replies, hooks, saved results, sessions and accounts. */
   reset(): void;
   close(): Promise<void>;
 };
@@ -83,13 +160,21 @@ export function stripeError(status: number, code: string, message = code): FakeR
 /**
  * Start the fake. `clientRetries` is the returned client's maxNetworkRetries:
  * 0 by default, so a test sees exactly the requests the code sends; 2 is the
- * SDK's default, which production's client uses.
+ * SDK's default, which production's client uses. `v2ReplayErrors` chooses
+ * whether an error answer to a v2 request is saved under its key (v1 errors
+ * always are).
  */
-export async function startFakeStripe({ clientRetries = 0 }: { clientRetries?: number } = {}): Promise<FakeStripe> {
+export async function startFakeStripe({
+  clientRetries = 0,
+  v2ReplayErrors = true,
+}: { clientRetries?: number; v2ReplayErrors?: boolean } = {}): Promise<FakeStripe> {
   const requests: RecordedRequest[] = [];
   const queue: FakeReply[] = [];
   const hooks: Array<() => Promise<void>> = [];
-  const saved = new Map<string, FakeReply>();
+  /** Saved results by key, with the body they were made with. */
+  const saved = new Map<string, { reply: FakeReply; body: string }>();
+  const accounts = new Map<string, FakeAccount>();
+  let links = 0;
   /** Keys of requests being executed (a hook may hold one open). */
   const executing = new Set<string>();
   const sessions = new Map<string, FakeSession>();
@@ -99,13 +184,31 @@ export async function startFakeStripe({ clientRetries = 0 }: { clientRetries?: n
   const server = createServer((req, res) => {
     void readBody(req).then(async (body) => {
       const url = new URL(req.url ?? "/", "http://127.0.0.1");
-      const params = new URLSearchParams(body);
+      const isJson = (header(req, "content-type") ?? "").startsWith("application/json");
+      const json: unknown = isJson && body !== "" ? JSON.parse(body) : undefined;
+      const params = new URLSearchParams(isJson ? "" : body);
       const stripeAccount = header(req, "stripe-account");
+      const stripeContext = header(req, "stripe-context");
       const idempotencyKey = header(req, "idempotency-key");
-      const savedKey = idempotencyKey === undefined ? undefined : `${stripeAccount ?? ""} ${idempotencyKey}`;
+      const scope = stripeAccount ?? stripeContext ?? "";
+      const savedKey = idempotencyKey === undefined ? undefined : `${scope} ${idempotencyKey}`;
+      const isV2 = url.pathname.startsWith("/v2/");
 
       let reply: FakeReply;
-      if (savedKey !== undefined && !saved.has(savedKey) && executing.has(savedKey)) {
+      let dropped = false;
+      const previous = savedKey === undefined ? undefined : saved.get(savedKey);
+      if (previous && previous.body !== body) {
+        reply = {
+          status: 400,
+          body: {
+            error: {
+              type: "idempotency_error",
+              code: "idempotency_key_reused",
+              message: "Keys for idempotent requests can only be used with the same parameters.",
+            },
+          },
+        };
+      } else if (savedKey !== undefined && !previous && executing.has(savedKey)) {
         reply = stripeError(
           409,
           "idempotency_key_in_use",
@@ -115,18 +218,35 @@ export async function startFakeStripe({ clientRetries = 0 }: { clientRetries?: n
         if (savedKey !== undefined) executing.add(savedKey);
         try {
           await hooks.shift()?.();
+          let next = previous?.reply ?? queue.shift();
+          if (next && "saveThenDrop" in next) {
+            next = undefined;
+            dropped = true;
+          }
           reply =
-            (savedKey === undefined ? undefined : saved.get(savedKey)) ??
-            queue.shift() ??
-            defaultReply(req.method ?? "", url.pathname, params, stripeAccount, url.searchParams);
-          if (savedKey !== undefined && !saved.has(savedKey) && !isUnsaved(reply)) saved.set(savedKey, reply);
+            next ??
+            defaultReply(req.method ?? "", url.pathname, params, json, scope, url.searchParams);
+          const keep = !isUnsaved(reply) && !(isV2 && !v2ReplayErrors && "status" in reply && reply.status >= 400);
+          if (savedKey !== undefined && !previous && keep) saved.set(savedKey, { reply, body });
         } finally {
           if (savedKey !== undefined) executing.delete(savedKey);
         }
       }
-      requests.push({ method: req.method ?? "", path: url.pathname, params, stripeAccount, idempotencyKey, reply });
+      requests.push({
+        method: req.method ?? "",
+        path: url.pathname,
+        params,
+        body: json,
+        query: url.searchParams,
+        stripeAccount,
+        stripeContext,
+        stripeVersion: header(req, "stripe-version"),
+        idempotencyKey,
+        reply,
+        dropped,
+      });
 
-      if ("dropConnection" in reply) {
+      if (dropped || !("status" in reply)) {
         req.socket.destroy();
         return;
       }
@@ -136,7 +256,40 @@ export async function startFakeStripe({ clientRetries = 0 }: { clientRetries?: n
   });
 
   function isUnsaved(reply: FakeReply): boolean {
-    return "dropConnection" in reply || reply.status === 429 || reply.status === 409;
+    return !("status" in reply) || reply.status === 429 || reply.status === 409;
+  }
+
+  /** The v2 `include` values of a request: from a JSON body, or include[N] in the query. */
+  function includesOf(json: unknown, query: URLSearchParams): string[] {
+    const fromBody = (json as { include?: unknown } | undefined)?.include;
+    if (Array.isArray(fromBody)) return fromBody.map(String);
+    return [...query].filter(([key]) => /^include\[\d*\]$/.test(key)).map(([, value]) => value);
+  }
+
+  function accountBody(account: FakeAccount, include: string[]) {
+    const body: Record<string, unknown> = {
+      id: account.id,
+      object: "v2.core.account",
+      applied_configurations: account.applied ? ["merchant"] : [],
+      closed: account.closed,
+      created: account.created,
+      dashboard: "full",
+      livemode: false,
+      metadata: account.metadata,
+    };
+    if (include.includes("configuration.merchant") && !account.hideConfiguration) {
+      body.configuration = {
+        merchant: {
+          applied: account.applied,
+          capabilities: { card_payments: { ...account.cardPayments } },
+        },
+      };
+    }
+    if (include.includes("requirements")) body.requirements = account.requirements;
+    if (include.includes("defaults")) {
+      body.defaults = { responsibilities: { fees_collector: "stripe", losses_collector: "stripe", requirements_collector: "stripe" } };
+    }
+    return body;
   }
 
   function sessionBody(session: FakeSession, expand: string[]) {
@@ -160,9 +313,48 @@ export async function startFakeStripe({ clientRetries = 0 }: { clientRetries?: n
     method: string,
     path: string,
     params: URLSearchParams,
-    account: string | undefined,
+    json: unknown,
+    scope: string,
     query: URLSearchParams,
   ): FakeReply {
+    const account = scope === "" ? undefined : scope;
+    if (method === "POST" && path === "/v2/core/accounts") {
+      const id = `acct_${randomBytes(8).toString("hex")}`;
+      const created: FakeAccount = {
+        id,
+        metadata: ((json as { metadata?: Record<string, string> } | undefined)?.metadata ?? {}) as Record<string, string>,
+        created: new Date().toISOString(),
+        ...newAccountState(),
+      };
+      accounts.set(id, created);
+      return { status: 200, body: accountBody(created, includesOf(json, query)) };
+    }
+    const accountPath = /^\/v2\/core\/accounts\/([^/]+)$/.exec(path);
+    if (method === "GET" && accountPath) {
+      const found = accounts.get(decodeURIComponent(accountPath[1]!));
+      if (!found) return stripeError(404, "resource_missing", `No such account: '${accountPath[1]}'`);
+      return { status: 200, body: accountBody(found, includesOf(undefined, query)) };
+    }
+    if (method === "POST" && path === "/v2/core/account_links") {
+      const request = json as { account?: string; use_case?: unknown } | undefined;
+      if (!request?.account || !accounts.has(request.account)) {
+        return stripeError(404, "resource_missing", `No such account: '${request?.account}'`);
+      }
+      links += 1;
+      const now = Date.now();
+      return {
+        status: 200,
+        body: {
+          object: "v2.core.account_link",
+          account: request.account,
+          created: new Date(now).toISOString(),
+          expires_at: new Date(now + 5 * 60_000).toISOString(),
+          livemode: false,
+          url: `https://connect.stripe.test/setup/${links}`,
+          use_case: request.use_case,
+        },
+      };
+    }
     if (method === "POST" && path === "/v1/checkout/sessions") {
       sessionCount += 1;
       const id = `cs_test_fake_${sessionCount}`;
@@ -235,6 +427,7 @@ export async function startFakeStripe({ clientRetries = 0 }: { clientRetries?: n
       hooks.push(hook);
     },
     sessions,
+    accounts,
     reset: () => {
       requests.length = 0;
       queue.length = 0;
@@ -242,6 +435,7 @@ export async function startFakeStripe({ clientRetries = 0 }: { clientRetries?: n
       saved.clear();
       executing.clear();
       sessions.clear();
+      accounts.clear();
     },
     close: () => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
   };

@@ -2405,12 +2405,21 @@ export async function upsertPaymentAccount(opts: {
   });
 }
 
+/** Stripe's card payments status for an Accounts v2 account (ADR-0006). */
+export type CardPaymentsStatus = "active" | "pending" | "restricted" | "unsupported";
+
+/** A Store's Stripe account, as last read from Stripe. */
+export type PaymentAccount = {
+  connectAccountId: string;
+  chargesEnabled: boolean;
+  cardPaymentsStatus: CardPaymentsStatus | null;
+  statusCheckedAt: Date | null;
+};
+
 /**
  * Get a Store's Stripe Connect account, or null if not yet onboarded.
  */
-export async function getPaymentAccount(
-  storeId: string,
-): Promise<{ connectAccountId: string; detailsSubmitted: boolean; chargesEnabled: boolean } | null> {
+export async function getPaymentAccount(storeId: string): Promise<PaymentAccount | null> {
   return platformClient(async (tx) => {
     const rows = await tx.execute(
       sql`SELECT connect_account_id, details_submitted, charges_enabled FROM stripe_payment_accounts WHERE store_id = ${storeId} LIMIT 1`,
@@ -2423,10 +2432,51 @@ export async function getPaymentAccount(
     };
     return {
       connectAccountId: r.connect_account_id,
-      detailsSubmitted: r.details_submitted,
       chargesEnabled: r.charges_enabled,
+      cardPaymentsStatus: null,
+      statusCheckedAt: null,
     };
   });
+}
+
+// Ported from today's only writer, upsertPaymentAccount: it replaces the account id.
+export async function savePaymentAccount(
+  storeId: string,
+  accountId: string,
+): Promise<{ accountId: string; saved: boolean }> {
+  await upsertPaymentAccount({ storeId, connectAccountId: accountId });
+  return { accountId, saved: true };
+}
+
+/** A read of a Store's Stripe account from Stripe, begun. */
+export type StripeAccountRead = { storeId: string; accountId: string; read: string };
+
+// Today nothing orders reads of Stripe.
+export async function startStripeAccountRead(
+  of: { storeId: string } | { accountId: string },
+): Promise<StripeAccountRead | null> {
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      "storeId" in of
+        ? sql`SELECT store_id, connect_account_id FROM stripe_payment_accounts WHERE store_id = ${of.storeId} LIMIT 1`
+        : sql`SELECT store_id, connect_account_id FROM stripe_payment_accounts WHERE connect_account_id = ${of.accountId} LIMIT 1`,
+    );
+    const r = rows.rows[0] as { store_id: string; connect_account_id: string } | undefined;
+    return r ? { storeId: r.store_id, accountId: r.connect_account_id, read: "0" } : null;
+  });
+}
+
+// Today the flag is simply set.
+export async function recordStripeAccountStatus(
+  read: StripeAccountRead,
+  status: { cardPayments: CardPaymentsStatus | null; canTakePayments: boolean },
+): Promise<"recorded" | "stale"> {
+  await platformClient(async (tx) => {
+    await tx.execute(
+      sql`UPDATE stripe_payment_accounts SET charges_enabled = ${status.canTakePayments}, updated_at = now() WHERE store_id = ${read.storeId}`,
+    );
+  });
+  return "recorded";
 }
 
 /**

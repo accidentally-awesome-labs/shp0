@@ -190,6 +190,10 @@ async function snapshot(pool: Pool, schemaName: string = SCHEMA) {
       FROM information_schema.role_table_grants
       WHERE table_schema = $1
       ORDER BY table_name, grantee, privilege_type`),
+    sequences: await q(`
+      SELECT sequencename, data_type::text AS data_type FROM pg_sequences
+      WHERE schemaname = $1
+      ORDER BY sequencename`),
   };
 }
 
@@ -590,5 +594,98 @@ describe("applySchema() upgrades a database created before the Membership constr
     ]);
     // The very same Owner row, not a copy.
     expect(after[0]).toEqual(ownerRow);
+  });
+});
+
+describe("applySchema() upgrades stripe_payment_accounts from before Stripe accounts were saved (ADR-0006)", () => {
+  const OLD = `accounts_${randomUUID().replace(/-/g, "")}`;
+  const FRESH = `accounts_fresh_${randomUUID().replace(/-/g, "")}`;
+  const OLD_URL = urlWithSearchPath(BASE_URL, OLD);
+  const FRESH_URL = urlWithSearchPath(BASE_URL, FRESH);
+  const STORE = randomUUID();
+  let admin: Pool;
+  let old: Pool;
+  let fresh: Pool;
+
+  beforeAll(async () => {
+    admin = new Pool({ connectionString: BASE_URL });
+    await admin.query(`CREATE SCHEMA "${OLD}"`);
+    await admin.query(`CREATE SCHEMA "${FRESH}"`);
+    old = new Pool({ connectionString: OLD_URL });
+    fresh = new Pool({ connectionString: FRESH_URL });
+  });
+
+  afterAll(async () => {
+    await old?.end();
+    await fresh?.end();
+    await admin?.query(`DROP SCHEMA IF EXISTS "${OLD}" CASCADE`);
+    await admin?.query(`DROP SCHEMA IF EXISTS "${FRESH}" CASCADE`);
+    await admin?.end();
+  });
+
+  const ACCOUNT_RULES = [
+    "stripe_payment_accounts_card_payments_status_check",
+    "stripe_payment_accounts_connect_account_id_check",
+    "stripe_payment_accounts_connect_account_id_key",
+    "stripe_payment_accounts_enabled_only_when_active",
+  ];
+
+  it("turns off card payments that no read of Stripe reported, adds its rules once, and ends like a fresh bootstrap", async () => {
+    // The table as PR B left it: flags anyone could set, no status, no rules.
+    await applySchema(OLD_URL);
+    await old.query(`
+      DROP TRIGGER IF EXISTS stripe_payment_accounts_keep_account ON stripe_payment_accounts;
+      DROP FUNCTION IF EXISTS stripe_payment_accounts_keep_account();
+      ALTER TABLE stripe_payment_accounts
+        DROP CONSTRAINT IF EXISTS stripe_payment_accounts_enabled_only_when_active,
+        DROP CONSTRAINT IF EXISTS stripe_payment_accounts_card_payments_status_check,
+        DROP CONSTRAINT IF EXISTS stripe_payment_accounts_connect_account_id_key,
+        DROP CONSTRAINT IF EXISTS stripe_payment_accounts_connect_account_id_check,
+        DROP COLUMN IF EXISTS card_payments_status,
+        DROP COLUMN IF EXISTS status_read,
+        DROP COLUMN IF EXISTS status_checked_at,
+        ADD COLUMN IF NOT EXISTS details_submitted boolean NOT NULL DEFAULT false;
+      DROP SEQUENCE IF EXISTS stripe_account_reads;`);
+    const older = await snapshot(old, OLD);
+    expect(older.constraints.filter((c) => ACCOUNT_RULES.includes(c.conname as string))).toEqual([]);
+    expect(older.sequences).toEqual([]);
+    await inTransaction(old, [
+      [`INSERT INTO "user" (id, name, email) VALUES ('owner', 'Owner', 'owner@upgrade.test')`],
+      [`INSERT INTO stores (id, store_id, name, subdomain) VALUES ($1, $1, 'Old', 'old')`, [STORE]],
+      [`INSERT INTO memberships (user_id, store_id, role) VALUES ('owner', $1, 'owner')`, [STORE]],
+      [
+        `INSERT INTO stripe_payment_accounts (store_id, connect_account_id, details_submitted, charges_enabled)
+         VALUES ($1, 'acct_old123', true, true)`,
+        [STORE],
+      ],
+    ]);
+
+    await applySchema(OLD_URL);
+    const { rows } = await old.query(`SELECT * FROM stripe_payment_accounts`);
+    expect(rows).toEqual([
+      expect.objectContaining({
+        store_id: STORE,
+        connect_account_id: "acct_old123",
+        charges_enabled: false,
+        card_payments_status: null,
+        status_read: null,
+      }),
+    ]);
+    expect(rows[0]).not.toHaveProperty("details_submitted");
+    const upgraded = await snapshot(old, OLD);
+    expect(upgraded.constraints.filter((c) => ACCOUNT_RULES.includes(c.conname as string)).map((c) => c.conname)).toEqual(
+      ACCOUNT_RULES,
+    );
+    expect(triggersOn("stripe_payment_accounts", upgraded, OLD).map((t) => t.tgname)).toEqual([
+      "stripe_payment_accounts_keep_account",
+    ]);
+    expect(upgraded.sequences).toEqual([{ sequencename: "stripe_account_reads", data_type: "bigint" }]);
+
+    await applySchema(FRESH_URL);
+    expect(withoutSchemaName(upgraded, OLD)).toEqual(withoutSchemaName(await snapshot(fresh, FRESH), FRESH));
+
+    // A second run changes nothing.
+    await applySchema(OLD_URL);
+    expect(await snapshot(old, OLD)).toEqual(upgraded);
   });
 });
