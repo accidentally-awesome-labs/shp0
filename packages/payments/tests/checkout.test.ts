@@ -2,10 +2,11 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
 import { randomUUID } from "node:crypto";
 import { Pool, type PoolClient } from "pg";
 
-import { applySchema, closePools, getStorefrontOrder, provisionStore, upsertPaymentAccount } from "@shp0/db";
+import { applySchema, closePools, getStorefrontOrder, provisionStore } from "@shp0/db";
 
 import { getCheckoutAvailability, handleStripeWebhook, startCheckout, type CheckoutOutcome } from "../src/index";
 import { startFakeStripe, stripeError, type FakeSession, type FakeStripe, type RecordedRequest } from "./fake-stripe";
+import { newAccountId, seedStripeAccount } from "./stripe-accounts";
 
 /**
  * Pay: a Customer's pending Order gets one Checkout Session on the Store's own
@@ -36,7 +37,7 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
     fake = await startFakeStripe({ clientRetries: 2 });
     storeId = await newStore("checkout");
     account = newAccountId();
-    await upsertPaymentAccount({ storeId, connectAccountId: account, detailsSubmitted: true, chargesEnabled: true });
+    await seedStripeAccount(storeId, account, "active");
   });
 
   afterAll(async () => {
@@ -48,10 +49,6 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
   beforeEach(() => {
     fake.reset();
   });
-
-  function newAccountId(): string {
-    return `acct_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
-  }
 
   async function newStore(label: string): Promise<string> {
     const ownerId = `owner-${randomUUID()}`;
@@ -615,7 +612,7 @@ describe("Pay: starting Stripe Checkout for an Order (ADR-0006)", () => {
     it("payments not set up: no Stripe account, or one that cannot take payments yet", async () => {
       const noAccount = await newStore("checkout-noacct");
       const notReady = await newStore("checkout-notready");
-      await upsertPaymentAccount({ storeId: notReady, connectAccountId: newAccountId(), chargesEnabled: false });
+      await seedStripeAccount(notReady, newAccountId(), "restricted");
 
       for (const store of [noAccount, notReady]) {
         const order = await newOrder({ store });

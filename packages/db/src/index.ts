@@ -1075,17 +1075,82 @@ export async function applySchema(
     // ── status on stores (platform admin: active | suspended | terminated) ──
     await client.query(`ALTER TABLE stores ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'active';`);
 
-    // ── stripe_payment_accounts (PLATFORM table — no RLS) ──
+    // ── stripe_payment_accounts (PLATFORM table — no RLS; ADR-0006) ──
+    // A Store's Stripe account: saved once, never replaced (nor deleted, but
+    // with its Store), one per Store and one Store per account. Whether it
+    // can take card payments is only what the latest read of Stripe reported
+    // (card_payments_status, and charges_enabled only while that is
+    // 'active'); status_read is the ticket of that read, so an older read
+    // never overwrites a newer one.
     await client.query(`
       CREATE TABLE IF NOT EXISTS stripe_payment_accounts (
         id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
         store_id uuid NOT NULL UNIQUE REFERENCES stores(id) ON DELETE CASCADE,
         connect_account_id text NOT NULL,
-        details_submitted boolean NOT NULL DEFAULT false,
         charges_enabled boolean NOT NULL DEFAULT false,
+        card_payments_status text,
+        status_read bigint,
+        status_checked_at timestamptz,
         created_at timestamptz NOT NULL DEFAULT now(),
         updated_at timestamptz NOT NULL DEFAULT now()
       );
+    `);
+    // A table created before Stripe accounts were saved (PR B's shape).
+    await client.query(`
+      ALTER TABLE stripe_payment_accounts
+        ADD COLUMN IF NOT EXISTS card_payments_status text,
+        ADD COLUMN IF NOT EXISTS status_read bigint,
+        ADD COLUMN IF NOT EXISTS status_checked_at timestamptz,
+        DROP COLUMN IF EXISTS details_submitted;
+      CREATE SEQUENCE IF NOT EXISTS stripe_account_reads;
+    `);
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'stripe_payment_accounts'::regclass
+                         AND conname = 'stripe_payment_accounts_card_payments_status_check') THEN
+          ALTER TABLE stripe_payment_accounts ADD CONSTRAINT stripe_payment_accounts_card_payments_status_check
+            CHECK (card_payments_status IN ('active', 'pending', 'restricted', 'unsupported'));
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'stripe_payment_accounts'::regclass
+                         AND conname = 'stripe_payment_accounts_enabled_only_when_active') THEN
+          -- A flag no read of Stripe set cannot stand: off until the next read.
+          UPDATE stripe_payment_accounts SET charges_enabled = false, updated_at = now()
+            WHERE charges_enabled AND card_payments_status IS DISTINCT FROM 'active';
+          ALTER TABLE stripe_payment_accounts ADD CONSTRAINT stripe_payment_accounts_enabled_only_when_active
+            CHECK (NOT charges_enabled OR card_payments_status IS NOT DISTINCT FROM 'active');
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'stripe_payment_accounts'::regclass
+                         AND conname = 'stripe_payment_accounts_connect_account_id_key') THEN
+          ALTER TABLE stripe_payment_accounts ADD CONSTRAINT stripe_payment_accounts_connect_account_id_key
+            UNIQUE (connect_account_id);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'stripe_payment_accounts'::regclass
+                         AND conname = 'stripe_payment_accounts_connect_account_id_check') THEN
+          ALTER TABLE stripe_payment_accounts ADD CONSTRAINT stripe_payment_accounts_connect_account_id_check
+            CHECK (connect_account_id ~ '^acct_[A-Za-z0-9]{1,64}$');
+        END IF;
+      END $$;
+    `);
+    await client.query(`
+      CREATE OR REPLACE FUNCTION stripe_payment_accounts_keep_account() RETURNS trigger
+      LANGUAGE plpgsql AS $$
+      BEGIN
+        IF TG_OP = 'DELETE' THEN
+          -- Only with its Store: the cascade runs once the Store row is gone.
+          IF EXISTS (SELECT 1 FROM stores WHERE id = OLD.store_id) THEN
+            RAISE EXCEPTION 'a Store''s saved Stripe account is never replaced (ADR-0006)' USING ERRCODE = 'check_violation';
+          END IF;
+          RETURN OLD;
+        END IF;
+        IF NEW.connect_account_id IS DISTINCT FROM OLD.connect_account_id OR NEW.store_id IS DISTINCT FROM OLD.store_id THEN
+          RAISE EXCEPTION 'a Store''s saved Stripe account is never replaced (ADR-0006)' USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN NEW;
+      END $$;
+      DROP TRIGGER IF EXISTS stripe_payment_accounts_keep_account ON stripe_payment_accounts;
+      CREATE TRIGGER stripe_payment_accounts_keep_account BEFORE UPDATE OR DELETE ON stripe_payment_accounts
+        FOR EACH ROW EXECUTE FUNCTION stripe_payment_accounts_keep_account();
     `);
 
     // ── processed_events (PLATFORM table — idempotency, no RLS) ──
@@ -2394,51 +2459,136 @@ export async function markEventProcessed(eventId: string): Promise<void> {
   });
 }
 
-/**
- * Upsert a Store's Stripe Connect account. Called after onboarding completes.
- */
-export async function upsertPaymentAccount(opts: {
-  storeId: string;
+// ─────────────────────────────────────────────────────────────────────────
+// A Store's Stripe account (ADR-0006 point 2).
+//
+// Written only through @shp0/payments: connectStripeAccount saves the id
+// Stripe returned (savePaymentAccount, never replacing one already saved),
+// and every read of the account from Stripe records what Stripe reported
+// (startStripeAccountRead, then recordStripeAccountStatus). Pay reads
+// chargesEnabled (getPaymentAccount).
+// ─────────────────────────────────────────────────────────────────────────
+
+/** A Stripe account id as Stripe mints them (the table's CHECK too). */
+const STRIPE_ACCOUNT_ID = /^acct_[A-Za-z0-9]{1,64}$/;
+
+/** Stripe's card payments status for an Accounts v2 account (ADR-0006). */
+export type CardPaymentsStatus = "active" | "pending" | "restricted" | "unsupported";
+
+/** A Store's Stripe account, as the latest read of Stripe reported it. */
+export type PaymentAccount = {
   connectAccountId: string;
-  detailsSubmitted?: boolean;
-  chargesEnabled?: boolean;
-}): Promise<void> {
-  await platformClient(async (tx) => {
-    await tx.execute(
-      sql`
-        INSERT INTO stripe_payment_accounts (store_id, connect_account_id, details_submitted, charges_enabled)
-        VALUES (${opts.storeId}, ${opts.connectAccountId}, ${opts.detailsSubmitted ?? false}, ${opts.chargesEnabled ?? false})
-        ON CONFLICT (store_id) DO UPDATE SET
-          connect_account_id = EXCLUDED.connect_account_id,
-          details_submitted = EXCLUDED.details_submitted,
-          charges_enabled = EXCLUDED.charges_enabled,
-          updated_at = now()
-      `,
+  /** Stripe reported the account able to accept card payments (card payments `active`). */
+  chargesEnabled: boolean;
+  /** Stripe's card payments status at that read; null before any read, or for an account Stripe no longer has. */
+  cardPaymentsStatus: CardPaymentsStatus | null;
+  /** When that read was recorded. */
+  statusCheckedAt: Date | null;
+};
+
+/** A Store's Stripe account, or null if it has none. */
+export async function getPaymentAccount(storeId: string): Promise<PaymentAccount | null> {
+  if (!isUuid(storeId)) return null;
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      sql`SELECT connect_account_id, charges_enabled, card_payments_status, status_checked_at
+          FROM stripe_payment_accounts WHERE store_id = ${storeId}`,
     );
+    const r = rows.rows[0] as
+      | {
+          connect_account_id: string;
+          charges_enabled: boolean;
+          card_payments_status: CardPaymentsStatus | null;
+          status_checked_at: Date | string | null;
+        }
+      | undefined;
+    if (!r) return null;
+    return {
+      connectAccountId: r.connect_account_id,
+      chargesEnabled: r.charges_enabled,
+      cardPaymentsStatus: r.card_payments_status,
+      statusCheckedAt: r.status_checked_at === null ? null : new Date(r.status_checked_at),
+    };
   });
 }
 
 /**
- * Get a Store's Stripe Connect account, or null if not yet onboarded.
+ * Save the Stripe account Stripe created for a Store, unless the Store
+ * already has one: a saved account is never replaced. Returns the Store's
+ * account (the one saved before, when there was one) and whether this call
+ * saved it. Two concurrent saves for a Store keep one. An account another
+ * Store has is refused (the unique account id), and nothing is saved.
  */
-export async function getPaymentAccount(
+export async function savePaymentAccount(
   storeId: string,
-): Promise<{ connectAccountId: string; detailsSubmitted: boolean; chargesEnabled: boolean } | null> {
+  accountId: string,
+): Promise<{ accountId: string; saved: boolean }> {
+  if (!isUuid(storeId)) throw new Error("savePaymentAccount needs a Store id");
+  if (!STRIPE_ACCOUNT_ID.test(accountId)) throw new Error("savePaymentAccount needs a Stripe account id (acct_…)");
+  return platformClient(async (tx) => {
+    const inserted = await tx.execute(
+      sql`INSERT INTO stripe_payment_accounts (store_id, connect_account_id) VALUES (${storeId}, ${accountId})
+          ON CONFLICT (store_id) DO NOTHING RETURNING connect_account_id`,
+    );
+    if (inserted.rows.length > 0) return { accountId, saved: true };
+    // Another save got there first: a concurrent one has committed by now.
+    const existing = await tx.execute(
+      sql`SELECT connect_account_id FROM stripe_payment_accounts WHERE store_id = ${storeId}`,
+    );
+    return { accountId: existing.rows[0]!.connect_account_id as string, saved: false };
+  });
+}
+
+/** A read of a Store's Stripe account, begun: `read` is its ticket. */
+export type StripeAccountRead = { storeId: string; accountId: string; read: string };
+
+/**
+ * Begin a read of a Store's saved Stripe account (by the Store, or by the
+ * account an event names): the saved account, and a ticket from a sequence,
+ * taken before Stripe is asked. Null when there is no such account.
+ */
+export async function startStripeAccountRead(
+  of: { storeId: string } | { accountId: string },
+): Promise<StripeAccountRead | null> {
+  if ("storeId" in of ? !isUuid(of.storeId) : !STRIPE_ACCOUNT_ID.test(of.accountId)) return null;
   return platformClient(async (tx) => {
     const rows = await tx.execute(
-      sql`SELECT connect_account_id, details_submitted, charges_enabled FROM stripe_payment_accounts WHERE store_id = ${storeId} LIMIT 1`,
+      "storeId" in of
+        ? sql`SELECT store_id, connect_account_id, nextval('stripe_account_reads')::text AS read
+              FROM stripe_payment_accounts WHERE store_id = ${of.storeId}`
+        : sql`SELECT store_id, connect_account_id, nextval('stripe_account_reads')::text AS read
+              FROM stripe_payment_accounts WHERE connect_account_id = ${of.accountId}`,
     );
-    if (rows.rows.length === 0) return null;
-    const r = rows.rows[0] as {
-      connect_account_id: string;
-      details_submitted: boolean;
-      charges_enabled: boolean;
-    };
-    return {
-      connectAccountId: r.connect_account_id,
-      detailsSubmitted: r.details_submitted,
-      chargesEnabled: r.charges_enabled,
-    };
+    const r = rows.rows[0] as { store_id: string; connect_account_id: string; read: string } | undefined;
+    return r ? { storeId: r.store_id, accountId: r.connect_account_id, read: r.read } : null;
+  });
+}
+
+/**
+ * Record what a read of Stripe reported about a Store's account: only if no
+ * read with a later ticket has been recorded ("stale" otherwise), and only
+ * for the account the read was begun for. It never touches the account id.
+ */
+export async function recordStripeAccountStatus(
+  read: StripeAccountRead,
+  status: { cardPayments: CardPaymentsStatus | null; canTakePayments: boolean },
+): Promise<"recorded" | "stale"> {
+  if (!isUuid(read.storeId) || !STRIPE_ACCOUNT_ID.test(read.accountId) || !/^\d{1,19}$/.test(read.read)) {
+    throw new Error("recordStripeAccountStatus needs a read begun by startStripeAccountRead");
+  }
+  if (status.canTakePayments && status.cardPayments !== "active") {
+    throw new Error("A Stripe account takes card payments only while Stripe reports them active");
+  }
+  return platformClient(async (tx) => {
+    const rows = await tx.execute(
+      sql`UPDATE stripe_payment_accounts
+          SET charges_enabled = ${status.canTakePayments}, card_payments_status = ${status.cardPayments},
+              status_read = ${read.read}::bigint, status_checked_at = now(), updated_at = now()
+          WHERE store_id = ${read.storeId} AND connect_account_id = ${read.accountId}
+            AND (status_read IS NULL OR status_read < ${read.read}::bigint)
+          RETURNING 1`,
+    );
+    return rows.rows.length > 0 ? "recorded" : "stale";
   });
 }
 

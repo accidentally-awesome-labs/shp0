@@ -55,7 +55,7 @@ export const CAPABILITY_MINIMUM_ROLE = {
   "catalog.manage": "admin",
   /** Create and preview Discounts. */
   "discounts.manage": "admin",
-  /** Store settings, including payouts (Stripe Connect onboarding). */
+  /** Store settings, including connecting the Store's Stripe account (ADR-0006). */
   "settings.manage": "admin",
   /** Custom Domains: list (with their TXT values), add, retry verification. */
   "domains.manage": "admin",

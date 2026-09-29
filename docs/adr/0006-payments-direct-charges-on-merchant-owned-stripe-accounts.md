@@ -31,9 +31,14 @@ This ADR records the charge model and the rules every payment path follows.
    - New accounts are created with Accounts v2:
      - `dashboard: 'full'`, so the Merchant has the full Stripe Dashboard;
      - `defaults.responsibilities` set explicitly to `{ fees_collector: 'stripe', losses_collector: 'stripe' }`, because v2 has no default;
-     - the merchant configuration, requesting the card payments capability.
-   - Account creation carries the idempotency key `account:<Store id>`, and its id is saved as soon as Stripe returns it, before onboarding. A second or concurrent attempt therefore reuses the account instead of creating another. A saved account id is never replaced by a later attempt.
-   - A Store can take payments only while Stripe reports its account able to accept card payments. shp0 reads that from Stripe, when the Merchant returns from onboarding and on account events, never from anything the Merchant submits.
+     - the merchant configuration, requesting the card payments capability (`configuration.merchant.capabilities.card_payments.requested: true`);
+     - `metadata.shp0_store_id`, and nothing else: nothing the Merchant typed (no email, name or country). Stripe refuses a reused idempotency key with other parameters, so the parameters are a constant of the Store id; Stripe's hosted onboarding collects the rest.
+   - Account creation carries the idempotency key `account:<Store id>` (the Store id in lower case), and its id is saved as soon as Stripe returns it, before onboarding. A second or concurrent attempt therefore reuses the account instead of creating another. A saved account id is never replaced by a later attempt; an account created meanwhile is logged and left unused. A save that fails is logged with the account Stripe created.
+   - The key is the same on every attempt, so if Stripe keeps a failed create's answer under it (as v1 keeps errors; #74 asks about v2), later attempts get that answer back until Stripe drops the key. Such a failure is logged with the key. An answer Stripe marks as replayed (`Idempotent-Replayed: true`, as v1 does) tells the Admin to contact support; any other is "try again, and contact support if it keeps failing".
+   - The database enforces it: a saved account id and its Store cannot be updated, a saved account cannot be deleted except with its Store, and an account id belongs to one Store.
+   - A Store can take payments only while Stripe reports its account able to accept card payments: the account is not closed, its merchant configuration is applied, and `configuration.merchant.capabilities.card_payments.status` is `active` (read with `include: ['configuration.merchant', 'requirements']`). Any other status, a missing value, or an account Stripe no longer has (404) or no longer lets shp0 read (403) means it cannot.
+   - shp0 reads that from Stripe, never from anything the Merchant submits or from a URL: whenever an Admin opens the Store's Payments page (where Stripe's onboarding returns), before offering onboarding for a saved account, and on account events. A read that began before the one recorded never overwrites it.
+   - shp0 offers Stripe's onboarding for a saved account only while Stripe says it cannot take card payments or asks the Merchant for information. What the Merchant owes is read from the requirements awaiting them (`awaiting_action_from: 'user'`), not from the summary deadline, which also covers what Stripe itself is reviewing. An onboarding link is a bearer credential: it is never stored or logged.
    - Connecting a Merchant's _existing_ Stripe account waits for #74's questions to Stripe.
    - Connecting an account stays an Admin capability (`settings.manage`), as today.
 
@@ -70,6 +75,10 @@ This ADR records the charge model and the rules every payment path follows.
 4. **Webhooks.**
    - **Endpoint:** one Connect webhook endpoint (`connect: true`) at `/api/stripe/webhook`, created with API version `2026-06-24.dahlia` (the SDK's pinned version).
    - **Events:** `checkout.session.completed`, `checkout.session.async_payment_succeeded` and `checkout.session.async_payment_failed`. Account status changes on Accounts v2 arrive as thin events with their own destination and secret.
+   - **Account events** arrive at `/api/stripe/account-events`, a thin event destination with its own signing secret, `STRIPE_ACCOUNT_EVENTS_SECRET`:
+     - `v2.core.account[configuration.merchant].capability_status_updated`, `v2.core.account[configuration.merchant].updated`, `v2.core.account[requirements].updated`, `v2.core.account.updated` and `v2.core.account.closed`;
+     - the notification is only a trigger: shp0 reads the account again from Stripe, as the platform, and uses nothing else from the event, so a redelivery reads again instead of being skipped (no `processed_events` record);
+     - the same 400, 200 and 5xx rules as below apply.
    - **Signature:** it is verified first. Only a request that fails verification is answered 400.
    - **Anything that is not shp0's** is answered 200 and changes nothing:
      - a `livemode` other than the configured key's mode;
@@ -109,7 +118,7 @@ This ADR records the charge model and the rules every payment path follows.
 7. **Idempotency is layered.**
    - `processed_events` skips an event that was already handled.
    - The unique Payment and the locked Order row make a repeated, or concurrent, delivery of the same payment change nothing, except retrying a refund that is still due.
-   - Stripe idempotency keys make a repeated account or session request return the first result. Refund attempts have a key each, and a charge cannot be refunded twice.
+   - Stripe idempotency keys make a repeated account or session request return the first result, for as long as Stripe keeps the key. After a save that failed, a retry within that time gets the account back and saves it; a retry after it creates and saves another, and the first, logged at the failed save, is left unused. Refund attempts have a key each, and a charge cannot be refunded twice.
 
 8. **Testing without Stripe.**
    - CI cannot reach Stripe. Tests point the Stripe SDK at a local fake Stripe server, configured with its `host`, `port` and `protocol` options. The fake records every request: method, path, parameters, `Stripe-Account` and `Idempotency-Key`.
@@ -128,7 +137,9 @@ This ADR records the charge model and the rules every payment path follows.
 - **Fees and losses.** The Store bears Stripe's fees, refunds and disputes. Stripe collects the fees and carries negative balances (`fees_collector` and `losses_collector: 'stripe'`); both depend on Stripe's answer to #74 Q3.
 - **Cost of automatic refunds.** As we understand Stripe's pricing, it keeps its processing fee on a refunded payment. So each automatic refund (stock that ran out, or a second payment) costs the Store that fee, with no sale.
 - **A Customer who pays for stock that has just run out** is refunded in full automatically. The Order stays `pending`, so it can be paid again if the Merchant restocks. The Order page shows that the Order was not paid and that the payment was refunded.
-- **Webhook setup.** The endpoint must be a Connect endpoint (`connect: true`). Setup notes must record its URL, events, API version and signing secrets.
+- **Webhook setup.** The endpoint must be a Connect endpoint (`connect: true`). The account events need a second, thin destination (`event_payload: 'thin'`) at `/api/stripe/account-events`, with the events above and its own secret. Setup notes must record both destinations' URLs, events, API version and signing secrets.
+- **Accounts in test mode do not carry over to live mode.** Going live needs a decision on the Stores' saved test-mode accounts, since a saved account is never replaced.
+- **The database changes** to `stripe_payment_accounts` (the status columns, its rules and the read sequence) are applied by a person on an existing database: `applySchema` runs only in tests.
 - **Testing.** The rules above are testable offline. Every payment path is tested against the fake Stripe server and signed events.
 - **Out of scope here, each its own work item:**
   - refunds and disputes made in the Stripe Dashboard (`charge.refunded`, `charge.dispute.*`);
@@ -138,5 +149,8 @@ This ADR records the charge model and the rules every payment path follows.
   - storing the Store's Currency;
   - the Customer's email and delivery address on the Order;
   - retrying _refund due_ Payments outside the webhook, needed before live mode;
+  - replacing a Store's closed Stripe account, or one Stripe no longer has or no longer lets shp0 use: today such a Store cannot take payments, and needs an Operator decision;
+  - letting a Store whose account creation Stripe keeps refusing under its key try again under another key (needs #74's answer on v2 replays);
+  - showing Operators each Store's Stripe account and status;
   - resolving a _refund failed_ Payment once a person has refunded it (handling `charge.refunded`, or an Admin or Operator action); until then, Pay stays blocked on that Order;
   - following a refund that Stripe created but that later fails (`refund.updated`, `refund.failed`).
