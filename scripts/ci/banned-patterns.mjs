@@ -54,6 +54,13 @@ export const RULES = [
     pattern: /\b(?:reserveCheckoutAttempt|recordCheckoutSession|endCheckoutAttempt)\s*\(/,
     ignoreLine: /^\s*(?:\/\/|\*|\/\*)/,
   },
+  {
+    id: "no-stripe-account-writes-in-app",
+    why: "a Store's Stripe account id and its status come only from Stripe (ADR-0006): app code goes through @shp0/payments' connectStripeAccount, syncStripeAccount and handleStripeAccountEvent, never the writers or its own Stripe account creation",
+    files: /^apps\/.*\.[cm]?[jt]sx?$/,
+    pattern: /\b(?:savePaymentAccount|recordStripeAccountStatus|startStripeAccountRead|upsertPaymentAccount)\s*\(|\.accounts\.create\s*\(/,
+    ignoreLine: /^\s*(?:\/\/|\*|\/\*)/,
+  },
 ];
 
 // These two files necessarily contain the patterns they ban.

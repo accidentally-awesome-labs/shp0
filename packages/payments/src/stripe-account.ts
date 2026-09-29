@@ -1,105 +1,347 @@
-import type Stripe from "stripe";
+import Stripe from "stripe";
 
-import { getPaymentAccount, type CardPaymentsStatus } from "@shp0/db";
+import {
+  getPaymentAccount,
+  isUuid,
+  recordStripeAccountStatus,
+  savePaymentAccount,
+  startStripeAccountRead,
+  type CardPaymentsStatus,
+  type StripeAccountRead,
+} from "@shp0/db";
 
 /** What Stripe's answer means for taking card payments. */
 export type StripeAccountSummary = {
+  /** The account is open, its merchant configuration applied, and card payments `active`. */
   canTakePayments: boolean;
+  /** Stripe's card payments status; null when not reported, or a value shp0 does not know. */
   cardPayments: CardPaymentsStatus | null;
   closed: boolean;
+  /** Stripe asks the Merchant for information, now or overdue. */
   needsInfo: boolean;
+  /** Stripe offers no way for the Merchant to resolve a restriction themselves. */
   contactStripe: boolean;
+  /** The deadline of what Stripe asks for, if anything. */
   due: "currently_due" | "eventually_due" | "past_due" | null;
   dueAt: string | null;
 };
 
-export type StripeAccountDeps = { stripe: () => Stripe };
+export type StripeAccountDeps = {
+  /**
+   * The Stripe API client (the platform's key), created only when Stripe
+   * must be asked.
+   */
+  stripe: () => Stripe;
+};
 
+/** What Connect did. `busy` and `unavailable` change nothing; try again. */
 export type ConnectOutcome =
+  /** Stripe's onboarding for the Store's account: send the Admin there. */
   | { kind: "onboarding"; url: string }
+  /** The account can take card payments and Stripe needs nothing more. */
   | { kind: "active" }
   | { kind: "closed" }
+  /** Stripe no longer has the saved account. */
   | { kind: "missing" }
+  /** Another Connect for the Store is creating its account right now. */
   | { kind: "busy" }
+  /** Stripe could not be reached (no answer, 5xx, rate limited). */
   | { kind: "unavailable" };
 
+/** The Store's Stripe account as the Payments page shows it. */
 export type StripeAccountView =
   | { connected: false }
   | {
       connected: true;
       accountId: string;
+      /** Read from Stripe just now; false when Stripe could not be read (the stored status is shown). */
       fresh: boolean;
+      /** Stripe no longer has the account. */
       missing: boolean;
+      /** What Stripe reported, when fresh and not missing. */
       summary: StripeAccountSummary | null;
+      /** The stored status, after this read if it was recorded. */
       canTakePayments: boolean;
       cardPayments: CardPaymentsStatus | null;
       checkedAt: Date | null;
     };
 
-// Ported unchanged from apps/web/lib/stripe.ts#createConnectAccountAndOnboardingLink.
-export function accountCreateParams(storeId: string): Record<string, unknown> {
-  return { type: "express", business_type: "company", metadata: { storeId } };
-}
+/** What shp0 reads of an account: its merchant configuration and requirements. */
+export const ACCOUNT_READ = {
+  include: ["configuration.merchant", "requirements"],
+} satisfies Stripe.V2.Core.AccountRetrieveParams;
 
-// Today account creation carries no idempotency key.
-export function accountIdempotencyKey(_storeId: string): string {
-  return "";
-}
+type StripeRequestOptions = { timeout: number; maxNetworkRetries: number };
+/** Account creation retries under its key: a retry can only get the same account back. */
+const CREATE: StripeRequestOptions = { timeout: 15_000, maxNetworkRetries: 2 };
+const LINK: StripeRequestOptions = { timeout: 15_000, maxNetworkRetries: 1 };
+const CONNECT_READ: StripeRequestOptions = { timeout: 10_000, maxNetworkRetries: 1 };
+/** The Payments page's read: short, so the page is not held up. */
+const PAGE_READ: StripeRequestOptions = { timeout: 5_000, maxNetworkRetries: 0 };
 
-// Ported unchanged from apps/web/lib/stripe.ts.
-export function onboardingUrls(_origin: string, _storeId: string): { refresh_url: string; return_url: string } {
+const CARD_PAYMENTS = new Set<string>(["active", "pending", "restricted", "unsupported"]);
+const STRIPE_ACCOUNT_ID = /^acct_[A-Za-z0-9]{1,64}$/;
+
+/**
+ * The account creation request (ADR-0006 point 2): an Accounts v2 account
+ * with the full Stripe Dashboard, Stripe collecting fees and carrying losses,
+ * and card payments requested; the Store's id in shp0's metadata.
+ *
+ * A constant of the Store id: Stripe refuses a reused idempotency key with
+ * other parameters, and nothing the Merchant typed is sent. Stripe's hosted
+ * onboarding collects the rest.
+ */
+export function accountCreateParams(storeId: string) {
   return {
-    refresh_url: `${process.env.NEXT_PUBLIC_APP_URL}/dashboard`,
-    return_url: `${process.env.NEXT_PUBLIC_APP_URL}/dashboard`,
+    dashboard: "full",
+    defaults: { responsibilities: { fees_collector: "stripe", losses_collector: "stripe" } },
+    configuration: { merchant: { capabilities: { card_payments: { requested: true } } } },
+    metadata: { shp0_store_id: storeId },
+  } satisfies Stripe.V2.Core.AccountCreateParams;
+}
+
+/** The idempotency key of a Store's account creation (ADR-0006). */
+export function accountIdempotencyKey(storeId: string): string {
+  return `account:${storeId}`;
+}
+
+/**
+ * Where Stripe sends the Admin back: the Store's Payments page on the origin
+ * they are signed in on (refresh_url when a link expired or was used).
+ * Throws unless `origin` is a bare http(s) origin and `storeId` a Store id.
+ */
+export function onboardingUrls(origin: string, storeId: string): { refresh_url: string; return_url: string } {
+  if (!isUuid(storeId)) throw new Error("onboardingUrls needs a Store id");
+  let parsed: URL | null = null;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    // Reported below.
+  }
+  if (!parsed || (parsed.protocol !== "https:" && parsed.protocol !== "http:") || parsed.origin !== origin) {
+    throw new Error("onboardingUrls needs the dashboard's origin, such as https://app.shp0.dev");
+  }
+  const page = `${origin}/dashboard/${storeId}/payments`;
+  return { refresh_url: `${page}?stripe=refresh`, return_url: `${page}?stripe=return` };
+}
+
+/**
+ * What an Accounts v2 account read with ACCOUNT_READ means for taking card
+ * payments. Only an open account whose merchant configuration is applied and
+ * whose card payments are `active` can take them; anything else, including a
+ * status shp0 does not know or a missing configuration, cannot.
+ */
+export function summarizeStripeAccount(account: Stripe.V2.Core.Account): StripeAccountSummary {
+  const merchant = account.configuration?.merchant;
+  const cardPaymentsCapability = merchant?.capabilities?.card_payments;
+  const status = cardPaymentsCapability?.status;
+  const cardPayments = status !== undefined && CARD_PAYMENTS.has(status) ? (status as CardPaymentsStatus) : null;
+  const details = cardPaymentsCapability?.status_details ?? [];
+  const closed = account.closed === true;
+  const entries = account.requirements?.entries ?? [];
+  const deadline = account.requirements?.summary?.minimum_deadline;
+  return {
+    canTakePayments: !closed && merchant?.applied === true && cardPayments === "active",
+    cardPayments,
+    closed,
+    needsInfo:
+      details.some((detail) => detail.resolution === "provide_info") ||
+      entries.some(
+        (entry) =>
+          entry.awaiting_action_from === "user" &&
+          (entry.minimum_deadline?.status === "currently_due" || entry.minimum_deadline?.status === "past_due"),
+      ),
+    contactStripe: details.some((detail) => detail.resolution === "contact_stripe" || detail.resolution === "no_resolution"),
+    due: deadline?.status ?? null,
+    dueAt: deadline?.time ?? null,
   };
 }
 
-// Today nothing reads the account from Stripe.
-export function summarizeStripeAccount(_account: Stripe.V2.Core.Account): StripeAccountSummary {
-  return {
-    canTakePayments: false,
-    cardPayments: null,
-    closed: false,
-    needsInfo: false,
-    contactStripe: false,
-    due: null,
-    dueAt: null,
-  };
-}
-
-// Ported unchanged from apps/web/app/actions/stripe.ts#onboardConnectAction and apps/web/lib/stripe.ts.
+/**
+ * Connect (ADR-0006 point 2): send an Admin to Stripe's onboarding for the
+ * Store's own Stripe account.
+ *
+ * - No saved account: create one (accountCreateParams, key
+ *   account:<Store id>) and save its id at once, before onboarding. A
+ *   concurrent or repeated attempt gets the same account back under the key;
+ *   one already saved is used, and never replaced (an account created
+ *   meanwhile is logged and left unused).
+ * - A saved account: read it from Stripe first (and record what Stripe
+ *   reports). A closed account, or one Stripe no longer has, gets no link;
+ *   one that can take payments and needs nothing gets none either.
+ * - Otherwise: an onboarding link for the saved account, returning to the
+ *   Store's Payments page (onboardingUrls).
+ *
+ * Throws on Stripe's refusal (logged by the caller with its code) and on a
+ * database failure: nothing is linked then, and the next Connect gets the
+ * same account back.
+ */
 export async function connectStripeAccount(
   deps: StripeAccountDeps,
   request: { storeId: string; origin: string },
 ): Promise<ConnectOutcome> {
+  const { storeId } = request;
+  const urls = onboardingUrls(request.origin, storeId);
   const stripe = deps.stripe();
-  const urls = onboardingUrls(request.origin, request.storeId);
-  const existing = await getPaymentAccount(request.storeId);
-  if (existing) {
-    const link = await stripe.accountLinks.create({ account: existing.connectAccountId, ...urls, type: "account_onboarding" });
-    return { kind: "onboarding", url: link.url };
+
+  let accountId: string;
+  const read = await startStripeAccountRead({ storeId });
+  if (read) {
+    let result: AccountRead;
+    try {
+      result = await readAccount(stripe, read, CONNECT_READ);
+    } catch (error) {
+      if (isStripeFailure(error, "retryable", "in_use")) return { kind: "unavailable" };
+      throw error;
+    }
+    if (result.missing) return { kind: "missing" };
+    const { summary } = result;
+    if (summary.closed) return { kind: "closed" };
+    const due = summary.due === "currently_due" || summary.due === "past_due";
+    if (summary.canTakePayments && !summary.needsInfo && !due) return { kind: "active" };
+    accountId = read.accountId;
+  } else {
+    let created: Stripe.V2.Core.Account;
+    try {
+      created = await stripe.v2.core.accounts.create(accountCreateParams(storeId), {
+        idempotencyKey: accountIdempotencyKey(storeId),
+        ...CREATE,
+      });
+    } catch (error) {
+      if (isStripeFailure(error, "in_use")) return { kind: "busy" };
+      if (isStripeFailure(error, "retryable")) return { kind: "unavailable" };
+      throw error;
+    }
+    if (!STRIPE_ACCOUNT_ID.test(created.id)) throw new Error("Stripe returned an account id shp0 cannot save");
+    const saved = await savePaymentAccount(storeId, created.id);
+    if (saved.accountId !== created.id) {
+      console.warn(
+        `Stripe account ${created.id} was created for Store ${storeId}, which already has ${saved.accountId}; the new one is not used`,
+      );
+    }
+    accountId = saved.accountId;
   }
-  const account = await stripe.accounts.create({
-    type: "express",
-    business_type: "company",
-    metadata: { storeId: request.storeId },
-  });
-  const link = await stripe.accountLinks.create({ account: account.id, ...urls, type: "account_onboarding" });
+
+  let link: Stripe.V2.Core.AccountLink;
+  try {
+    link = await stripe.v2.core.accountLinks.create(
+      {
+        account: accountId,
+        use_case: { type: "account_onboarding", account_onboarding: { configurations: ["merchant"], ...urls } },
+      } satisfies Stripe.V2.Core.AccountLinkCreateParams,
+      LINK,
+    );
+  } catch (error) {
+    if (isStripeFailure(error, "retryable", "in_use")) return { kind: "unavailable" };
+    throw error;
+  }
+  // The link is a bearer credential for the Store's account: never stored or logged.
+  if (!link.url.startsWith("https://")) throw new Error("Stripe returned an onboarding link that is not https");
   return { kind: "onboarding", url: link.url };
 }
 
-// Today nothing reads the account from Stripe: the stored flags are all there is.
-export async function syncStripeAccount(_deps: StripeAccountDeps, storeId: string): Promise<StripeAccountView> {
-  const account = await getPaymentAccount(storeId);
-  if (!account) return { connected: false };
+/**
+ * The Store's Stripe account for the Payments page, read from Stripe (and
+ * recorded) each time: `fresh` false, with the stored status, when Stripe
+ * cannot be read. Stripe is not asked when the Store has no account.
+ */
+export async function syncStripeAccount(deps: StripeAccountDeps, storeId: string): Promise<StripeAccountView> {
+  const read = await startStripeAccountRead({ storeId });
+  if (!read) return { connected: false };
+
+  let fresh = false;
+  let missing = false;
+  let summary: StripeAccountSummary | null = null;
+  try {
+    const result = await readAccount(deps.stripe(), read, PAGE_READ);
+    fresh = true;
+    missing = result.missing;
+    summary = result.missing ? null : result.summary;
+  } catch (error) {
+    if (!isStripeFailure(error, "retryable", "in_use", "refused") && !isClientError(error)) throw error;
+    console.warn(`Could not read Stripe account ${read.accountId} of Store ${storeId}: ${describeFailure(error)}`);
+  }
+
+  const stored = await getPaymentAccount(storeId);
   return {
     connected: true,
-    accountId: account.connectAccountId,
-    fresh: false,
-    missing: false,
-    summary: null,
-    canTakePayments: account.chargesEnabled,
-    cardPayments: account.cardPaymentsStatus,
-    checkedAt: account.statusCheckedAt,
+    accountId: read.accountId,
+    fresh,
+    missing,
+    summary,
+    canTakePayments: stored?.chargesEnabled ?? false,
+    cardPayments: stored?.cardPaymentsStatus ?? null,
+    checkedAt: stored?.statusCheckedAt ?? null,
   };
+}
+
+export type AccountRead = { missing: true } | { missing: false; summary: StripeAccountSummary };
+
+/**
+ * Read a saved account from Stripe as the platform (no Stripe-Account), and
+ * record what Stripe reports, ordered by the read's ticket. An account Stripe
+ * no longer has (404) is recorded as unable to take payments. Other Stripe
+ * errors are thrown, and nothing is recorded.
+ */
+export async function readAccount(
+  stripe: Stripe,
+  read: StripeAccountRead,
+  options: StripeRequestOptions,
+): Promise<AccountRead> {
+  let account: Stripe.V2.Core.Account;
+  try {
+    account = await stripe.v2.core.accounts.retrieve(read.accountId, ACCOUNT_READ, options);
+  } catch (error) {
+    if (isStripeFailure(error, "missing")) {
+      await recordStripeAccountStatus(read, { cardPayments: null, canTakePayments: false });
+      return { missing: true };
+    }
+    throw error;
+  }
+  const summary = summarizeStripeAccount(account);
+  await recordStripeAccountStatus(read, { cardPayments: summary.cardPayments, canTakePayments: summary.canTakePayments });
+  return { missing: false, summary };
+}
+
+/** How a Stripe request failed. */
+export type StripeFailure = "in_use" | "retryable" | "missing" | "refused";
+
+/**
+ * Classify a Stripe error by its status, not its class (v2 maps some errors
+ * to other classes than v1): a key in use (409 idempotency_key_in_use); a
+ * failure a retry can fix (no answer, 5xx, 429, another 409, or 401, a
+ * configuration fix); gone (404); or a refusal. Null for anything else.
+ */
+export function stripeFailure(error: unknown): StripeFailure | null {
+  if (!(error instanceof Stripe.errors.StripeError)) return null;
+  const status = error.statusCode;
+  if (status === 409 && error.code === "idempotency_key_in_use") return "in_use";
+  if (
+    error instanceof Stripe.errors.StripeConnectionError ||
+    status === undefined ||
+    status >= 500 ||
+    status === 429 ||
+    status === 409 ||
+    status === 401
+  ) {
+    return "retryable";
+  }
+  if (status === 404) return "missing";
+  return "refused";
+}
+
+function isStripeFailure(error: unknown, ...kinds: StripeFailure[]): boolean {
+  const failure = stripeFailure(error);
+  return failure !== null && kinds.includes(failure);
+}
+
+/** The Stripe client could not be created (no key configured). */
+function isClientError(error: unknown): boolean {
+  return error instanceof Error && !(error instanceof Stripe.errors.StripeError) && /api ?key|authenticator/i.test(error.message);
+}
+
+/** A Stripe error, for a log line: its type, code, status and request id, never its message body. */
+export function describeFailure(error: unknown): string {
+  if (!(error instanceof Stripe.errors.StripeError)) return error instanceof Error ? error.name : "unknown error";
+  return [error.type, error.code, error.statusCode, error.requestId].filter((part) => part !== undefined).join(" ");
 }

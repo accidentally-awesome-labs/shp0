@@ -112,7 +112,7 @@ Where an Order stands on the money axis — its own state machine (e.g. pending,
 _Avoid_: order status (that is the derived overall state)
 
 **Stripe account**:
-The Store's own Stripe account, owned by the Merchant's business, on which every Payment and refund for the Store's Orders is made (direct charges; the Store, not shp0, is the merchant of record). A Store has at most one Stripe account and a Stripe account serves one Store. The Store can take Payments only while Stripe reports the account able to accept card payments.
+The Store's own Stripe account, owned by the Merchant's business, on which every Payment and refund for the Store's Orders is made (direct charges; the Store, not shp0, is the merchant of record). A Store has at most one Stripe account and a Stripe account serves one Store. The Store can take Payments only while Stripe reports the account able to accept card payments (its card payments capability `active`), as read from Stripe, never from the Merchant.
 _Avoid_: Connect account, payout account, merchant account
 
 **Payment**:

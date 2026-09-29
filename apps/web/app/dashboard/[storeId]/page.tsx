@@ -33,6 +33,12 @@ const SECTIONS: Array<{ path: string; title: string; description: string; capabi
     description: "Serve your Store on your own domain.",
     capability: "domains.manage",
   },
+  {
+    path: "payments",
+    title: "Payments",
+    description: "Take card payments on this Store's own Stripe account.",
+    capability: "settings.manage",
+  },
   { path: "billing", title: "Billing", description: "Your Tier and Usage.", capability: "billing.view" },
 ];
 

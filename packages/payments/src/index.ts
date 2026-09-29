@@ -14,12 +14,13 @@ export {
   accountCreateParams,
   accountIdempotencyKey,
   connectStripeAccount,
+  describeFailure,
   onboardingUrls,
   summarizeStripeAccount,
   syncStripeAccount,
 } from "./stripe-account";
 export type { ConnectOutcome, StripeAccountDeps, StripeAccountSummary, StripeAccountView } from "./stripe-account";
-export { handleStripeAccountEvent } from "./account-events";
+export { ACCOUNT_EVENT_TYPES, handleStripeAccountEvent } from "./account-events";
 export type { AccountEventDeps } from "./account-events";
 export { describeStripeAccount } from "./stripe-account-page";
 export type { StripeAccountPage, StripeAccountState } from "./stripe-account-page";
