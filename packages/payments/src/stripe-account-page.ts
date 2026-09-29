@@ -43,8 +43,9 @@ export type StripeAccountPage = {
  */
 export function describeStripeAccount(view: StripeAccountView, from: string | null): StripeAccountPage {
   const page = describeState(view);
+  // "Back from Stripe: this is what Stripe reports now" only when Stripe was just read.
   const notice =
-    from === "return" ? "returned" : from === "refresh" && page.action !== null ? "link_expired" : null;
+    from === "return" && !page.stale ? "returned" : from === "refresh" && page.action !== null ? "link_expired" : null;
   return { ...page, notice };
 }
 

@@ -37,7 +37,10 @@ export type StripeAccountDeps = {
   stripe: () => Stripe;
 };
 
-/** What Connect did. `busy` and `unavailable` change nothing; try again. */
+/**
+ * What Connect did. On `busy` and `unavailable`, try again: nothing was
+ * linked, though an account Stripe created may have been saved.
+ */
 export type ConnectOutcome =
   /** Stripe's onboarding for the Store's account: send the Admin there. */
   | { kind: "onboarding"; url: string }
@@ -188,8 +191,9 @@ function strictest(deadlines: Array<string | undefined>): Deadline | null {
  * while Stripe keeps the key.
  *
  * Stripe may keep a failed create's answer under the key too (#74): the next
- * Connects then get that answer back until Stripe drops the key. The failure
- * is logged with the key, for support.
+ * Connects then get that answer back until Stripe drops the key. A failure is
+ * logged with the key, for support; one Stripe marks as replayed is thrown, so
+ * the Admin is told to contact support rather than to try again.
  */
 export async function connectStripeAccount(
   deps: StripeAccountDeps,
@@ -221,9 +225,15 @@ export async function connectStripeAccount(
       created = await stripe.v2.core.accounts.create(accountCreateParams(storeId), { idempotencyKey: key, ...CREATE });
     } catch (error) {
       if (isStripeFailure(error, "in_use")) return { kind: "busy" };
-      if (isStripeFailure(error, "retryable")) {
+      if (isStripeFailure(error, "retryable") && !isReplayed(error)) {
         console.warn(`Stripe could not create the Stripe account of Store ${storeId} (key ${key}): ${describeFailure(error)}`);
         return { kind: "unavailable" };
+      }
+      if (isReplayed(error)) {
+        console.error(
+          `Stripe answered the Stripe account creation of Store ${storeId} with the error it kept under key ${key} ` +
+            `(${describeFailure(error)}): Connect cannot create the account until Stripe drops the key`,
+        );
       }
       throw error;
     }
@@ -275,14 +285,23 @@ export async function syncStripeAccount(deps: StripeAccountDeps, storeId: string
   let fresh = false;
   let missing = false;
   let summary: StripeAccountSummary | null = null;
+  let stripe: Stripe | null = null;
   try {
-    const result = await readAccount(deps.stripe(), read, PAGE_READ);
-    fresh = true;
-    missing = result.missing;
-    summary = result.missing ? null : result.summary;
+    stripe = deps.stripe();
   } catch (error) {
-    if (!isStripeFailure(error, "retryable", "in_use", "refused") && !isClientError(error)) throw error;
+    // No client (no key configured): the page still shows what Stripe last reported.
     console.warn(`Could not read Stripe account ${read.accountId} of Store ${storeId}: ${describeFailure(error)}`);
+  }
+  if (stripe) {
+    try {
+      const result = await readAccount(stripe, read, PAGE_READ);
+      fresh = true;
+      missing = result.missing;
+      summary = result.missing ? null : result.summary;
+    } catch (error) {
+      if (!isStripeFailure(error, "retryable", "in_use", "refused")) throw error;
+      console.warn(`Could not read Stripe account ${read.accountId} of Store ${storeId}: ${describeFailure(error)}`);
+    }
   }
 
   const stored = await getPaymentAccount(storeId);
@@ -361,9 +380,9 @@ function isStripeFailure(error: unknown, ...kinds: StripeFailure[]): boolean {
   return failure !== null && kinds.includes(failure);
 }
 
-/** The Stripe client could not be created (no key configured). */
-function isClientError(error: unknown): boolean {
-  return error instanceof Error && !(error instanceof Stripe.errors.StripeError) && /api ?key|authenticator/i.test(error.message);
+/** Stripe answered with the result it kept under the request's idempotency key (Idempotent-Replayed). */
+function isReplayed(error: unknown): boolean {
+  return error instanceof Stripe.errors.StripeError && error.headers?.["idempotent-replayed"] === "true";
 }
 
 /**
