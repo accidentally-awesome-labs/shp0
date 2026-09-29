@@ -6,6 +6,7 @@ import { notFound } from "next/navigation";
 import { customerSignInAction } from "@/app/actions/customers";
 import { resolveStorefrontStore } from "@/lib/current-store";
 import CustomerForm from "../customer-form";
+import SignedInNote from "../signed-in-note";
 
 export default async function CustomerSignInPage() {
   // A Customer account belongs to one Store: only a storefront host has one.
@@ -14,6 +15,7 @@ export default async function CustomerSignInPage() {
   return (
     <div className="mx-auto max-w-sm p-8">
       <h1 className="mb-6 text-2xl font-bold">Sign In</h1>
+      <SignedInNote />
       <CustomerForm
         action={customerSignInAction}
         fields={[

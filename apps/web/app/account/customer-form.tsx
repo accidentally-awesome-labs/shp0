@@ -18,6 +18,7 @@ type Field = {
  * succeeds. On success the browser loads the account page afresh: a client
  * navigation would keep this form, with what was typed, in the router's
  * hidden routes (customers.ts says why the action does not redirect).
+ * Without JavaScript, the page's SignedInNote says the Customer is in.
  */
 export default function CustomerForm({
   action,
@@ -60,14 +61,6 @@ export default function CustomerForm({
       {state && !state.ok && (
         <p role="alert" className="text-sm text-red-600">
           {state.error}
-        </p>
-      )}
-      {signedIn && (
-        <p role="status" className="text-sm text-gray-600">
-          You&apos;re signed in.{" "}
-          <a href="/account" className="underline">
-            Go to your account
-          </a>
         </p>
       )}
       <button
