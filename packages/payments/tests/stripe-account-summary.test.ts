@@ -1,9 +1,10 @@
 import { describe, it, expect } from "vitest";
-import type Stripe from "stripe";
+import Stripe from "stripe";
 
 import {
   accountCreateParams,
   accountIdempotencyKey,
+  describeFailure,
   describeStripeAccount,
   onboardingUrls,
   summarizeStripeAccount,
@@ -278,5 +279,29 @@ describe("describeStripeAccount: what the Payments page says", () => {
     ["an unknown note", connected(), "paid", page({ state: "active", stripeDashboard: true })],
   ])("%s", (_name, view, from, expected) => {
     expect(describeStripeAccount(view, from)).toEqual(expected);
+  });
+});
+
+describe("describeFailure: what a log line says about a failure", () => {
+  it("gives a Stripe error's type, code, status and request id, never its message", () => {
+    const error = Stripe.errors.StripeError.generate({
+      type: "invalid_request_error",
+      code: "parameter_invalid",
+      message: "Invalid email: someone@example.com",
+      statusCode: 400,
+      requestId: "req_123",
+    } as Parameters<typeof Stripe.errors.StripeError.generate>[0]);
+
+    const line = describeFailure(error);
+
+    expect(line).toContain("parameter_invalid");
+    expect(line).toContain("400");
+    expect(line).toContain("req_123");
+    expect(line).not.toContain("someone@example.com");
+  });
+
+  it("gives shp0's own errors their name and message", () => {
+    expect(describeFailure(new TypeError("STRIPE_SECRET_KEY is not set"))).toBe("TypeError: STRIPE_SECRET_KEY is not set");
+    expect(describeFailure("a string")).toBe("unknown error");
   });
 });

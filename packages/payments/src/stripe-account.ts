@@ -340,8 +340,15 @@ function isClientError(error: unknown): boolean {
   return error instanceof Error && !(error instanceof Stripe.errors.StripeError) && /api ?key|authenticator/i.test(error.message);
 }
 
-/** A Stripe error, for a log line: its type, code, status and request id, never its message body. */
+/**
+ * A failure, for a log line. A Stripe error gives its type, code, status and
+ * request id, never its message (which can quote what was sent). Anything
+ * else is shp0's own (no key configured, a database error): its name and
+ * message, so the log says what went wrong.
+ */
 export function describeFailure(error: unknown): string {
-  if (!(error instanceof Stripe.errors.StripeError)) return error instanceof Error ? error.name : "unknown error";
+  if (!(error instanceof Stripe.errors.StripeError)) {
+    return error instanceof Error ? `${error.name}: ${error.message.slice(0, 200)}` : "unknown error";
+  }
   return [error.type, error.code, error.statusCode, error.requestId].filter((part) => part !== undefined).join(" ");
 }
