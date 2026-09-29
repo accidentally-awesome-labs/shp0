@@ -341,16 +341,19 @@ export const discountRedemptions = pgTable("discount_redemptions", {
 export type DiscountRedemption = typeof discountRedemptions.$inferSelect;
 
 /**
- * A Stripe Connect payment account linked to a Store. PLATFORM table (no RLS) —
- * bridges the Store (tenant) to Stripe's Connect account (external). Queried
- * via platformClient. One per Store.
+ * A Store's Stripe account (ADR-0006). PLATFORM table (no RLS): bridges the
+ * Store (tenant) to its Merchant-owned Stripe account (external). Queried via
+ * platformClient. One per Store, one Store per account, never replaced; the
+ * status columns hold what the latest read of Stripe reported.
  */
 export const stripePaymentAccounts = pgTable("stripe_payment_accounts", {
   id: uuid("id").primaryKey().defaultRandom(),
   storeId: uuid("store_id").notNull().unique(),
-  connectAccountId: text("connect_account_id").notNull(),
-  detailsSubmitted: boolean("details_submitted").notNull().default(false),
+  connectAccountId: text("connect_account_id").notNull().unique(),
   chargesEnabled: boolean("charges_enabled").notNull().default(false),
+  cardPaymentsStatus: text("card_payments_status"),
+  statusRead: bigint("status_read", { mode: "bigint" }),
+  statusCheckedAt: timestamp("status_checked_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 });

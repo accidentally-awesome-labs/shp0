@@ -61,7 +61,7 @@ test("allows applySchema() in tests, its definition and comments, but not in app
   );
 });
 
-test("keeps app code off getOrder (outside the Store dashboard), the unvalidated cart writers and Pay's bookkeeping", () => {
+test("keeps app code off getOrder (outside the Store dashboard), the unvalidated cart writers, Pay's bookkeeping and the Stripe account writers", () => {
   const violations = scanFiles({
     "apps/web/app/(storefront)/order/[orderId]/page.tsx": "const order = await getOrder(storeId, orderId);",
     "apps/web/app/account/orders/page.tsx": "const o = await db.getOrder (storeId, id);",
@@ -69,6 +69,10 @@ test("keeps app code off getOrder (outside the Store dashboard), the unvalidated
       "await saveDbCartLines(storeId, token, lines);\nconst id = await getOrCreateDbCart(storeId, token);",
     "apps/web/app/actions/stripe.ts":
       "await reserveCheckoutAttempt(storeId, orderId, expected);\nawait recordCheckoutSession(storeId, orderId, 1, id);\nawait endCheckoutAttempt(storeId, orderId, 1);",
+    "apps/web/app/actions/stripe-account.ts":
+      "await savePaymentAccount(storeId, id);\nawait recordStripeAccountStatus(read, status);\nconst read = await startStripeAccountRead({ storeId });\nawait upsertPaymentAccount(opts);\nawait stripe.accounts.create({ type: 'express' });\nawait stripe.v2.core.accounts.create(params);",
+    "apps/web/app/api/stripe/account-events/route.ts": "// never savePaymentAccount(storeId, id) here\nawait handleStripeAccountEvent(payload, signature, deps);",
+    "packages/payments/src/stripe-account.ts": "await savePaymentAccount(storeId, created.id);\nawait stripe.v2.core.accounts.create(params);",
     // Allowed: the token-scoped and validated functions, a gated dashboard
     // page, the db package and its tests, and comments.
     "apps/web/app/(storefront)/order/[orderId]/ok.tsx":
@@ -90,6 +94,12 @@ test("keeps app code off getOrder (outside the Store dashboard), the unvalidated
       ["apps/web/app/actions/stripe.ts", 1, "no-checkout-bookkeeping-in-app"],
       ["apps/web/app/actions/stripe.ts", 2, "no-checkout-bookkeeping-in-app"],
       ["apps/web/app/actions/stripe.ts", 3, "no-checkout-bookkeeping-in-app"],
+      ["apps/web/app/actions/stripe-account.ts", 1, "no-stripe-account-writes-in-app"],
+      ["apps/web/app/actions/stripe-account.ts", 2, "no-stripe-account-writes-in-app"],
+      ["apps/web/app/actions/stripe-account.ts", 3, "no-stripe-account-writes-in-app"],
+      ["apps/web/app/actions/stripe-account.ts", 4, "no-stripe-account-writes-in-app"],
+      ["apps/web/app/actions/stripe-account.ts", 5, "no-stripe-account-writes-in-app"],
+      ["apps/web/app/actions/stripe-account.ts", 6, "no-stripe-account-writes-in-app"],
     ],
   );
 });

@@ -1,31 +1,10 @@
 "use server";
 
 import { readCartToken } from "@/lib/cart-token";
-import { authorizeStore, resolveStorefront } from "@/lib/current-store";
-import { getPaymentAccount, isUuid } from "@shp0/db";
+import { resolveStorefront } from "@/lib/current-store";
+import { isUuid } from "@shp0/db";
 import { startCheckout, type CheckoutOutcome } from "@shp0/payments";
-import {
-  createConnectAccountAndOnboardingLink,
-  createOnboardingLink,
-  getStripe,
-} from "@/lib/stripe";
-
-// Payouts are Store settings: Admin and above.
-export async function onboardConnectAction(storeId: string): Promise<{ url: string }> {
-  const resolved = await authorizeStore(storeId, "settings.manage");
-
-  const existing = await getPaymentAccount(resolved.storeId);
-  if (existing) {
-    return createOnboardingLink(existing.connectAccountId);
-  }
-
-  const { url } = await createConnectAccountAndOnboardingLink({
-    storeId: resolved.storeId,
-    storeName: resolved.storeId,
-  });
-
-  return { url };
-}
+import { getStripe } from "@/lib/stripe";
 
 /** Where the Order page goes after Pay: to Stripe, or back to the Order with a note. */
 export type PayResult = { kind: "stripe"; url: string } | { kind: "order"; note: "failed" | "in_progress" | null };
