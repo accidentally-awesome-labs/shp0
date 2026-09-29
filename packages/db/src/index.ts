@@ -66,6 +66,17 @@ export type {
 } from "./domain-verification";
 export { hashPassword, verifyPassword } from "./customer-auth";
 export {
+  customerFormMessage,
+  CustomerSignUpError,
+  MAX_EMAIL_LENGTH,
+  MAX_NAME_LENGTH,
+  MAX_PASSWORD_LENGTH,
+  MIN_PASSWORD_LENGTH,
+  parseCustomerSignIn,
+  parseCustomerSignUp,
+} from "./customer-forms";
+export type { CustomerFormRejection, CustomerSignIn, CustomerSignUp } from "./customer-forms";
+export {
   ROLES,
   ROLE_LABEL,
   CAPABILITY_MINIMUM_ROLE,
@@ -2889,13 +2900,15 @@ export async function redeemDiscount(
 // ─────────────────────────────────────────────────────────────────────────
 
 import { hashPassword, verifyPassword } from "./customer-auth";
+import { CustomerSignUpError } from "./customer-forms";
 
 /** Session expiry: 30 days. */
 const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
- * Sign up a new Customer in a Store.
- * Throws if a customer with this email already exists in this Store.
+ * Sign up a new Customer in a Store. Throws CustomerSignUpError
+ * ("email_taken"), writing nothing, if the Store already has a Customer with
+ * this email.
  */
 export async function signUpCustomer(
   storeId: string,
@@ -2904,8 +2917,10 @@ export async function signUpCustomer(
   const passwordHash = hashPassword(opts.password);
   return tenantClient(storeId, async (tx) => {
     const rows = await tx.execute(
-      sql`INSERT INTO customers (email, name, password_hash) VALUES (${opts.email}, ${opts.name}, ${passwordHash}) RETURNING id`,
+      sql`INSERT INTO customers (email, name, password_hash) VALUES (${opts.email}, ${opts.name}, ${passwordHash})
+          ON CONFLICT (store_id, email) DO NOTHING RETURNING id`,
     );
+    if (rows.rows.length === 0) throw new CustomerSignUpError("email_taken");
     return { customerId: (rows.rows[0] as { id: string }).id };
   });
 }
@@ -2930,6 +2945,17 @@ export async function signInCustomer(
       sql`INSERT INTO customer_sessions (customer_id, token, expires_at) VALUES (${customer.id}, ${token}, ${expiresAt})`,
     );
     return { token, customerId: customer.id };
+  });
+}
+
+/**
+ * Sign a Customer out: end the session with this token, in this Store. A
+ * token that is no session (already ended, expired, or another Store's)
+ * changes nothing.
+ */
+export async function signOutCustomer(storeId: string, token: string): Promise<void> {
+  await tenantClient(storeId, async (tx) => {
+    await tx.execute(sql`DELETE FROM customer_sessions WHERE token = ${token}`);
   });
 }
 

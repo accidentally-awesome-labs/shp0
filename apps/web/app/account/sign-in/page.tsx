@@ -1,24 +1,34 @@
 export const instant = false;
 
-import { customerSignInAction } from "@/app/actions/customers";
+import Link from "next/link";
+import { notFound } from "next/navigation";
 
-export default function CustomerSignInPage() {
+import { customerSignInAction } from "@/app/actions/customers";
+import { resolveStorefrontStore } from "@/lib/current-store";
+import CustomerForm from "../customer-form";
+
+export default async function CustomerSignInPage() {
+  // A Customer account belongs to one Store: only a storefront host has one.
+  if (!(await resolveStorefrontStore())) notFound();
+
   return (
     <div className="mx-auto max-w-sm p-8">
       <h1 className="mb-6 text-2xl font-bold">Sign In</h1>
-      <form action={customerSignInAction} className="space-y-4">
-        <div>
-          <label className="block text-sm font-medium">Email</label>
-          <input name="email" type="email" required className="mt-1 w-full rounded border px-3 py-2" />
-        </div>
-        <div>
-          <label className="block text-sm font-medium">Password</label>
-          <input name="password" type="password" required className="mt-1 w-full rounded border px-3 py-2" />
-        </div>
-        <button type="submit" className="w-full rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700">
-          Sign In
-        </button>
-      </form>
+      <CustomerForm
+        action={customerSignInAction}
+        fields={[
+          { name: "email", label: "Email", type: "email", autoComplete: "email" },
+          { name: "password", label: "Password", type: "password", autoComplete: "current-password" },
+        ]}
+        submitLabel="Sign In"
+        pendingLabel="Signing in…"
+      />
+      <p className="mt-6 text-sm text-gray-600">
+        New here?{" "}
+        <Link href="/account/sign-up" className="underline">
+          Create an account
+        </Link>
+      </p>
     </div>
   );
 }

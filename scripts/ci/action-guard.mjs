@@ -149,6 +149,10 @@ export const PUBLIC_ACTIONS = new Map([
     "storefront: Customer sign-in in the request host's Store",
   ],
   [
+    "apps/web/app/actions/customers.ts#customerSignOutAction",
+    "storefront: ends the Customer's own session (cookie) in the request host's Store",
+  ],
+  [
     "apps/web/app/actions/customers.ts#getStorefrontCustomer",
     "storefront: the Customer's own session cookie, in the request host's Store",
   ],
